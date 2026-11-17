@@ -7,5 +7,6 @@ license.workspace = true
 [dependencies]
 p2c-core.workspace = true
 anyhow.workspace = true
+parking_lot.workspace = true
 tracing.workspace = true
 fast_image_resize.workspace = true

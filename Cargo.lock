@@ -1330,7 +1330,6 @@ dependencies = [
  "anyhow",
  "cef",
  "p2c-core",
- "tracing",
 ]
 
 [[package]]
@@ -1340,6 +1339,7 @@ dependencies = [
  "anyhow",
  "fast_image_resize",
  "p2c-core",
+ "parking_lot",
  "tracing",
 ]
 
@@ -1384,6 +1384,8 @@ dependencies = [
  "p2c-compositor",
  "p2c-core",
  "p2c-vcam",
+ "p2c-webcam",
+ "parking_lot",
  "serde",
  "tempfile",
  "toml",

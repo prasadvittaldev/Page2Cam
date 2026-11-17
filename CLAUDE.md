@@ -42,7 +42,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt
 
 cargo run -p page2cam -- --test-pattern                  # moving bar → camera, no browser
-cargo run -p page2cam -- --url https://example.com       # web page → camera
+cargo run -p page2cam -- --url https://example.com       # web page → camera (+ webcam PIP bottom-right)
+cargo run -p page2cam -- --url https://example.com --pip top-left --pip-size 20 --webcam c920
+cargo run -p page2cam -- --url https://example.com --pip off
+cargo run -p p2c-webcam --example list                   # cameras the PIP picker can see
 ffplay -f v4l2 /dev/videoN                               # watch the camera output
 ```
 
@@ -53,6 +56,8 @@ Crates in `crates/`:
 - `p2c-compositor`: `compose()` plus `Ticker`, a thread that composites at a fixed fps using absolute deadlines and pushes to `FrameSink`s. It always emits frames (black when there's no page) so call apps never see a frozen camera. A failing sink is logged and doesn't block the others.
 - `p2c-vcam`: BGRA→YUYV (BT.601 limited) and `V4l2Sink`. It sets the format with a hand-written `VIDIOC_S_FMT` ioctl (via `nix`), not a bindgen crate, so no libclang is needed.
 - `p2c-browser`: CEF off-screen rendering. **CEF owns the main thread**: `main` must call `maybe_run_subprocess()` first (CEF re-launches the same exe as helper processes), then `run()` blocks the main thread pumping `do_message_loop_work`. Other threads control it via the `Send` `BrowserHandle`, which sends commands over a channel. `on_paint` always copies the full view buffer. The device scale factor is fixed at 1.0, so frames are exactly the output size.
+- `p2c-webcam`: nokhwa capture into its own `FrameSlot`. The nokhwa `Camera` is `!Send`, so it is opened and read on the capture thread. `pick_camera` never returns Page2Cam's own output device (by path or the `Page2Cam` name), which would create a feedback loop.
+- PIP: `PipLayout { visible, x, y, width }` lives behind `Arc<RwLock<_>>` so it can be changed live (the admin UI will). `x`/`y` are 0..1 positions within the area inside a 2% margin (corners are exactly 0/1); `width` is a fraction of the output width and height follows the webcam aspect. `pip_rect` always clamps inside the frame. The ticker hides the PIP when the webcam slot's `seq` hasn't changed for 1 s.
 - `page2cam`: binary; TOML config (`<config_dir>/page2cam/config.toml`) with CLI overrides; wires browser → slot → ticker → v4l2 sink.
 
 CEF test binaries use `harness = false` (libtest would reject CEF's helper-process flags), and CEF can initialize only once per process, so the render checks share one run.

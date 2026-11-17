@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 p2c-core.workspace = true
 anyhow.workspace = true
-tracing.workspace = true
 # Pinned: the CEF binary distribution must match this exact version.
 cef = { version = "=156.6.0", default-features = false }
 

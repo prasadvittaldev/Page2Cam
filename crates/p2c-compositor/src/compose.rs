@@ -2,10 +2,23 @@ use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use p2c_core::Frame;
 
-/// Draw `page` into `out`. With no page, `out` becomes black. When the
-/// sizes match, the page is copied. Otherwise it is scaled to fit, keeping
-/// its aspect ratio, centered with black bars.
-pub fn compose(page: Option<&Frame>, out: &mut Frame) {
+use crate::{pip_rect, PipLayout};
+
+/// Draw `page` into `out`, then the webcam `pip` on top if given and visible.
+/// With no page, `out` becomes black. When the sizes match, the page is
+/// copied. Otherwise it is scaled to fit, keeping its aspect ratio, centered
+/// with black bars.
+pub fn compose(page: Option<&Frame>, pip: Option<(&Frame, &PipLayout)>, out: &mut Frame) {
+    compose_page(page, out);
+    if let Some((cam, layout)) = pip {
+        if let Some((x, y, w, h)) = pip_rect(layout, cam.width, cam.height, out.width, out.height) {
+            let scaled = scale(cam, w, h);
+            blit(scaled.buffer(), w, h, out, x, y);
+        }
+    }
+}
+
+fn compose_page(page: Option<&Frame>, out: &mut Frame) {
     let Some(page) = page.filter(|p| p.width > 0 && p.height > 0) else {
         fill_black(out);
         return;
@@ -70,10 +83,27 @@ mod tests {
         Frame::from_bgra(w, h, px.repeat((w * h) as usize)).unwrap()
     }
 
+    const BLUE: [u8; 4] = [255, 0, 0, 255];
+
+    #[test]
+    fn compose_draws_pip_over_page() {
+        let mut out = Frame::new_black(64, 36);
+        let layout = crate::PipLayout {
+            visible: true,
+            x: 0.0,
+            y: 0.0,
+            width: 0.25,
+        };
+        let cam = solid(16, 9, BLUE);
+        compose(Some(&solid(64, 36, RED)), Some((&cam, &layout)), &mut out);
+        assert_eq!(out.pixel(2, 2), BLUE);
+        assert_eq!(out.pixel(40, 20), RED);
+    }
+
     #[test]
     fn tick_without_page_emits_black() {
         let mut out = solid(8, 4, RED);
-        compose(None, &mut out);
+        compose(None, None, &mut out);
         for (x, y) in [(0, 0), (4, 2), (7, 3)] {
             assert_eq!(out.pixel(x, y), BLACK);
         }
@@ -82,14 +112,14 @@ mod tests {
     #[test]
     fn compose_same_size_copies() {
         let mut out = Frame::new_black(4, 4);
-        compose(Some(&solid(4, 4, RED)), &mut out);
+        compose(Some(&solid(4, 4, RED)), None, &mut out);
         assert_eq!(out.pixel(2, 2), RED);
     }
 
     #[test]
     fn tick_scales_mismatched_page() {
         let mut out = Frame::new_black(8, 4);
-        compose(Some(&solid(2, 2, RED)), &mut out);
+        compose(Some(&solid(2, 2, RED)), None, &mut out);
         assert_eq!((out.width, out.height, out.data.len()), (8, 4, 128));
         assert_eq!(out.pixel(4, 2), RED);
         assert_eq!(out.pixel(0, 2), BLACK);

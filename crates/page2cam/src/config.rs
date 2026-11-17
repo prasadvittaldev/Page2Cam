@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use p2c_compositor::{Corner, PipLayout};
 use serde::Deserialize;
 
 /// App settings, loaded from TOML and overridden by CLI flags.
@@ -12,6 +13,12 @@ pub struct Config {
     pub height: u32,
     pub fps: u32,
     pub vcam_device: Option<PathBuf>,
+    /// Webcam overlay position: top-left | top-right | bottom-left | bottom-right | off
+    pub pip: String,
+    /// Webcam overlay width as a percent of the output width (5..=50).
+    pub pip_size: u32,
+    /// Pick the webcam whose name contains this (case-insensitive); default: first one.
+    pub webcam: Option<String>,
 }
 
 impl Default for Config {
@@ -22,6 +29,9 @@ impl Default for Config {
             height: 1080,
             fps: 30,
             vcam_device: None,
+            pip: "bottom-right".into(),
+            pip_size: 25,
+            webcam: None,
         }
     }
 }
@@ -68,7 +78,34 @@ impl Config {
             "fps must be 1..=60 (got {})",
             self.fps
         );
+        anyhow::ensure!(
+            (5..=50).contains(&self.pip_size),
+            "pip size must be 5..=50 percent (got {})",
+            self.pip_size
+        );
+        self.pip_layout()?;
         Ok(())
+    }
+
+    /// The webcam overlay layout described by `pip` and `pip_size`.
+    pub fn pip_layout(&self) -> anyhow::Result<PipLayout> {
+        let width = self.pip_size as f32 / 100.0;
+        let corner = match self.pip.as_str() {
+            "top-left" => Corner::TopLeft,
+            "top-right" => Corner::TopRight,
+            "bottom-left" => Corner::BottomLeft,
+            "bottom-right" => Corner::BottomRight,
+            "off" => {
+                return Ok(PipLayout {
+                    visible: false,
+                    ..PipLayout::preset(Corner::BottomRight, width)
+                })
+            }
+            other => anyhow::bail!(
+                "unknown pip position {other:?} (use top-left, top-right, bottom-left, bottom-right or off)"
+            ),
+        };
+        Ok(PipLayout::preset(corner, width))
     }
 }
 
@@ -108,6 +145,49 @@ mod tests {
     fn rejects_fps_zero() {
         let c = Config {
             fps: 0,
+            ..Config::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_pip_size_out_of_range() {
+        let c = Config {
+            pip_size: 80,
+            ..Config::default()
+        };
+        assert!(c.validate().is_err());
+        let c = Config {
+            pip_size: 4,
+            ..Config::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn pip_defaults_bottom_right_25() {
+        let l = Config::default().pip_layout().unwrap();
+        assert_eq!(l, PipLayout::preset(Corner::BottomRight, 0.25));
+    }
+
+    #[test]
+    fn pip_off_is_hidden_and_bad_corner_rejected() {
+        let c = Config {
+            pip: "off".into(),
+            ..Config::default()
+        };
+        assert!(!c.pip_layout().unwrap().visible);
+        let c = Config {
+            pip: "top-left".into(),
+            pip_size: 10,
+            ..Config::default()
+        };
+        assert_eq!(
+            c.pip_layout().unwrap(),
+            PipLayout::preset(Corner::TopLeft, 0.10)
+        );
+        let c = Config {
+            pip: "middle".into(),
             ..Config::default()
         };
         assert!(c.validate().is_err());
