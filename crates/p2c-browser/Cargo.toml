@@ -1,0 +1,18 @@
+[package]
+name = "p2c-browser"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+p2c-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# Pinned: the CEF binary distribution must match this exact version.
+cef = { version = "=156.6.0", default-features = false }
+
+# CEF re-launches the current executable as helper processes with Chromium
+# flags, which the libtest harness would reject, so these tests own `main`.
+[[test]]
+name = "render"
+harness = false
