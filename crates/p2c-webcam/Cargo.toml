@@ -8,7 +8,11 @@ license.workspace = true
 p2c-core.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-nokhwa = { version = "0.10", features = ["input-native"] }
+nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
+zune-jpeg = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[dev-dependencies.jpeg-encoder]
+version = "0.6"

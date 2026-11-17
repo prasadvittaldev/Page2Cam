@@ -6,13 +6,13 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context;
-use nokhwa::pixel_format::RgbAFormat;
+use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{
     ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
     Resolution,
 };
 use nokhwa::Camera;
-use p2c_core::{Frame, FrameSlot};
+use p2c_core::FrameSlot;
 
 use crate::CameraInfo;
 
@@ -79,16 +79,13 @@ impl WebcamCapture {
                         }
                     };
                     let res = frame.resolution();
-                    let mut data = vec![0u8; res.width() as usize * res.height() as usize * 4];
-                    if let Err(e) = frame.decode_image_to_buffer::<RgbAFormat>(&mut data) {
-                        tracing::debug!(error = %e, "dropping undecodable webcam frame");
-                        continue;
-                    }
-                    for px in data.as_chunks_mut::<4>().0 {
-                        px.swap(0, 2); // RGBA -> BGRA
-                    }
-                    if let Ok(f) = Frame::from_bgra(res.width(), res.height(), data) {
-                        slot.put(f);
+                    let Some(fmt) = raw_format(frame.source_frame_format()) else {
+                        tracing::warn!(format = ?frame.source_frame_format(), "unsupported webcam pixel format");
+                        break;
+                    };
+                    match crate::decode::to_bgra(fmt, res.width(), res.height(), frame.buffer()) {
+                        Ok(f) => slot.put(f),
+                        Err(e) => tracing::debug!(error = %e, "dropping undecodable webcam frame"),
                     }
                 }
                 let _ = camera.stop_stream();
@@ -115,6 +112,16 @@ impl WebcamCapture {
     }
 }
 
+fn raw_format(f: FrameFormat) -> Option<crate::decode::RawFormat> {
+    use crate::decode::RawFormat;
+    match f {
+        FrameFormat::MJPEG => Some(RawFormat::Mjpeg),
+        FrameFormat::YUYV => Some(RawFormat::Yuyv),
+        FrameFormat::NV12 => Some(RawFormat::Nv12),
+        _ => None,
+    }
+}
+
 /// Join `handle` if its thread finishes within `timeout` (signalled by `done`
 /// disconnecting); otherwise detach it. Returns whether it was joined.
 fn join_within(handle: JoinHandle<()>, done: &Receiver<()>, timeout: Duration) -> bool {
@@ -129,7 +136,7 @@ fn join_within(handle: JoinHandle<()>, done: &Receiver<()>, timeout: Duration) -
 
 fn open(cam: &CameraInfo) -> anyhow::Result<Camera> {
     let want = CameraFormat::new(Resolution::new(1280, 720), FrameFormat::MJPEG, 30);
-    let format = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::Closest(want));
+    let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(want));
     let mut camera = Camera::new(CameraIndex::Index(cam.index), format)
         .with_context(|| format!("opening webcam {}", cam.name))?;
     camera

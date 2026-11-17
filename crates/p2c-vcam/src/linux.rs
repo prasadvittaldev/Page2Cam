@@ -38,6 +38,17 @@ pub fn find_loopback_device(sysfs_root: &Path) -> Option<PathBuf> {
     fallback
 }
 
+/// Explicit device wins; otherwise auto-detect a v4l2loopback device.
+pub fn resolve_device(explicit: Option<&Path>, sysfs_root: &Path) -> anyhow::Result<PathBuf> {
+    if let Some(d) = explicit {
+        return Ok(d.to_path_buf());
+    }
+    find_loopback_device(sysfs_root).context(
+        "no virtual camera device found. Load it with:\n  \
+         sudo modprobe v4l2loopback exclusive_caps=1 card_label=Page2Cam",
+    )
+}
+
 /// Writes frames to a v4l2loopback device as YUYV.
 pub struct V4l2Sink {
     file: File,
@@ -171,6 +182,23 @@ mod tests {
             fs::write(base.join(dir).join("name"), format!("{name}\n")).unwrap();
         }
         root
+    }
+
+    #[test]
+    fn missing_device_error_mentions_modprobe() {
+        let root = fake_sysfs(&[]);
+        let err = resolve_device(None, root.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("modprobe v4l2loopback"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn explicit_device_wins() {
+        let root = fake_sysfs(&[]);
+        let got = resolve_device(Some(Path::new("/dev/video9")), root.path()).unwrap();
+        assert_eq!(got, PathBuf::from("/dev/video9"));
     }
 
     #[test]

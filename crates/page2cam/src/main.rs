@@ -9,7 +9,6 @@ use clap::Parser;
 use p2c_browser::BrowserConfig;
 use p2c_compositor::{FrameSink, OutputSpec, Ticker};
 use p2c_core::FrameSlot;
-use p2c_vcam::{find_loopback_device, V4l2Sink};
 use p2c_webcam::{list_cameras, pick_camera, WebcamCapture};
 use parking_lot::RwLock;
 
@@ -76,17 +75,6 @@ impl Cli {
     }
 }
 
-/// Explicit config device wins; otherwise auto-detect a v4l2loopback device.
-fn resolve_device(cfg: &Config, sysfs_root: &Path) -> anyhow::Result<PathBuf> {
-    if let Some(d) = &cfg.vcam_device {
-        return Ok(d.clone());
-    }
-    find_loopback_device(sysfs_root).context(
-        "no virtual camera device found. Load it with:\n  \
-         sudo modprobe v4l2loopback exclusive_caps=1 card_label=Page2Cam",
-    )
-}
-
 fn main() -> anyhow::Result<()> {
     // CEF re-launches this executable for its helper processes; handle that first.
     if let Some(code) = p2c_browser::maybe_run_subprocess() {
@@ -101,19 +89,32 @@ fn main() -> anyhow::Result<()> {
     let cfg = cli.apply(Config::load(cli.config.as_deref())?);
     cfg.validate()?;
 
-    let device = resolve_device(&cfg, Path::new("/sys"))?;
     let spec = OutputSpec {
         width: cfg.width,
         height: cfg.height,
         fps: cfg.fps,
     };
-    let sink = V4l2Sink::open(&device, &spec)?;
-    tracing::info!(device = %device.display(), "virtual camera {}x{}@{}", spec.width, spec.height, spec.fps);
+    // The virtual camera is optional: on failure keep running (preview/stream still work).
+    let mut sinks: Vec<Box<dyn FrameSink>> = Vec::new();
+    let mut own_device = None;
+    match p2c_vcam::open_default(cfg.vcam_device.as_deref(), &spec) {
+        Ok(cam) => {
+            tracing::info!(
+                "virtual camera: {} {}x{}@{}",
+                cam.description,
+                spec.width,
+                spec.height,
+                spec.fps
+            );
+            own_device = cam.own_device;
+            sinks.push(cam.sink);
+        }
+        Err(e) => tracing::warn!("virtual camera unavailable: {e:#}"),
+    }
 
     let page = FrameSlot::new();
-    let sinks: Vec<Box<dyn FrameSink>> = vec![Box::new(sink)];
     let layout = Arc::new(RwLock::new(cfg.pip_layout()?));
-    let webcam = start_webcam(&cfg, &device);
+    let webcam = start_webcam(&cfg, own_device.as_deref());
     let webcam_slot = webcam.as_ref().map(|(slot, _)| slot.clone());
 
     if cli.test_pattern {
@@ -155,14 +156,14 @@ fn main() -> anyhow::Result<()> {
 
 /// Start capturing the overlay webcam, never picking our own output device.
 /// Any failure just means no PIP.
-fn start_webcam(cfg: &Config, own_device: &Path) -> Option<(FrameSlot, WebcamCapture)> {
+fn start_webcam(cfg: &Config, own_device: Option<&Path>) -> Option<(FrameSlot, WebcamCapture)> {
     if !cfg.pip_layout().ok()?.visible {
         return None;
     }
     let cams = list_cameras()
         .map_err(|e| tracing::warn!(error = %e, "could not list webcams; running without PIP"))
         .ok()?;
-    let Some(cam) = pick_camera(&cams, cfg.webcam.as_deref(), Some(own_device)) else {
+    let Some(cam) = pick_camera(&cams, cfg.webcam.as_deref(), own_device) else {
         tracing::warn!("no webcam found; running without PIP");
         return None;
     };
@@ -179,34 +180,5 @@ fn start_webcam(cfg: &Config, own_device: &Path) -> Option<(FrameSlot, WebcamCap
 fn stop_webcam(webcam: Option<(FrameSlot, WebcamCapture)>) {
     if let Some((_, cap)) = webcam {
         cap.stop();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn missing_device_error_mentions_modprobe() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("class/video4linux")).unwrap();
-        let err = resolve_device(&Config::default(), root.path()).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("modprobe v4l2loopback"),
-            "{err:#}"
-        );
-    }
-
-    #[test]
-    fn explicit_device_wins() {
-        let root = tempfile::tempdir().unwrap();
-        let cfg = Config {
-            vcam_device: Some("/dev/video9".into()),
-            ..Config::default()
-        };
-        assert_eq!(
-            resolve_device(&cfg, root.path()).unwrap(),
-            PathBuf::from("/dev/video9")
-        );
     }
 }
