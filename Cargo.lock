@@ -38,6 +38,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2c-vcam"
+version = "0.1.0"
+dependencies = [
+ "p2c-core",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
