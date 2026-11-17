@@ -6,6 +6,8 @@ use p2c_compositor::{FrameSink, OutputSpec};
 mod convert;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(windows)]
+mod windows_cam;
 
 pub use convert::bgra_to_yuyv;
 #[cfg(target_os = "linux")]
@@ -33,9 +35,19 @@ pub fn open_default(device: Option<&Path>, spec: &OutputSpec) -> anyhow::Result<
             own_device: Some(dev),
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        let _ = device;
+        let sink = windows_cam::WinVcamSink::open(spec)?;
+        Ok(VirtualCamera {
+            sink: Box::new(sink),
+            description: "Windows camera \"Page2Cam\"".into(),
+            own_device: None,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (device, spec);
-        anyhow::bail!("virtual camera not available on this platform yet")
+        anyhow::bail!("virtual camera not available on this platform")
     }
 }

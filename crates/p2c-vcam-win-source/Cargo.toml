@@ -1,0 +1,29 @@
+[package]
+name = "p2c-vcam-win-source"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Page2Cam Windows 11 virtual camera media source (COM DLL loaded by Frame Server)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+p2c-shm = { path = "../p2c-shm" }
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_System_Variant",
+] }

@@ -1,0 +1,9 @@
+[package]
+name = "p2c-shm"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# Shared between page2cam (writer) and the Windows camera DLL (reader).
+# No platform code here, so it is unit-tested on any OS.
+[dependencies]

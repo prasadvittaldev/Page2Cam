@@ -2322,6 +2322,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2c-shm"
+version = "0.1.0"
+
+[[package]]
 name = "p2c-stream"
 version = "0.1.0"
 dependencies = [
@@ -2343,7 +2347,19 @@ dependencies = [
  "nix 0.29.0",
  "p2c-compositor",
  "p2c-core",
+ "p2c-shm",
  "tempfile",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "p2c-vcam-win-source"
+version = "0.1.0"
+dependencies = [
+ "p2c-shm",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
