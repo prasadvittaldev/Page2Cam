@@ -8,6 +8,7 @@ license.workspace = true
 p2c-core.workspace = true
 p2c-compositor.workspace = true
 p2c-vcam.workspace = true
+p2c-browser.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

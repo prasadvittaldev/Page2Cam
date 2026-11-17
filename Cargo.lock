@@ -895,6 +895,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "directories",
+ "p2c-browser",
  "p2c-compositor",
  "p2c-core",
  "p2c-vcam",
