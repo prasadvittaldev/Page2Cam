@@ -1,0 +1,21 @@
+[package]
+name = "page2cam"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+p2c-core.workspace = true
+p2c-compositor.workspace = true
+p2c-vcam.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
+ctrlc = "3"
+
+[dev-dependencies]
+tempfile.workspace = true
