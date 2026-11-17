@@ -141,6 +141,7 @@ fn main() -> anyhow::Result<()> {
         height: cfg.height,
         fps: cfg.fps,
         profile_dir,
+        audio: None,
     };
     tracing::info!(url = %cfg.url, "loading page");
     // CEF owns the main thread until shutdown; Ctrl-C asks it to close.
