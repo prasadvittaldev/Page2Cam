@@ -285,13 +285,18 @@ impl State {
                 &mut start,
                 &mut len,
             )?;
+            // The locked buffer must hold `rows` rows of at least `row_bytes`.
+            let step = pitch.unsigned_abs() as usize;
+            if step < row_bytes || (rows - 1) * step + row_bytes > len as usize {
+                let _ = b2.Unlock2D();
+                if self.tick.is_multiple_of(300) {
+                    super::log(&format!("sample buffer too small: pitch {pitch} len {len} rows {rows} row bytes {row_bytes}"));
+                }
+                return Err(windows::Win32::Foundation::E_FAIL.into());
+            }
             for r in 0..rows {
                 let dst = scan.offset(r as isize * pitch as isize);
-                std::ptr::copy_nonoverlapping(
-                    packed.as_ptr().add(r * row_bytes),
-                    dst,
-                    row_bytes.min(pitch.unsigned_abs() as usize),
-                );
+                std::ptr::copy_nonoverlapping(packed.as_ptr().add(r * row_bytes), dst, row_bytes);
             }
             b2.Unlock2D()?;
         }
@@ -366,20 +371,12 @@ impl IMFMediaStream_Impl for MediaStream_Impl {
 }
 
 impl IMFMediaStream2_Impl for MediaStream_Impl {
+    /// VCamSample (the working reference) only records the requested state here;
+    /// actual start/stop happens through IMFMediaSource::Start/Stop. Re-running
+    /// start() on PAUSED->RUNNING would re-initialize the allocator mid-stream.
     fn SetStreamState(&self, value: MF_STREAM_STATE) -> Result<()> {
-        let current = self.state();
-        if current == value {
-            return Ok(());
-        }
-        match value {
-            MF_STREAM_STATE_PAUSED if current == MF_STREAM_STATE_RUNNING => {
-                self.st.lock().unwrap().state = value;
-                Ok(())
-            }
-            MF_STREAM_STATE_RUNNING => self.start(None),
-            MF_STREAM_STATE_STOPPED => self.stop(),
-            _ => Err(MF_E_INVALID_STATE_TRANSITION.into()),
-        }
+        self.st.lock().unwrap().state = value;
+        Ok(())
     }
 
     fn GetStreamState(&self) -> Result<MF_STREAM_STATE> {

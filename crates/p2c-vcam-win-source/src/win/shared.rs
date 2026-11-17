@@ -1,7 +1,8 @@
 //! Reader side of p2c-shm: the DLL creates the Global mapping (the Frame Server
 //! service is allowed to; a normal user process is not) with a DACL that lets
 //! the interactive user's page2cam.exe open it for writing.
-use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
@@ -21,7 +22,9 @@ struct Mapping {
 unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
-static MAPPING: OnceLock<Option<Mapping>> = OnceLock::new();
+/// The mapping once opened, plus when we last tried (failed attempts are retried
+/// every 2 s: this DLL lives as long as the Frame Server process).
+static MAPPING: Mutex<(Option<Mapping>, Option<Instant>)> = Mutex::new((None, None));
 
 /// Everyone, SYSTEM and LocalService get full access; low-integrity writers allowed.
 const SDDL: &str = "D:(A;;GA;;;WD)(A;;GA;;;SY)(A;;GA;;;LS)S:(ML;;NW;;;LW)";
@@ -85,8 +88,10 @@ fn open() -> Option<Mapping> {
 
 /// Base pointer of the mapping, created on first use.
 pub(crate) fn base() -> Option<*const u8> {
-    MAPPING
-        .get_or_init(open)
-        .as_ref()
-        .map(|m| m.view.Value as *const u8)
+    let mut g = MAPPING.lock().ok()?;
+    if g.0.is_none() && g.1.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
+        g.1 = Some(Instant::now());
+        g.0 = open();
+    }
+    g.0.as_ref().map(|m| m.view.Value as *const u8)
 }

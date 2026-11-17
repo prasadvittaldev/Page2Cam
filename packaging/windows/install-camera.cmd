@@ -18,8 +18,8 @@ if not exist "%SRC%" (
 )
 
 echo Stopping the Windows camera service so the driver can be updated...
-net stop FrameServerMonitor >nul 2>&1
-net stop FrameServer >nul 2>&1
+net stop FrameServerMonitor /y >nul 2>&1
+net stop FrameServer /y >nul 2>&1
 
 rem The camera service cannot read files inside your user folder, so the
 rem driver is copied to Program Files and registered from there.
