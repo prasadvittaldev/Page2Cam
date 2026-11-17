@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Page2Cam control</title>
+<style>
+  :root {
+    --desk: #1e2226;
+    --panel: #272c31;
+    --well: #15181b;
+    --line: #3a4249;
+    --text: #e8e5de;
+    --muted: #9aa3ab;
+    --tally-live: #e5372b;
+    --tally-cam: #3fb56b;
+    --amber: #e9a23b;
+    --focus: #7cc4ff;
+    --font: "Bahnschrift", "DIN Alternate", "Barlow", "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--desk);
+    color: var(--text);
+    font: 15px/1.45 var(--font);
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    min-height: 100vh;
+  }
+  button, input { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 16px; border-bottom: 1px solid var(--line);
+  }
+  .brand { font-weight: 700; letter-spacing: .02em; font-size: 18px; white-space: nowrap; }
+  .brand span { color: var(--muted); font-weight: 400; }
+  form.url { display: flex; gap: 6px; flex: 1; min-width: 0; }
+  form.url input {
+    flex: 1; min-width: 0; background: var(--well); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 10px;
+  }
+  .btn {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 12px; cursor: pointer; white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--muted); }
+  .btn.primary { background: #39424a; }
+  .btn.live { background: var(--tally-live); border-color: var(--tally-live); color: #fff; }
+  .btn[disabled] { opacity: .5; cursor: default; }
+  .icon { width: 36px; padding: 6px 0; text-align: center; }
+
+  main {
+    display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px;
+    padding: 16px; align-items: start;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  /* The program monitor with its tally frame */
+  .monitor {
+    position: relative; border-radius: 4px; padding: 6px;
+    background: var(--line);
+    transition: background-color .3s;
+  }
+  .monitor.cam { background: var(--tally-cam); }
+  .monitor.live { background: var(--tally-live); }
+  .screen {
+    position: relative; aspect-ratio: 16 / 9; background: #000; overflow: hidden;
+    cursor: default; outline: none;
+  }
+  .screen:focus-visible { box-shadow: inset 0 0 0 2px var(--focus); }
+  .screen canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .screen .empty {
+    position: absolute; inset: 0; display: grid; place-items: center;
+    color: var(--muted); text-align: center; padding: 24px;
+  }
+  .tally-label {
+    position: absolute; top: -1px; left: 14px; transform: translateY(-50%);
+    background: inherit; color: #fff; font-weight: 700; font-size: 12px;
+    padding: 1px 8px; border-radius: 3px; letter-spacing: .06em;
+  }
+  .monitor:not(.cam):not(.live) .tally-label { color: var(--muted); }
+  .hint { color: var(--muted); font-size: 13px; margin: 8px 2px 0; }
+
+  .pip {
+    position: absolute; border: 2px dashed rgba(255,255,255,.85);
+    background: rgba(255,255,255,.06); cursor: move; touch-action: none;
+  }
+  .pip.hidden { display: none; }
+  .pip .grip {
+    position: absolute; right: -7px; bottom: -7px; width: 14px; height: 14px;
+    background: #fff; border-radius: 2px; cursor: nwse-resize;
+  }
+
+  aside { display: grid; gap: 12px; }
+  section.panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px;
+  }
+  section.panel h2 { font-size: 16px; margin: 0 0 10px; font-weight: 600; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+  .row label { flex: 1; }
+  .row input[type=text], .row input[type=password] {
+    width: 100%; background: var(--well); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px;
+  }
+  .row input[type=range] { flex: 1; accent-color: var(--text); }
+  .corners { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .state { font-size: 13px; color: var(--muted); min-height: 1.4em; word-break: break-word; }
+  .state.err { color: var(--amber); }
+  .presets { display: flex; flex-wrap: wrap; gap: 6px; }
+  .presets .btn { padding: 3px 9px; font-size: 13px; }
+
+  footer {
+    display: flex; flex-wrap: wrap; gap: 18px; padding: 8px 16px;
+    border-top: 1px solid var(--line); font-size: 13px; color: var(--muted);
+  }
+  .lamp { display: inline-flex; align-items: center; gap: 7px; }
+  .lamp::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--line); }
+  .lamp.ok::before { background: var(--tally-cam); }
+  .lamp.err::before { background: var(--amber); }
+  .lamp.live::before { background: var(--tally-live); }
+  @media (prefers-reduced-motion: reduce) { .monitor { transition: none; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Page2Cam <span>control</span></div>
+  <button class="btn icon" id="back" title="Back" aria-label="Back">&#8592;</button>
+  <button class="btn icon" id="fwd" title="Forward" aria-label="Forward">&#8594;</button>
+  <button class="btn icon" id="reload" title="Reload" aria-label="Reload">&#8635;</button>
+  <form class="url" id="urlform">
+    <input id="url" type="text" spellcheck="false" autocomplete="off" aria-label="Website address" placeholder="Website to show, e.g. example.com">
+    <button class="btn primary" type="submit">Go</button>
+    <button class="btn" type="button" id="save" title="Save this site to the quick list">Save</button>
+  </form>
+</header>
+
+<main>
+  <div>
+    <div class="monitor" id="monitor">
+      <span class="tally-label" id="tally">Preview</span>
+      <div class="screen" id="screen" tabindex="0" aria-label="Live output. Click to control the page; keys are sent while focused.">
+        <canvas id="canvas" width="960" height="540"></canvas>
+        <div class="empty" id="empty">Waiting for the first frame…</div>
+        <div class="pip" id="pip" title="Drag to move your webcam, drag the corner to resize"><div class="grip" id="grip"></div></div>
+      </div>
+    </div>
+    <p class="hint">Click, scroll and type in the picture to use the page. Drag the dashed box to place your webcam.</p>
+    <div class="presets" id="presets"></div>
+  </div>
+
+  <aside>
+    <section class="panel" aria-labelledby="h-cam">
+      <h2 id="h-cam">Webcam overlay</h2>
+      <div class="row">
+        <label for="pipOn">Show webcam</label>
+        <input type="checkbox" id="pipOn">
+      </div>
+      <div class="corners">
+        <button class="btn" data-corner="0,0">Top left</button>
+        <button class="btn" data-corner="1,0">Top right</button>
+        <button class="btn" data-corner="0,1">Bottom left</button>
+        <button class="btn" data-corner="1,1">Bottom right</button>
+      </div>
+      <div class="row">
+        <label for="pipSize">Size</label>
+        <input type="range" id="pipSize" min="5" max="50" step="1">
+      </div>
+      <div class="state" id="webcamState"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-stream">
+      <h2 id="h-stream">YouTube Live</h2>
+      <div class="row"><input type="text" id="rtmpUrl" aria-label="Server URL" spellcheck="false"></div>
+      <div class="row"><input type="password" id="streamKey" aria-label="Stream key" placeholder="Stream key" autocomplete="off"></div>
+      <div class="row">
+        <label for="remember">Remember key on this PC</label>
+        <input type="checkbox" id="remember">
+      </div>
+      <div class="row"><button class="btn primary" id="goLive" style="flex:1">Go live</button></div>
+      <div class="state" id="streamState"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-audio">
+      <h2 id="h-audio">Stream sound</h2>
+      <div class="row">
+        <input type="checkbox" id="pageOn" aria-label="Include page sound">
+        <label for="pageOn">Page sound</label>
+        <input type="range" id="pageGain" min="0" max="150" aria-label="Page volume">
+      </div>
+      <div class="row">
+        <input type="checkbox" id="micOn" aria-label="Include microphone">
+        <label for="micOn">Microphone</label>
+        <input type="range" id="micGain" min="0" max="150" aria-label="Microphone volume">
+      </div>
+      <div class="state" id="micState"></div>
+    </section>
+  </aside>
+</main>
+
+<footer>
+  <span class="lamp" id="lampCam">Virtual camera</span>
+  <span class="lamp" id="lampWebcam">Webcam</span>
+  <span class="lamp" id="lampStream">Stream</span>
+  <span class="lamp" id="lampMic">Microphone</span>
+  <span id="logFile"></span>
+</footer>
+
+<script>
+(() => {
+  const token = new URLSearchParams(location.search).get("t") || "";
+  const $ = (id) => document.getElementById(id);
+  const api = (path, body) => fetch(path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: { "x-p2c-token": token, "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  };
+
+  let state = null;
+  let pip = { visible: true, x: 1, y: 1, width: 0.25 };
+  let dragging = false;
+
+  // ---------- navigation ----------
+  $("urlform").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const r = await api("/api/navigate", { url: $("url").value });
+    if (!r.ok) { $("url").setCustomValidity(await r.text()); $("url").reportValidity(); }
+    else { $("url").setCustomValidity(""); $("screen").focus(); }
+  });
+  $("url").addEventListener("input", () => $("url").setCustomValidity(""));
+  $("back").onclick = () => api("/api/nav", { action: "back" });
+  $("fwd").onclick = () => api("/api/nav", { action: "forward" });
+  $("reload").onclick = () => api("/api/nav", { action: "reload" });
+
+  function renderPresets() {
+    const list = store.get("presets", []);
+    const box = $("presets");
+    box.replaceChildren();
+    for (const u of list) {
+      const b = document.createElement("button");
+      b.className = "btn"; b.textContent = u.replace(/^https?:\/\//, "");
+      b.title = "Show " + u + " (right-click to remove)";
+      b.onclick = () => { $("url").value = u; $("urlform").requestSubmit(); };
+      b.oncontextmenu = (e) => { e.preventDefault(); store.set("presets", list.filter(x => x !== u)); renderPresets(); };
+      box.append(b);
+    }
+  }
+  $("save").onclick = () => {
+    const u = (state && state.status.url) || $("url").value;
+    if (!u) return;
+    const list = store.get("presets", []);
+    if (!list.includes(u)) { list.push(u); store.set("presets", list); renderPresets(); }
+  };
+  renderPresets();
+
+  // ---------- preview + input ----------
+  const canvas = $("canvas"), ctx = canvas.getContext("2d"), screen = $("screen");
+  let ws, wsOpen = false;
+  function connect() {
+    ws = new WebSocket(`ws://${location.host}/ws?t=${encodeURIComponent(token)}`);
+    ws.binaryType = "blob";
+    ws.onopen = () => { wsOpen = true; };
+    ws.onclose = () => { wsOpen = false; setTimeout(connect, 1000); };
+    ws.onmessage = async (ev) => {
+      try {
+        const bmp = await createImageBitmap(ev.data);
+        if (canvas.width !== bmp.width || canvas.height !== bmp.height) { canvas.width = bmp.width; canvas.height = bmp.height; }
+        ctx.drawImage(bmp, 0, 0);
+        bmp.close();
+        $("empty").hidden = true;
+      } catch {}
+    };
+  }
+  connect();
+  const send = (m) => { if (wsOpen) ws.send(JSON.stringify(m)); };
+  const pos = (e) => { const r = screen.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }; };
+  const mods = (e) => (e.shiftKey ? 2 : 0) | (e.ctrlKey ? 4 : 0) | (e.altKey ? 8 : 0) | (e.metaKey ? 128 : 0)
+    | ((e.buttons & 1) ? 16 : 0) | ((e.buttons & 4) ? 32 : 0) | ((e.buttons & 2) ? 64 : 0);
+  const btn = (b) => (b === 1 ? 1 : b === 2 ? 2 : 0);
+  let lastMove = 0;
+  screen.addEventListener("pointermove", (e) => {
+    if (dragging) return;
+    const now = performance.now(); if (now - lastMove < 16) return; lastMove = now;
+    send({ t: "move", ...pos(e), mods: mods(e) });
+  });
+  screen.addEventListener("pointerdown", (e) => {
+    if (e.target !== canvas && e.target !== screen) return;
+    screen.focus(); screen.setPointerCapture(e.pointerId);
+    send({ t: "down", ...pos(e), b: btn(e.button), clicks: Math.max(1, e.detail), mods: mods(e) });
+  });
+  screen.addEventListener("pointerup", (e) => {
+    if (dragging) return;
+    send({ t: "up", ...pos(e), b: btn(e.button), clicks: Math.max(1, e.detail), mods: mods(e) });
+  });
+  screen.addEventListener("contextmenu", (e) => e.preventDefault());
+  screen.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const k = e.deltaMode === 1 ? 40 : 1;
+    send({ t: "wheel", ...pos(e), dx: Math.round(-e.deltaX * k), dy: Math.round(-e.deltaY * k), mods: mods(e) });
+  }, { passive: false });
+  screen.addEventListener("keydown", (e) => {
+    e.preventDefault();
+    send({ t: "key", a: "down", code: e.keyCode, mods: mods(e) });
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+      send({ t: "key", a: "char", code: e.keyCode, ch: e.key.charCodeAt(0), mods: mods(e) });
+    } else if (e.key === "Enter") {
+      send({ t: "key", a: "char", code: 13, ch: 13, mods: mods(e) });
+    }
+  });
+  screen.addEventListener("keyup", (e) => { e.preventDefault(); send({ t: "key", a: "up", code: e.keyCode, mods: mods(e) }); });
+
+  // ---------- PIP box (same geometry as the compositor: 2% margin, x/y in free space) ----------
+  const pipEl = $("pip");
+  function aspect() { return (state && state.status.webcam_aspect) || 9 / 16; }
+  function layoutPip() {
+    const r = screen.getBoundingClientRect();
+    const W = r.width, H = r.height, mx = W * 0.02, my = H * 0.02;
+    let w = pip.width * W, h = w * aspect();
+    const aw = W - 2 * mx, ah = H - 2 * my;
+    if (w > aw || h > ah) { const s = Math.min(aw / w, ah / h); w *= s; h *= s; }
+    const x = mx + Math.min(Math.max(pip.x, 0), 1) * (aw - w);
+    const y = my + Math.min(Math.max(pip.y, 0), 1) * (ah - h);
+    Object.assign(pipEl.style, { left: x + "px", top: y + "px", width: w + "px", height: h + "px" });
+    pipEl.classList.toggle("hidden", !pip.visible);
+  }
+  let pushTimer = 0;
+  function pushPip(now) {
+    clearTimeout(pushTimer);
+    const go = () => api("/api/pip", pip);
+    if (now) go(); else pushTimer = setTimeout(go, 60);
+  }
+  function startDrag(e, resize) {
+    e.preventDefault(); e.stopPropagation();
+    dragging = true;
+    pipEl.setPointerCapture(e.pointerId);
+    const r = screen.getBoundingClientRect();
+    const start = { x: e.clientX, y: e.clientY, pip: { ...pip }, box: pipEl.getBoundingClientRect() };
+    const move = (ev) => {
+      const W = r.width, H = r.height, mx = W * 0.02, my = H * 0.02;
+      if (resize) {
+        const w = Math.max(start.box.width + (ev.clientX - start.x), W * 0.05);
+        pip.width = Math.min(Math.max(w / W, 0.05), 0.5);
+      } else {
+        const w = start.box.width, h = start.box.height;
+        const left = start.box.left - r.left + (ev.clientX - start.x);
+        const top = start.box.top - r.top + (ev.clientY - start.y);
+        pip.x = Math.min(Math.max((left - mx) / Math.max(W - 2 * mx - w, 1), 0), 1);
+        pip.y = Math.min(Math.max((top - my) / Math.max(H - 2 * my - h, 1), 0), 1);
+      }
+      layoutPip(); pushPip(false); syncControls();
+    };
+    const up = () => {
+      dragging = false;
+      pipEl.removeEventListener("pointermove", move);
+      pipEl.removeEventListener("pointerup", up);
+      pushPip(true);
+    };
+    pipEl.addEventListener("pointermove", move);
+    pipEl.addEventListener("pointerup", up);
+  }
+  pipEl.addEventListener("pointerdown", (e) => startDrag(e, e.target === $("grip")));
+  new ResizeObserver(layoutPip).observe(screen);
+
+  $("pipOn").onchange = () => { pip.visible = $("pipOn").checked; layoutPip(); pushPip(true); };
+  $("pipSize").oninput = () => { pip.width = $("pipSize").value / 100; layoutPip(); pushPip(false); };
+  document.querySelectorAll("[data-corner]").forEach((b) => b.onclick = () => {
+    const [x, y] = b.dataset.corner.split(",").map(Number);
+    pip.x = x; pip.y = y; pip.visible = true; layoutPip(); pushPip(true); syncControls();
+  });
+  function syncControls() {
+    $("pipOn").checked = pip.visible;
+    $("pipSize").value = Math.round(pip.width * 100);
+  }
+
+  // ---------- stream ----------
+  $("rtmpUrl").value = store.get("rtmpUrl", "rtmp://a.rtmp.youtube.com/live2");
+  $("goLive").onclick = async () => {
+    const live = state && /^(live|connecting)/.test(state.status.stream);
+    if (live) { await api("/api/stream/stop", {}); refresh(); return; }
+    store.set("rtmpUrl", $("rtmpUrl").value);
+    $("goLive").disabled = true;
+    const r = await api("/api/stream/start", { url: $("rtmpUrl").value, key: $("streamKey").value, remember: $("remember").checked });
+    $("goLive").disabled = false;
+    if (!r.ok) { setState("streamState", "error: " + await r.text()); }
+    $("streamKey").value = "";
+    refresh();
+  };
+
+  // ---------- audio ----------
+  let audio = null;
+  function pushAudio() {
+    audio = { page_on: $("pageOn").checked, page_gain: $("pageGain").value / 100, mic_on: $("micOn").checked, mic_gain: $("micGain").value / 100 };
+    api("/api/audio", audio);
+  }
+  ["pageOn", "micOn"].forEach((id) => $(id).onchange = pushAudio);
+  ["pageGain", "micGain"].forEach((id) => $(id).oninput = pushAudio);
+
+  // ---------- status ----------
+  function setState(id, text) { const el = $(id); el.textContent = text || ""; el.classList.toggle("err", /^error/.test(text || "")); }
+  function lamp(id, text, liveWord) {
+    const el = $(id);
+    el.className = "lamp " + (liveWord && text === liveWord ? "live" : /^ok/.test(text) ? "ok" : /^error/.test(text) ? "err" : "");
+    el.title = text;
+  }
+  let first = true;
+  async function refresh() {
+    try {
+      const r = await api("/api/state");
+      if (!r.ok) { setState("streamState", "error: this page lost access. Reopen it from the Page2Cam window."); return; }
+      state = await r.json();
+      const s = state.status;
+      if (first || document.activeElement !== $("url")) $("url").value = s.url;
+      if (!dragging) { pip = state.pip; syncControls(); layoutPip(); }
+      if (first) {
+        audio = state.audio;
+        $("pageOn").checked = audio.page_on; $("pageGain").value = Math.round(audio.page_gain * 100);
+        $("micOn").checked = audio.mic_on; $("micGain").value = Math.round(audio.mic_gain * 100);
+        if (s.stream_url) $("rtmpUrl").value = s.stream_url;
+        first = false;
+      }
+      $("streamKey").placeholder = s.has_saved_key ? "Stream key (saved key will be used)" : "Stream key";
+      const live = s.stream === "live", connecting = s.stream === "connecting";
+      $("goLive").textContent = live ? "End stream" : connecting ? "Cancel" : "Go live";
+      $("goLive").classList.toggle("live", live);
+      setState("streamState", live ? "Live on " + s.stream_url : connecting ? "Connecting…" : s.stream === "idle" ? "" : s.stream);
+      setState("webcamState", s.webcam === "none" ? "No webcam found. Plug one in and restart Page2Cam." : /^error/.test(s.webcam) ? s.webcam : "");
+      setState("micState", /^error/.test(s.mic) ? s.mic : s.mic === "none" ? "No microphone found." : "");
+      const camOn = /^ok/.test(s.vcam);
+      const mon = $("monitor");
+      mon.classList.toggle("live", live);
+      mon.classList.toggle("cam", camOn && !live);
+      $("tally").textContent = live ? "On air" : camOn ? "Camera on" : "Preview";
+      lamp("lampCam", s.vcam); lamp("lampWebcam", s.webcam); lamp("lampStream", s.stream, "live"); lamp("lampMic", s.mic);
+      $("lampCam").textContent = camOn ? "Virtual camera" : "Virtual camera off";
+      $("logFile").textContent = s.log_file ? "Log: " + s.log_file : "";
+    } catch {
+      setState("streamState", "error: Page2Cam is not responding. Is it still running?");
+    }
+  }
+  refresh();
+  setInterval(refresh, 1000);
+})();
+</script>
+</body>
+</html>

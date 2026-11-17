@@ -1,0 +1,12 @@
+[package]
+name = "p2c-audio"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+p2c-core.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+cpal = "0.15"

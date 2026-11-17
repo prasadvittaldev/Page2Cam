@@ -20,3 +20,6 @@ p2c-compositor = { path = "crates/p2c-compositor" }
 p2c-vcam = { path = "crates/p2c-vcam" }
 p2c-browser = { path = "crates/p2c-browser" }
 p2c-webcam = { path = "crates/p2c-webcam" }
+p2c-audio = { path = "crates/p2c-audio" }
+p2c-stream = { path = "crates/p2c-stream" }
+p2c-admin = { path = "crates/p2c-admin" }

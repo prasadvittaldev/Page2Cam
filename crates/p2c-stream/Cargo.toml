@@ -1,0 +1,17 @@
+[package]
+name = "p2c-stream"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+p2c-core.workspace = true
+p2c-compositor.workspace = true
+p2c-audio.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+tempfile.workspace = true

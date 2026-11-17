@@ -44,6 +44,16 @@ fn fit_rect(sw: u32, sh: u32, ow: u32, oh: u32) -> (u32, u32, u32, u32) {
     ((ow - dw) / 2, (oh - dh) / 2, dw, dh)
 }
 
+/// Scale a frame to exactly `dw` x `dh` (bilinear).
+pub fn scale_frame(src: &Frame, dw: u32, dh: u32) -> Frame {
+    let img = scale(src, dw, dh);
+    Frame {
+        width: dw,
+        height: dh,
+        data: img.into_vec(),
+    }
+}
+
 pub(crate) fn scale(src: &Frame, dw: u32, dh: u32) -> Image<'static> {
     let src_img = ImageRef::new(src.width, src.height, &src.data, PixelType::U8x4)
         .expect("Frame invariant: len == w*h*4");
@@ -98,6 +108,13 @@ mod tests {
         compose(Some(&solid(64, 36, RED)), Some((&cam, &layout)), &mut out);
         assert_eq!(out.pixel(2, 2), BLUE);
         assert_eq!(out.pixel(40, 20), RED);
+    }
+
+    #[test]
+    fn scale_frame_resizes() {
+        let f = scale_frame(&solid(8, 8, RED), 4, 2);
+        assert_eq!((f.width, f.height, f.data.len()), (4, 2, 32));
+        assert_eq!(f.pixel(1, 1), RED);
     }
 
     #[test]

@@ -3,6 +3,6 @@ mod compose;
 mod pip;
 mod ticker;
 
-pub use compose::compose;
+pub use compose::{compose, scale_frame};
 pub use pip::{pip_rect, Corner, PipLayout};
 pub use ticker::{FrameSink, OutputSpec, Ticker};
