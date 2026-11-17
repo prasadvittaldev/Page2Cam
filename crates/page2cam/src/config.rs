@@ -50,17 +50,19 @@ impl Default for Config {
 
 impl Config {
     /// Load from `path`, else `<config_dir>/page2cam/config.toml` if present, else defaults.
+    /// Load from `path`, else `page2cam.toml` next to the executable, else
+    /// `<config_dir>/page2cam/config.toml`, else defaults.
     pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
-        let default_path = directories::ProjectDirs::from("", "", "page2cam")
-            .map(|d| d.config_dir().join("config.toml"));
-        let path = match path {
-            Some(p) => Some(p.to_path_buf()),
-            None => default_path.filter(|p| p.exists()),
-        };
-        let cfg = match path {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let user_dir = directories::ProjectDirs::from("", "", "page2cam")
+            .map(|d| d.config_dir().to_path_buf());
+        let cfg = match config_path(path, exe_dir.as_deref(), user_dir.as_deref()) {
             Some(p) => {
                 let text = std::fs::read_to_string(&p)
                     .with_context(|| format!("reading {}", p.display()))?;
+                tracing::info!(config = %p.display(), "using settings file");
                 toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))?
             }
             None => Config::default(),
@@ -124,6 +126,25 @@ impl Config {
         };
         Ok(PipLayout::preset(corner, width))
     }
+}
+
+/// Which settings file to use (see [`Config::load`]).
+fn config_path(
+    explicit: Option<&Path>,
+    exe_dir: Option<&Path>,
+    user_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(p.to_path_buf());
+    }
+    let beside = exe_dir
+        .map(|d| d.join("page2cam.toml"))
+        .filter(|p| p.is_file());
+    beside.or_else(|| {
+        user_dir
+            .map(|d| d.join("config.toml"))
+            .filter(|p| p.is_file())
+    })
 }
 
 #[cfg(test)]
@@ -223,6 +244,27 @@ mod tests {
             ..Config::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn config_next_to_exe_wins_over_user_dir() {
+        let exe_dir = tempfile::tempdir().unwrap();
+        let user_dir = tempfile::tempdir().unwrap();
+        std::fs::write(user_dir.path().join("config.toml"), "fps = 25").unwrap();
+        assert_eq!(
+            config_path(None, Some(exe_dir.path()), Some(user_dir.path())),
+            Some(user_dir.path().join("config.toml"))
+        );
+        std::fs::write(exe_dir.path().join("page2cam.toml"), "fps = 24").unwrap();
+        assert_eq!(
+            config_path(None, Some(exe_dir.path()), Some(user_dir.path())),
+            Some(exe_dir.path().join("page2cam.toml"))
+        );
+        let explicit = Path::new("/x/y.toml");
+        assert_eq!(
+            config_path(Some(explicit), Some(exe_dir.path()), None),
+            Some(explicit.to_path_buf())
+        );
     }
 
     #[test]

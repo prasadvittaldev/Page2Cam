@@ -1,0 +1,24 @@
+# Page2Cam settings. Delete a line to use the default.
+
+# Page shown at start (you can change it any time in the control page).
+url = "https://example.com"
+
+# Output size and frame rate for the camera and the stream.
+width = 1920
+height = 1080
+fps = 30
+
+# Your webcam overlay: top-left, top-right, bottom-left, bottom-right or off.
+pip = "bottom-right"
+# Overlay width in percent of the picture (5 to 50).
+pip_size = 25
+# Use the webcam whose name contains this text (default: the first one found).
+# webcam = "C920"
+
+# YouTube Live server and video quality (kbit/s).
+rtmp_url = "rtmp://a.rtmp.youtube.com/live2"
+video_kbps = 4500
+
+# Control page.
+admin_port = 8765
+open_admin = true
