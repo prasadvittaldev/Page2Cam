@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+fast_image_resize = "5"
+tempfile = "3"
+p2c-core = { path = "crates/p2c-core" }
+p2c-compositor = { path = "crates/p2c-compositor" }
+p2c-vcam = { path = "crates/p2c-vcam" }
+p2c-browser = { path = "crates/p2c-browser" }
+p2c-webcam = { path = "crates/p2c-webcam" }

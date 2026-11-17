@@ -1,0 +1,9 @@
+[package]
+name = "p2c-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+thiserror.workspace = true
