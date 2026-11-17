@@ -1,0 +1,11 @@
+[package]
+name = "p2c-webcam"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+p2c-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+nokhwa = { version = "0.10", features = ["input-native"] }
