@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use cef::args::Args;
 use cef::{CefString, ImplBrowser, ImplBrowserHost, ImplCommandLine, ImplFrame};
-use p2c_core::FrameSlot;
+use p2c_core::{AudioRing, FrameSlot};
+use parking_lot::Mutex;
 
 #[derive(Clone, Debug)]
 pub struct BrowserConfig {
@@ -23,26 +24,133 @@ pub struct BrowserConfig {
     pub fps: u32,
     /// Persistent profile (cookies, logins) directory.
     pub profile_dir: PathBuf,
+    /// Where page audio goes (48 kHz stereo). `None`: the page plays to speakers.
+    pub audio: Option<AudioRing>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyKind {
+    /// Key pressed (CEF RAWKEYDOWN).
+    Down,
+    Up,
+    /// Text input for a printable character.
+    Char,
+}
+
+/// A keyboard event. `windows_key_code` is a Windows virtual-key code (what
+/// the DOM's `keyCode` reports); `character` is the UTF-16 unit for `Char`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyInput {
+    pub kind: KeyKind,
+    pub windows_key_code: i32,
+    pub character: u16,
+    /// CEF `EVENTFLAG_*` bits (shift 2, ctrl 4, alt 8, ...).
+    pub modifiers: u32,
 }
 
 enum Cmd {
     Navigate(String),
+    Back,
+    Forward,
+    Reload,
+    MouseMove {
+        x: i32,
+        y: i32,
+        mods: u32,
+    },
+    MouseButton {
+        x: i32,
+        y: i32,
+        button: MouseButton,
+        down: bool,
+        clicks: i32,
+        mods: u32,
+    },
+    Wheel {
+        x: i32,
+        y: i32,
+        dx: i32,
+        dy: i32,
+        mods: u32,
+    },
+    Key(KeyInput),
     Shutdown,
 }
 
 /// Thread-safe control handle; commands run on the CEF main thread.
+/// Coordinates are page pixels.
 #[derive(Clone)]
 pub struct BrowserHandle {
     tx: Sender<Cmd>,
+    url: Arc<Mutex<String>>,
 }
 
 impl BrowserHandle {
+    fn send(&self, c: Cmd) {
+        let _ = self.tx.send(c);
+    }
+
     pub fn navigate(&self, url: &str) {
-        let _ = self.tx.send(Cmd::Navigate(url.to_owned()));
+        self.send(Cmd::Navigate(url.to_owned()));
+    }
+
+    pub fn back(&self) {
+        self.send(Cmd::Back);
+    }
+
+    pub fn forward(&self) {
+        self.send(Cmd::Forward);
+    }
+
+    pub fn reload(&self) {
+        self.send(Cmd::Reload);
+    }
+
+    pub fn mouse_move(&self, x: i32, y: i32, mods: u32) {
+        self.send(Cmd::MouseMove { x, y, mods });
+    }
+
+    pub fn mouse_button(
+        &self,
+        x: i32,
+        y: i32,
+        button: MouseButton,
+        down: bool,
+        clicks: i32,
+        mods: u32,
+    ) {
+        self.send(Cmd::MouseButton {
+            x,
+            y,
+            button,
+            down,
+            clicks,
+            mods,
+        });
+    }
+
+    pub fn wheel(&self, x: i32, y: i32, dx: i32, dy: i32, mods: u32) {
+        self.send(Cmd::Wheel { x, y, dx, dy, mods });
+    }
+
+    pub fn key(&self, k: KeyInput) {
+        self.send(Cmd::Key(k));
+    }
+
+    /// URL of the main frame as last reported by the browser.
+    pub fn current_url(&self) -> String {
+        self.url.lock().clone()
     }
 
     pub fn shutdown(&self) {
-        let _ = self.tx.send(Cmd::Shutdown);
+        self.send(Cmd::Shutdown);
     }
 }
 
@@ -96,7 +204,15 @@ pub fn run(
     );
 
     let closed = Arc::new(AtomicBool::new(false));
-    let mut client = handlers::client(slot, cfg.width, cfg.height, closed.clone());
+    let url = Arc::new(Mutex::new(cfg.url.clone()));
+    let mut client = handlers::client(handlers::ClientParts {
+        slot,
+        width: cfg.width,
+        height: cfg.height,
+        closed: closed.clone(),
+        url: url.clone(),
+        audio: cfg.audio.clone(),
+    });
     let window_info = cef::WindowInfo {
         windowless_rendering_enabled: 1,
         ..Default::default()
@@ -119,7 +235,7 @@ pub fn run(
     };
 
     let (tx, rx): (Sender<Cmd>, Receiver<Cmd>) = mpsc::channel();
-    ready(BrowserHandle { tx });
+    ready(BrowserHandle { tx, url });
 
     // Pump CEF from this thread; poll commands between pumps.
     let mut closing_since: Option<Instant> = None;
@@ -130,6 +246,47 @@ pub fn run(
                 Cmd::Navigate(url) => {
                     if let Some(frame) = browser.main_frame() {
                         frame.load_url(Some(&CefString::from(url.as_str())));
+                    }
+                }
+                Cmd::Back => browser.go_back(),
+                Cmd::Forward => browser.go_forward(),
+                Cmd::Reload => browser.reload(),
+                Cmd::MouseMove { x, y, mods } => {
+                    if let Some(host) = browser.host() {
+                        host.send_mouse_move_event(Some(&mouse(x, y, mods)), 0);
+                    }
+                }
+                Cmd::MouseButton {
+                    x,
+                    y,
+                    button,
+                    down,
+                    clicks,
+                    mods,
+                } => {
+                    if let Some(host) = browser.host() {
+                        host.set_focus(1);
+                        let b = match button {
+                            MouseButton::Left => cef::MouseButtonType::LEFT,
+                            MouseButton::Middle => cef::MouseButtonType::MIDDLE,
+                            MouseButton::Right => cef::MouseButtonType::RIGHT,
+                        };
+                        host.send_mouse_click_event(
+                            Some(&mouse(x, y, mods)),
+                            b,
+                            (!down) as _,
+                            clicks,
+                        );
+                    }
+                }
+                Cmd::Wheel { x, y, dx, dy, mods } => {
+                    if let Some(host) = browser.host() {
+                        host.send_mouse_wheel_event(Some(&mouse(x, y, mods)), dx, dy);
+                    }
+                }
+                Cmd::Key(k) => {
+                    if let Some(host) = browser.host() {
+                        host.send_key_event(Some(&key_event(k)));
                     }
                 }
                 Cmd::Shutdown if closing_since.is_none() => {
@@ -156,6 +313,35 @@ pub fn run(
     }
     cef::shutdown();
     Ok(())
+}
+
+fn mouse(x: i32, y: i32, modifiers: u32) -> cef::MouseEvent {
+    cef::MouseEvent { x, y, modifiers }
+}
+
+/// CEF expects the character in `windows_key_code` for CHAR events on Windows
+/// (like WM_CHAR), but the virtual-key code on Linux (like cefclient's GTK path).
+fn key_code_for(k: KeyInput) -> i32 {
+    if k.kind == KeyKind::Char && (cfg!(windows) || k.windows_key_code == 0) {
+        k.character as i32
+    } else {
+        k.windows_key_code
+    }
+}
+
+fn key_event(k: KeyInput) -> cef::KeyEvent {
+    cef::KeyEvent {
+        type_: match k.kind {
+            KeyKind::Down => cef::KeyEventType::RAWKEYDOWN,
+            KeyKind::Up => cef::KeyEventType::KEYUP,
+            KeyKind::Char => cef::KeyEventType::CHAR,
+        },
+        modifiers: k.modifiers,
+        windows_key_code: key_code_for(k),
+        character: k.character,
+        unmodified_character: k.character,
+        ..Default::default()
+    }
 }
 
 /// Leave the pump loop once the browser has closed, whatever closed it

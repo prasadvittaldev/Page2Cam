@@ -1276,6 +1276,7 @@ dependencies = [
  "anyhow",
  "cef",
  "p2c-core",
+ "parking_lot",
  "tracing",
 ]
 

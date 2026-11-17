@@ -1,9 +1,10 @@
 //! CEF callback objects: App, Client, RenderHandler, LifeSpanHandler.
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
 use cef::*;
-use p2c_core::{Frame, FrameSlot};
+use p2c_core::{AudioRing, Frame, FrameSlot, SAMPLE_RATE};
+use parking_lot::Mutex;
 
 wrap_app! {
     struct P2cApp {}
@@ -93,10 +94,75 @@ wrap_life_span_handler! {
     }
 }
 
+wrap_display_handler! {
+    struct P2cDisplay {
+        url: Arc<Mutex<String>>,
+    }
+
+    impl DisplayHandler {
+        fn on_address_change(&self, _browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, url: Option<&CefString>) {
+            if let (Some(frame), Some(url)) = (frame, url) {
+                if frame.is_main() == 1 {
+                    *self.url.lock() = url.to_string();
+                }
+            }
+        }
+    }
+}
+
+wrap_audio_handler! {
+    struct P2cAudio {
+        ring: AudioRing,
+        channels: Arc<AtomicI32>,
+    }
+
+    impl AudioHandler {
+        fn audio_parameters(&self, _browser: Option<&mut Browser>, params: Option<&mut AudioParameters>) -> ::std::os::raw::c_int {
+            if let Some(p) = params {
+                p.channel_layout = ChannelLayout::LAYOUT_STEREO;
+                p.sample_rate = SAMPLE_RATE as _;
+                p.frames_per_buffer = 480;
+            }
+            1
+        }
+
+        fn on_audio_stream_started(&self, _browser: Option<&mut Browser>, _params: Option<&AudioParameters>, channels: ::std::os::raw::c_int) {
+            self.channels.store(channels, Ordering::SeqCst);
+        }
+
+        fn on_audio_stream_packet(&self, _browser: Option<&mut Browser>, data: *mut *const f32, frames: ::std::os::raw::c_int, _pts: i64) {
+            let ch = self.channels.load(Ordering::SeqCst).max(1) as usize;
+            if data.is_null() || frames <= 0 {
+                return;
+            }
+            // SAFETY: CEF passes `channels` planar buffers of `frames` samples each.
+            let planes: Vec<&[f32]> = (0..ch)
+                .map(|c| unsafe { std::slice::from_raw_parts(*data.add(c), frames as usize) })
+                .collect();
+            self.ring.push(&interleave_stereo(&planes));
+        }
+    }
+}
+
+/// Planar channels → interleaved stereo (mono is duplicated; extra channels dropped).
+pub(crate) fn interleave_stereo(planes: &[&[f32]]) -> Vec<f32> {
+    let n = planes.first().map_or(0, |p| p.len());
+    let l = planes.first().copied().unwrap_or(&[]);
+    let r = planes.get(1).copied().unwrap_or(l);
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        out.push(l[i]);
+        out.push(r[i]);
+    }
+    out
+}
+
 wrap_client! {
     struct P2cClient {
         render: RenderHandler,
         life_span: LifeSpanHandler,
+        display: DisplayHandler,
+        audio: Option<AudioHandler>,
     }
 
     impl Client {
@@ -107,12 +173,46 @@ wrap_client! {
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
             Some(self.life_span.clone())
         }
+
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(self.display.clone())
+        }
+
+        fn audio_handler(&self) -> Option<AudioHandler> {
+            self.audio.clone()
+        }
     }
 }
 
-pub(crate) fn client(slot: FrameSlot, width: u32, height: u32, closed: Arc<AtomicBool>) -> Client {
+pub(crate) struct ClientParts {
+    pub slot: FrameSlot,
+    pub width: u32,
+    pub height: u32,
+    pub closed: Arc<AtomicBool>,
+    pub url: Arc<Mutex<String>>,
+    pub audio: Option<AudioRing>,
+}
+
+pub(crate) fn client(p: ClientParts) -> Client {
     P2cClient::new(
-        P2cRenderHandler::new(slot, width, height),
-        P2cLifeSpan::new(closed),
+        P2cRenderHandler::new(p.slot, p.width, p.height),
+        P2cLifeSpan::new(p.closed),
+        P2cDisplay::new(p.url),
+        p.audio
+            .map(|ring| P2cAudio::new(ring, Arc::new(AtomicI32::new(2)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interleave_planar() {
+        let l = [1.0, 2.0];
+        let r = [-1.0, -2.0];
+        assert_eq!(interleave_stereo(&[&l, &r]), vec![1.0, -1.0, 2.0, -2.0]);
+        assert_eq!(interleave_stereo(&[&l]), vec![1.0, 1.0, 2.0, 2.0]);
+        assert!(interleave_stereo(&[]).is_empty());
+    }
 }
