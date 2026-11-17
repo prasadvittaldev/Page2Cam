@@ -9,3 +9,6 @@ p2c-core.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 nokhwa = { version = "0.10", features = ["input-native"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -19,13 +19,23 @@ pub fn pick_camera(
     let wanted = wanted.map(str::to_lowercase);
     cams.iter()
         .filter(|c| !c.name.contains("Page2Cam"))
-        .filter(|c| own_device.is_none_or(|own| c.path.as_deref() != Some(own)))
+        .filter(|c| {
+            own_device.is_none_or(|own| c.path.as_deref().is_none_or(|p| !same_device(p, own)))
+        })
         .find(|c| {
             wanted
                 .as_ref()
                 .is_none_or(|w| c.name.to_lowercase().contains(w))
         })
         .cloned()
+}
+
+/// Same device node, resolving symlinks (e.g. /dev/v4l/by-id/...) when possible.
+fn same_device(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 #[cfg(test)]
@@ -68,6 +78,17 @@ mod tests {
             cam(1, "Logitech C920", None),
         ];
         assert_eq!(pick_camera(&cams, Some("c920"), None).unwrap().index, 1);
+    }
+
+    #[test]
+    fn picker_skips_own_device_via_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("video5");
+        std::fs::write(&real, b"").unwrap();
+        let link = dir.path().join("by-id-page2cam");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let cams = [cam(0, "Dummy video device", Some(real.to_str().unwrap()))];
+        assert!(pick_camera(&cams, None, Some(&link)).is_none());
     }
 
     #[test]

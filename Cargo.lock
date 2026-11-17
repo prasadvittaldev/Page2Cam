@@ -1330,6 +1330,7 @@ dependencies = [
  "anyhow",
  "cef",
  "p2c-core",
+ "tracing",
 ]
 
 [[package]]
@@ -1369,6 +1370,7 @@ dependencies = [
  "anyhow",
  "nokhwa",
  "p2c-core",
+ "tempfile",
  "tracing",
 ]
 

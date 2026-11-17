@@ -141,10 +141,11 @@ pub fn run(
                 Cmd::Shutdown => {}
             }
         }
-        if let Some(t) = closing_since {
-            if closed.load(Ordering::SeqCst) || t.elapsed() > Duration::from_secs(3) {
-                break;
+        if should_exit(closed.load(Ordering::SeqCst), closing_since, Instant::now()) {
+            if !closed.load(Ordering::SeqCst) {
+                tracing::warn!("browser did not close within 3 s; shutting down anyway");
             }
+            break;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -155,6 +156,13 @@ pub fn run(
     }
     cef::shutdown();
     Ok(())
+}
+
+/// Leave the pump loop once the browser has closed, whatever closed it
+/// (our Shutdown, `window.close()`, Chromium's own signal handling), or 3 s
+/// after we asked it to close.
+fn should_exit(closed: bool, closing_since: Option<Instant>, now: Instant) -> bool {
+    closed || closing_since.is_some_and(|t| now.duration_since(t) > Duration::from_secs(3))
 }
 
 pub(crate) fn add_switches(cmd: &mut cef::CommandLine) {
@@ -171,4 +179,27 @@ pub(crate) fn add_switches(cmd: &mut cef::CommandLine) {
         Some(&CefString::from("autoplay-policy")),
         Some(&CefString::from("no-user-gesture-required")),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exits_when_browser_closed_without_shutdown_command() {
+        let now = Instant::now();
+        assert!(should_exit(true, None, now));
+    }
+
+    #[test]
+    fn keeps_running_while_open() {
+        assert!(!should_exit(false, None, Instant::now()));
+    }
+
+    #[test]
+    fn closing_waits_then_gives_up_after_3s() {
+        let t = Instant::now();
+        assert!(!should_exit(false, Some(t), t + Duration::from_secs(1)));
+        assert!(should_exit(false, Some(t), t + Duration::from_secs(4)));
+    }
 }
