@@ -26,7 +26,7 @@ impl PreviewSink {
 impl FrameSink for PreviewSink {
     fn push(&mut self, frame: &Frame) -> anyhow::Result<()> {
         self.n = self.n.wrapping_add(1);
-        if self.n % self.every == 0 {
+        if self.n.is_multiple_of(self.every) {
             self.slot.put(frame.clone());
         }
         Ok(())
