@@ -3,7 +3,7 @@ use p2c_core::Frame;
 /// Convert BGRA to packed YUYV (YUY2), BT.601 limited range.
 /// Chroma is averaged across each horizontal pixel pair. Width must be even.
 pub fn bgra_to_yuyv(src: &Frame, dst: &mut Vec<u8>) {
-    debug_assert!(src.width % 2 == 0, "YUYV requires even width");
+    debug_assert!(src.width.is_multiple_of(2), "YUYV requires even width");
     dst.resize(src.width as usize * src.height as usize * 2, 0);
     let (pairs, _) = src.data.as_chunks::<8>();
     let (out, _) = dst.as_chunks_mut::<4>();

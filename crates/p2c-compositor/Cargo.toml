@@ -1,0 +1,11 @@
+[package]
+name = "p2c-compositor"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+p2c-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+fast_image_resize.workspace = true
