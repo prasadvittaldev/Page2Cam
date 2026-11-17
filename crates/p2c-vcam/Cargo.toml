@@ -6,3 +6,11 @@ license.workspace = true
 
 [dependencies]
 p2c-core.workspace = true
+p2c-compositor.workspace = true
+anyhow.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["ioctl"] }
+
+[dev-dependencies]
+tempfile.workspace = true
