@@ -10,6 +10,9 @@ p2c-compositor.workspace = true
 p2c-vcam.workspace = true
 p2c-browser.workspace = true
 p2c-webcam.workspace = true
+p2c-audio.workspace = true
+p2c-stream.workspace = true
+p2c-admin.workspace = true
 parking_lot.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -19,6 +22,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 directories = "5"
 ctrlc = { version = "3", features = ["termination"] }
+keyring = { version = "3", features = ["windows-native", "sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tempfile.workspace = true

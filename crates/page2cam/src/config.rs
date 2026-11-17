@@ -19,6 +19,14 @@ pub struct Config {
     pub pip_size: u32,
     /// Pick the webcam whose name contains this (case-insensitive); default: first one.
     pub webcam: Option<String>,
+    /// Admin page port on 127.0.0.1 (another free port is used if taken).
+    pub admin_port: u16,
+    /// Open the admin page in the default browser at startup.
+    pub open_admin: bool,
+    /// RTMP server pre-filled in the admin page.
+    pub rtmp_url: String,
+    /// Stream video bitrate in kbit/s.
+    pub video_kbps: u32,
 }
 
 impl Default for Config {
@@ -32,6 +40,10 @@ impl Default for Config {
             pip: "bottom-right".into(),
             pip_size: 25,
             webcam: None,
+            admin_port: 8765,
+            open_admin: true,
+            rtmp_url: "rtmp://a.rtmp.youtube.com/live2".into(),
+            video_kbps: 4500,
         }
     }
 }
@@ -84,6 +96,11 @@ impl Config {
             self.pip_size
         );
         self.pip_layout()?;
+        anyhow::ensure!(
+            (500..=20_000).contains(&self.video_kbps),
+            "video_kbps must be 500..=20000 (got {})",
+            self.video_kbps
+        );
         Ok(())
     }
 
@@ -188,6 +205,21 @@ mod tests {
         );
         let c = Config {
             pip: "middle".into(),
+            ..Config::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn stream_defaults_target_youtube() {
+        let c = Config::default();
+        assert_eq!(c.rtmp_url, "rtmp://a.rtmp.youtube.com/live2");
+        assert_eq!(
+            (c.video_kbps, c.admin_port, c.open_admin),
+            (4500, 8765, true)
+        );
+        let c = Config {
+            video_kbps: 100,
             ..Config::default()
         };
         assert!(c.validate().is_err());
