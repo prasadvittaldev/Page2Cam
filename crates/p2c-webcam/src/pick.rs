@@ -80,6 +80,7 @@ mod tests {
         assert_eq!(pick_camera(&cams, Some("c920"), None).unwrap().index, 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn picker_skips_own_device_via_symlink() {
         let dir = tempfile::tempdir().unwrap();

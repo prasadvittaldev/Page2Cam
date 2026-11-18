@@ -32,6 +32,29 @@ pub fn choose_format(formats: &[CameraFormat]) -> Option<CameraFormat> {
         })
 }
 
+/// One line listing a camera's modes, grouped by format and size, e.g.
+/// "MJPEG 1280x720 @15/30, YUYV 640x480 @30" (for the log).
+pub fn describe_modes(formats: &[CameraFormat]) -> String {
+    let mut groups: Vec<(FrameFormat, u32, u32, Vec<u32>)> = Vec::new();
+    for f in formats {
+        let key = (f.format(), f.width(), f.height());
+        match groups.iter_mut().find(|g| (g.0, g.1, g.2) == key) {
+            Some(g) => g.3.push(f.frame_rate()),
+            None => groups.push((key.0, key.1, key.2, vec![f.frame_rate()])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(fmt, w, h, mut fps)| {
+            fps.sort_unstable();
+            fps.dedup();
+            let fps: Vec<String> = fps.iter().map(u32::to_string).collect();
+            format!("{fmt} {w}x{h} @{}", fps.join("/"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Lower is better; None = we cannot decode it.
 fn format_rank(f: FrameFormat) -> Option<u8> {
     match f {
@@ -96,6 +119,17 @@ mod tests {
             f(640, 480, FrameFormat::MJPEG, 15),
         ]);
         assert_eq!(got, Some(f(640, 480, FrameFormat::MJPEG, 15)));
+    }
+
+    #[test]
+    fn modes_are_summarized_compactly() {
+        let s = describe_modes(&[
+            f(1280, 720, FrameFormat::MJPEG, 30),
+            f(1280, 720, FrameFormat::MJPEG, 15),
+            f(1280, 720, FrameFormat::MJPEG, 30),
+            f(640, 480, FrameFormat::YUYV, 30),
+        ]);
+        assert_eq!(s, "MJPEG 1280x720 @15/30, YUYV 640x480 @30");
     }
 
     #[test]

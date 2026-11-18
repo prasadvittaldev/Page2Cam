@@ -69,15 +69,11 @@ impl WebcamCapture {
                         return;
                     }
                 };
-                let started = std::time::Instant::now();
-                let mut frames = 0u32;
-                let mut reported = false;
+                // First report after 5 s (start-up included), then every 30 s,
+                // so a camera slowing down (e.g. dim light) shows in the log.
+                let mut rate = p2c_core::RateWindow::new(Duration::from_secs(5), std::time::Instant::now());
+                let mut first = true;
                 while !stop2.load(Ordering::Relaxed) {
-                    if !reported && started.elapsed() >= Duration::from_secs(5) {
-                        let fps = frames as f64 / started.elapsed().as_secs_f64();
-                        tracing::info!(camera = %cam.name, "webcam measured {fps:.1} fps");
-                        reported = true;
-                    }
                     let frame = match camera.frame() {
                         Ok(f) => f,
                         Err(e) => {
@@ -94,7 +90,14 @@ impl WebcamCapture {
                     match crate::decode::to_bgra(fmt, res.width(), res.height(), frame.buffer()) {
                         Ok(f) => {
                             slot.put(f);
-                            frames += 1;
+                            let now = std::time::Instant::now();
+                            if let Some(fps) = rate.tick(now) {
+                                tracing::info!(camera = %cam.name, "webcam measured {fps:.1} fps");
+                                if first {
+                                    rate = p2c_core::RateWindow::new(Duration::from_secs(30), now);
+                                    first = false;
+                                }
+                            }
                         }
                         Err(e) => tracing::debug!(error = %e, "dropping undecodable webcam frame"),
                     }
@@ -152,23 +155,32 @@ fn open(cam: &CameraInfo) -> anyhow::Result<Camera> {
         .with_context(|| format!("opening webcam {}", cam.name))?;
     // Prefer a mode that really delivers ~30 fps (some webcams default to a
     // slow high-resolution mode). If listing fails, keep the Closest request.
+    // On Windows, nokhwa lists only whole-number frame rates (a mode at
+    // 30000/1001 is left out) and reports the active rate wrongly, so the log
+    // shows the mode list and the measured rate rather than its fps.
     match camera.compatible_camera_formats() {
         Ok(modes) => {
-            tracing::debug!(camera = %cam.name, ?modes, "webcam modes");
-            if let Some(m) = crate::format::choose_format(&modes) {
-                let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(m));
-                if let Err(e) = camera.set_camera_requset(req) {
-                    tracing::warn!(camera = %cam.name, error = %e, "could not select webcam mode {m}");
+            tracing::info!(camera = %cam.name, "webcam modes: {}", crate::format::describe_modes(&modes));
+            match crate::format::choose_format(&modes) {
+                Some(m) => {
+                    tracing::info!(camera = %cam.name, "webcam mode chosen: {m}");
+                    let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(m));
+                    if let Err(e) = camera.set_camera_requset(req) {
+                        tracing::warn!(camera = %cam.name, error = %e, "could not select webcam mode {m}");
+                    }
+                }
+                None => {
+                    tracing::warn!(camera = %cam.name, "no usable webcam mode listed; using the camera default")
                 }
             }
         }
-        Err(e) => tracing::debug!(camera = %cam.name, error = %e, "cannot list webcam modes"),
+        Err(e) => tracing::warn!(camera = %cam.name, error = %e, "cannot list webcam modes"),
     }
     camera
         .open_stream()
         .with_context(|| format!("starting webcam {}", cam.name))?;
     let fmt = camera.camera_format();
-    tracing::info!(camera = %cam.name, "webcam {}x{}@{} {:?}", fmt.width(), fmt.height(), fmt.frame_rate(), fmt.format());
+    tracing::info!(camera = %cam.name, "webcam {}x{} {:?}", fmt.width(), fmt.height(), fmt.format());
     Ok(camera)
 }
 
