@@ -22,6 +22,8 @@ use crate::input::{map_preview, normalize_url};
 use crate::preview::spawn_encoder;
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
+const LOGO_PNG: &[u8] = include_bytes!("../ui/logo.png");
+const ICON_PNG: &[u8] = include_bytes!("../ui/icon.png");
 
 type Jpeg = Option<Arc<Vec<u8>>>;
 
@@ -73,10 +75,13 @@ pub(crate) fn router(st: State) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/state", get(state))
+        .route("/ui/logo.png", get(|| async { png(LOGO_PNG) }))
+        .route("/ui/icon.png", get(|| async { png(ICON_PNG) }))
         .route("/api/navigate", post(navigate))
         .route("/api/nav", post(nav))
         .route("/api/pip", post(pip))
         .route("/api/cutout", post(cutout))
+        .route("/api/update/install", post(update_install))
         .route("/api/stream/start", post(stream_start))
         .route("/api/stream/stop", post(stream_stop))
         .route("/api/audio", post(audio))
@@ -177,6 +182,16 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+fn png(bytes: &'static [u8]) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "max-age=86400"),
+        ],
+        bytes,
+    )
+}
+
 async fn index() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-store")], Html(INDEX_HTML))
 }
@@ -228,6 +243,16 @@ async fn pip(AxState(st): AxState<State>, Json(b): Json<PipDto>) -> Response {
 #[derive(Deserialize)]
 struct CutoutBody {
     engine: String,
+}
+
+async fn update_install(AxState(st): AxState<State>) -> Response {
+    // Downloading 300 MB takes a while: run it off the async runtime.
+    let c = st.controls.clone();
+    match tokio::task::spawn_blocking(move || c.install_update()).await {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 async fn cutout(AxState(st): AxState<State>, Json(b): Json<CutoutBody>) -> Response {
@@ -427,6 +452,7 @@ mod tests {
             pub pip: Mutex<PipLayout>,
             pub streams: Mutex<Vec<StreamRequest>>,
             pub engine: Mutex<String>,
+            pub updates: Mutex<u32>,
         }
 
         impl Controls for Fake {
@@ -454,11 +480,21 @@ mod tests {
                 Status {
                     url: "https://example.com".into(),
                     cutout: "Fast · CPU · 30 masks/s".into(),
+                    update: crate::api::UpdateInfo {
+                        state: "available".into(),
+                        version: "9.9.9".into(),
+                        page_url: "https://example.com/r".into(),
+                        can_install: true,
+                    },
                     ..Status::default()
                 }
             }
             fn cutout_engine(&self) -> String {
                 self.engine.lock().unwrap().clone()
+            }
+            fn install_update(&self) -> anyhow::Result<()> {
+                *self.updates.lock().unwrap() += 1;
+                Ok(())
             }
             fn set_cutout_engine(&self, engine: &str) -> anyhow::Result<()> {
                 anyhow::ensure!(["quality", "fast"].contains(&engine), "unknown engine");
@@ -666,6 +702,56 @@ mod tests {
             post(fake.clone(), "/api/cutout", r#"{"engine":"turbo"}"#).await,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn serves_logo_images_with_token_only() {
+        for path in ["/ui/logo.png", "/ui/icon.png"] {
+            let ok = app(Arc::new(Fake::default()))
+                .oneshot(req(
+                    "GET",
+                    &format!("{path}?t={TOKEN}"),
+                    "127.0.0.1:8765",
+                    None,
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), StatusCode::OK, "{path}");
+            assert_eq!(ok.headers()["content-type"], "image/png");
+            let denied = app(Arc::new(Fake::default()))
+                .oneshot(req("GET", path, "127.0.0.1:8765", None, None))
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_install_route() {
+        let fake = Arc::new(Fake::default());
+        assert_eq!(
+            post(fake.clone(), "/api/update/install", "{}").await,
+            StatusCode::OK
+        );
+        assert_eq!(*fake.updates.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn state_includes_update() {
+        let r = app(Arc::new(Fake::default()))
+            .oneshot(req(
+                "GET",
+                "/api/state",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                None,
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"]["update"]["version"], "9.9.9");
+        assert_eq!(v["status"]["update"]["can_install"], true);
     }
 
     #[tokio::test]

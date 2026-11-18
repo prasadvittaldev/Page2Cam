@@ -10,6 +10,11 @@ CEF_WIN="${CEF_WIN:-$HOME/.local/share/cef-win}"
 TARGET=x86_64-pc-windows-msvc
 OUT="$ROOT/dist/Page2Cam-windows-x64"
 ZIP="$ROOT/dist/Page2Cam-windows-x64.zip"
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
+SETUP="$ROOT/dist/Page2Cam-Setup-$VERSION.exe"
+STAGE="$ROOT/dist/installer-root"
+NSIS_HOME="${NSIS_HOME:-$HOME/.local/share/nsis-pkg/root}"
+RELEASE_KEY="${RELEASE_KEY:-$HOME/.config/page2cam/release-signing.key}"
 
 # Pinned FFmpeg static build (GPL) from BtbN/FFmpeg-Builds.
 FFMPEG_ZIP_NAME="ffmpeg-n8.1-latest-win64-gpl-8.1.zip"
@@ -26,7 +31,7 @@ cargo xwin build --release -p page2cam -p p2c-vcam-win-source --target "$TARGET"
 BIN="$ROOT/target/$TARGET/release"
 
 echo "==> Assembling $OUT"
-rm -rf "$OUT" "$ZIP"
+rm -rf "$OUT" "$ZIP" "$STAGE" "$ROOT"/dist/Page2Cam-Setup-*.exe "$ROOT"/dist/SHA256SUMS*
 mkdir -p "$OUT"
 cp "$BIN/page2cam.exe" "$BIN/p2c_vcam_win_source.dll" "$OUT/"
 for f in libcef.dll chrome_elf.dll d3dcompiler_47.dll dxcompiler.dll vk_swiftshader.dll vk_swiftshader_icd.json \
@@ -35,7 +40,7 @@ for f in libcef.dll chrome_elf.dll d3dcompiler_47.dll dxcompiler.dll vk_swiftsha
   cp "$CEF_WIN/$f" "$OUT/"
 done
 cp -r "$CEF_WIN/locales" "$OUT/"
-cp "$ROOT"/packaging/windows/* "$OUT/"
+for f in install-camera.cmd uninstall-camera.cmd README.txt page2cam.toml; do cp "$ROOT/packaging/windows/$f" "$OUT/"; done
 
 echo "==> Cut-out models and ONNX Runtime"
 "$ROOT/scripts/fetch-models.sh"
@@ -81,3 +86,30 @@ fi
 echo "==> Zipping"
 (cd "$ROOT/dist" && zip -qr -9 "$(basename "$ZIP")" "$(basename "$OUT")")
 ls -lh "$ZIP"
+
+echo "==> Installer"
+# Same files as the zip, minus the manual-install helpers (the installer does
+# their job) and the settings file (installed copies keep settings in %APPDATA%).
+# Icon and installer pictures (made by scripts/make-brand-assets.py).
+BRAND="$ROOT/dist/brand"
+mkdir -p "$STAGE" "$BRAND"
+cp "$ROOT/crates/page2cam/windows/page2cam.ico" "$ROOT"/packaging/windows/installer-*.bmp "$BRAND/"
+cp -r "$OUT"/. "$STAGE"/
+rm -f "$STAGE"/install-camera.cmd "$STAGE"/uninstall-camera.cmd "$STAGE"/page2cam.toml \
+      "$STAGE"/README.txt "$STAGE"/vc_redist.x64.exe
+NSISDIR="$NSIS_HOME/usr/share/nsis" "$NSIS_HOME/usr/bin/makensis" -V2 -WX \
+  -DVERSION="$VERSION" -DSRC="$STAGE" -DOUT="$SETUP" \
+  -DVCREDIST="$ROOT/third_party/onnxruntime/windows/vc_redist.x64.exe" \
+  -DBRAND="$BRAND" \
+  "$ROOT/packaging/windows/installer.nsi"
+rm -rf "$STAGE" "$BRAND"
+ls -lh "$SETUP"
+
+echo "==> Checksums and signature (for the in-app updater)"
+(cd "$ROOT/dist" && sha256sum "$(basename "$SETUP")" "$(basename "$ZIP")" > SHA256SUMS)
+if [ -f "$RELEASE_KEY" ]; then
+  cargo run -q -p p2c-update --example release_key -- sign "$RELEASE_KEY" "$ROOT/dist/SHA256SUMS"
+else
+  echo "WARNING: no release key at $RELEASE_KEY; SHA256SUMS is unsigned and the updater will refuse it" >&2
+fi
+ls -lh "$ROOT"/dist/SHA256SUMS*

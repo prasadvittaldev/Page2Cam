@@ -1,0 +1,159 @@
+; Page2Cam installer (NSIS 3, 64-bit). Built by scripts/package-windows.sh:
+;   makensis -DVERSION=x.y.z -DSRC=<staged files> -DOUT=<setup.exe> installer.nsi
+; Silent install: Page2Cam-Setup-x.y.z.exe /S   (add /RELAUNCH to start Page2Cam afterwards;
+; the in-app updater uses both).
+
+Unicode true
+Target amd64-unicode
+SetCompressor /SOLID lzma
+RequestExecutionLevel admin
+ManifestDPIAware true
+
+!include "MUI2.nsh"
+!include "FileFunc.nsh"
+!include "LogicLib.nsh"
+
+!ifndef VERSION
+  !error "pass -DVERSION=x.y.z"
+!endif
+
+!define APP "Page2Cam"
+!define PUBLISHER "Prasad Vittaldev"
+!define URL "https://github.com/prasadvittaldev/Page2Cam"
+!define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP}"
+!define CLSID "{7C2F9A41-3B6E-4D8A-9C1F-5E2B8D4A6F10}"
+
+Name "${APP} ${VERSION}"
+OutFile "${OUT}"
+InstallDir "$PROGRAMFILES64\${APP}"
+InstallDirRegKey HKLM "${UNINST_KEY}" "InstallLocation"
+BrandingText "${APP} ${VERSION}"
+VIProductVersion "${VERSION}.0"
+VIAddVersionKey "ProductName" "${APP}"
+VIAddVersionKey "ProductVersion" "${VERSION}"
+VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "CompanyName" "${PUBLISHER}"
+VIAddVersionKey "LegalCopyright" "GPL-3.0-or-later"
+VIAddVersionKey "FileDescription" "${APP} installer"
+
+!define MUI_ABORTWARNING
+!define MUI_ICON "${BRAND}\page2cam.ico"
+!define MUI_UNICON "${BRAND}\page2cam.ico"
+!define MUI_WELCOMEFINISHPAGE_BITMAP "${BRAND}\installer-welcome.bmp"
+!define MUI_UNWELCOMEFINISHPAGE_BITMAP "${BRAND}\installer-welcome.bmp"
+!define MUI_HEADERIMAGE
+!define MUI_HEADERIMAGE_RIGHT
+!define MUI_HEADERIMAGE_BITMAP "${BRAND}\installer-header.bmp"
+!define MUI_HEADERIMAGE_UNBITMAP "${BRAND}\installer-header.bmp"
+!define MUI_WELCOMEPAGE_TEXT "This will install ${APP} ${VERSION}.$\r$\n$\r$\n${APP} shows any website as a camera in Teams, Zoom or Google Meet, and can stream it to YouTube Live, with you on top of the page.$\r$\n$\r$\nPlease close ${APP} and any app that is using a camera before you continue."
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_TEXT "Start ${APP} now"
+!define MUI_FINISHPAGE_RUN_FUNCTION StartAppAsUser
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_LICENSE "${SRC}\LICENSE.txt"
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "English"
+
+; Start Page2Cam as the signed-in user, not as administrator (via Explorer).
+Function StartAppAsUser
+  Exec '"$WINDIR\explorer.exe" "$INSTDIR\page2cam.exe"'
+FunctionEnd
+
+; Close Page2Cam and release the camera driver so its files can be replaced.
+!macro StopEverything
+  nsExec::Exec 'taskkill /IM page2cam.exe /T /F'
+  Sleep 1500
+  nsExec::Exec 'net stop FrameServerMonitor /y'
+  nsExec::Exec 'net stop FrameServer /y'
+!macroend
+
+Section "Install"
+  SetShellVarContext all
+  InitPluginsDir
+  SetOutPath "$INSTDIR"
+  !insertmacro StopEverything
+
+  ; The camera service may still hold the old driver: move it aside and
+  ; delete it at the next restart if it can't be deleted now.
+  ${If} ${FileExists} "$INSTDIR\p2c_vcam_win_source.dll"
+    ExecWait '"$SYSDIR\regsvr32.exe" /s /u "$INSTDIR\p2c_vcam_win_source.dll"'
+    Delete "$INSTDIR\p2c_vcam_win_source.dll"
+    ${If} ${FileExists} "$INSTDIR\p2c_vcam_win_source.dll"
+      Rename "$INSTDIR\p2c_vcam_win_source.dll" "$INSTDIR\p2c_vcam_win_source.old"
+      Delete /REBOOTOK "$INSTDIR\p2c_vcam_win_source.old"
+    ${EndIf}
+  ${EndIf}
+
+  ; Files from an older version that are no longer shipped (models, locales).
+  RMDir /r "$INSTDIR\models"
+  RMDir /r "$INSTDIR\locales"
+  File /r "${SRC}\*.*"
+
+  ; Microsoft Visual C++ runtime (needed by the cut-out).
+  SetOutPath "$PLUGINSDIR"
+  File "${VCREDIST}"
+  DetailPrint "Installing the Microsoft Visual C++ runtime..."
+  ExecWait '"$PLUGINSDIR\vc_redist.x64.exe" /install /quiet /norestart'
+  SetOutPath "$INSTDIR"
+
+  ; Log folder for the camera driver, writable by the camera service.
+  CreateDirectory "$APPDATA\${APP}"
+  nsExec::Exec 'icacls "$APPDATA\${APP}" /grant *S-1-5-19:(OI)(CI)M *S-1-5-32-545:(OI)(CI)M'
+
+  ; Register the virtual camera driver.
+  ExecWait '"$SYSDIR\regsvr32.exe" /s "$INSTDIR\p2c_vcam_win_source.dll"' $0
+  ${If} $0 != 0
+    MessageBox MB_ICONEXCLAMATION|MB_OK "The Page2Cam camera could not be registered (code $0). Page2Cam will still run, but the camera may not appear in other apps. Restart your PC and run this installer again." /SD IDOK
+  ${EndIf}
+
+  ; Shortcuts.
+  CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\page2cam.exe"
+  CreateShortcut "$DESKTOP\${APP}.lnk" "$INSTDIR\page2cam.exe"
+
+  ; Apps & features entry.
+  WriteUninstaller "$INSTDIR\Uninstall.exe"
+  WriteRegStr HKLM "${UNINST_KEY}" "DisplayName" "${APP}"
+  WriteRegStr HKLM "${UNINST_KEY}" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKLM "${UNINST_KEY}" "Publisher" "${PUBLISHER}"
+  WriteRegStr HKLM "${UNINST_KEY}" "URLInfoAbout" "${URL}"
+  WriteRegStr HKLM "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKLM "${UNINST_KEY}" "DisplayIcon" "$INSTDIR\page2cam.exe"
+  WriteRegStr HKLM "${UNINST_KEY}" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+  WriteRegStr HKLM "${UNINST_KEY}" "QuietUninstallString" '"$INSTDIR\Uninstall.exe" /S'
+  WriteRegDWORD HKLM "${UNINST_KEY}" "NoModify" 1
+  WriteRegDWORD HKLM "${UNINST_KEY}" "NoRepair" 1
+  ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+  IntFmt $0 "0x%08X" $0
+  WriteRegDWORD HKLM "${UNINST_KEY}" "EstimatedSize" "$0"
+
+  ; Restart the camera service so the new driver is used.
+  nsExec::Exec 'net start FrameServer'
+
+  ; Silent update from inside Page2Cam: start it again when done.
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptions} $R0 "/RELAUNCH" $R1
+  ${IfNot} ${Errors}
+    Call StartAppAsUser
+  ${EndIf}
+SectionEnd
+
+Section "Uninstall"
+  SetShellVarContext all
+  !insertmacro StopEverything
+  ExecWait '"$SYSDIR\regsvr32.exe" /s /u "$INSTDIR\p2c_vcam_win_source.dll"'
+  DeleteRegKey HKLM "Software\Classes\CLSID\${CLSID}"
+  Delete /REBOOTOK "$INSTDIR\p2c_vcam_win_source.dll"
+  Delete /REBOOTOK "$INSTDIR\p2c_vcam_win_source.old"
+  RMDir /r /REBOOTOK "$INSTDIR"
+  RMDir /r "$APPDATA\${APP}"
+  Delete "$SMPROGRAMS\${APP}.lnk"
+  Delete "$DESKTOP\${APP}.lnk"
+  DeleteRegKey HKLM "${UNINST_KEY}"
+  nsExec::Exec 'net start FrameServer'
+  ; Your settings (%APPDATA%\page2cam) are kept in case you reinstall.
+SectionEnd

@@ -1,5 +1,8 @@
-PAGE2CAM FOR WINDOWS 11 - TEST BUILD
-====================================
+PAGE2CAM FOR WINDOWS 11 - PORTABLE VERSION
+==========================================
+
+Tip: the easier way is the installer (Page2Cam-Setup-<version>.exe on the
+GitHub Releases page). It sets everything up and updates itself.
 
 Page2Cam shows a website as a webcam (for Teams, Zoom, Meet...) and/or
 streams it to YouTube Live, with your real webcam in a small window on top.

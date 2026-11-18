@@ -4,22 +4,33 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Page2Cam control</title>
+<link rel="icon" type="image/png" id="favicon">
 <style>
+  /* Page2Cam brand: navy wordmark, brand blue, white (see assets/logo.png). */
   :root {
-    --desk: #1e2226;
-    --panel: #272c31;
-    --well: #15181b;
-    --line: #3a4249;
-    --text: #e8e5de;
-    --muted: #9aa3ab;
+    --desk: #f3f6fb;
+    --panel: #ffffff;
+    --well: #f7f9fd;
+    --line: #d9e1ee;
+    --text: #0d1b2a;
+    --muted: #5b6b82;
+    --brand: #0b63f0;
+    --brand-dark: #0848b8;
+    --brand-soft: #e8f0ff;
     --tally-live: #e5372b;
-    --tally-cam: #3fb56b;
-    --amber: #e9a23b;
-    --focus: #7cc4ff;
-    --font: "Bahnschrift", "DIN Alternate", "Barlow", "Segoe UI", system-ui, sans-serif;
+    --tally-cam: #1f9d55;
+    --amber: #a35f00;
+    --focus: #0b63f0;
+    --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
+  .updatebar {
+    display: flex; gap: 12px; align-items: center; padding: 8px 16px;
+    background: var(--brand-soft); border-bottom: 1px solid var(--line); font-size: 14px;
+  }
+  .updatebar a { color: var(--brand); font-weight: 600; }
+  .updatebar.err { background: #fff4e5; }
   html, body { margin: 0; height: 100%; }
   body {
     background: var(--desk);
@@ -34,10 +45,11 @@
 
   header {
     display: flex; align-items: center; gap: 16px;
-    padding: 10px 16px; border-bottom: 1px solid var(--line);
+    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
   }
-  .brand { font-weight: 700; letter-spacing: .02em; font-size: 18px; white-space: nowrap; }
-  .brand span { color: var(--muted); font-weight: 400; }
+  .brand { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+  .brand img { height: 32px; width: auto; display: block; }
+  .brand span { color: var(--muted); font-size: 14px; padding-top: 4px; }
   form.url { display: flex; gap: 6px; flex: 1; min-width: 0; }
   form.url input {
     flex: 1; min-width: 0; background: var(--well); border: 1px solid var(--line);
@@ -47,8 +59,9 @@
     background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
     padding: 6px 12px; cursor: pointer; white-space: nowrap;
   }
-  .btn:hover { border-color: var(--muted); }
-  .btn.primary { background: #39424a; }
+  .btn:hover { border-color: var(--brand); }
+  .btn.primary { background: var(--brand); border-color: var(--brand); color: #fff; font-weight: 600; }
+  .btn.primary:hover { background: var(--brand-dark); }
   .btn.live { background: var(--tally-live); border-color: var(--tally-live); color: #fff; }
   .btn[disabled] { opacity: .5; cursor: default; }
   .icon { width: 36px; padding: 6px 0; text-align: center; }
@@ -75,7 +88,7 @@
   .screen canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
   .screen .empty {
     position: absolute; inset: 0; display: grid; place-items: center;
-    color: var(--muted); text-align: center; padding: 24px;
+    color: #9aa3ab; text-align: center; padding: 24px;
   }
   .tally-label {
     position: absolute; top: -1px; left: 14px; transform: translateY(-50%);
@@ -104,7 +117,7 @@
   .seg .btn { border-radius: 0; font-size: 13px; padding: 5px 6px; }
   .seg .btn:first-child { border-radius: 6px 0 0 6px; }
   .seg .btn:last-child { border-radius: 0 6px 6px 0; }
-  .seg .btn[aria-pressed=true] { background: var(--text); color: var(--well); border-color: var(--text); }
+  .seg .btn[aria-pressed=true] { background: var(--brand); color: #fff; border-color: var(--brand); }
   .sub { font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
   .pip .grip {
     position: absolute; right: -7px; bottom: -7px; width: 14px; height: 14px;
@@ -115,13 +128,14 @@
   section.panel {
     background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px;
   }
-  section.panel h2 { font-size: 16px; margin: 0 0 10px; font-weight: 600; }
+  section.panel h2 { font-size: 16px; margin: 0 0 10px; font-weight: 700; color: var(--text); }
   .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
   .row label { flex: 1; }
   .row input[type=text], .row input[type=password] {
     width: 100%; background: var(--well); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px;
   }
-  .row input[type=range] { flex: 1; accent-color: var(--text); }
+  .row input[type=range] { flex: 1; accent-color: var(--brand); }
+  input[type=checkbox] { accent-color: var(--brand); }
   .corners { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .state { font-size: 13px; color: var(--muted); min-height: 1.4em; word-break: break-word; }
   .state.err { color: var(--amber); }
@@ -130,7 +144,7 @@
 
   footer {
     display: flex; flex-wrap: wrap; gap: 18px; padding: 8px 16px;
-    border-top: 1px solid var(--line); font-size: 13px; color: var(--muted);
+    border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); background: var(--panel);
   }
   .lamp { display: inline-flex; align-items: center; gap: 7px; }
   .lamp::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--line); }
@@ -142,7 +156,7 @@
 </head>
 <body>
 <header>
-  <div class="brand">Page2Cam <span>control</span></div>
+  <div class="brand"><img id="logo" alt="Page2Cam"><span>control</span></div>
   <button class="btn icon" id="back" title="Back" aria-label="Back">&#8592;</button>
   <button class="btn icon" id="fwd" title="Forward" aria-label="Forward">&#8594;</button>
   <button class="btn icon" id="reload" title="Reload" aria-label="Reload">&#8635;</button>
@@ -152,6 +166,11 @@
     <button class="btn" type="button" id="save" title="Save this site to the quick list">Save</button>
   </form>
 </header>
+<div class="updatebar" id="updateBar" hidden>
+  <span id="updateText"></span>
+  <button class="btn primary" id="updateBtn">Install update</button>
+  <a id="updateLink" target="_blank" rel="noopener">Download from GitHub</a>
+</div>
 
 <main>
   <div>
@@ -241,6 +260,8 @@
 (() => {
   const token = new URLSearchParams(location.search).get("t") || "";
   const $ = (id) => document.getElementById(id);
+  $("logo").src = "/ui/logo.png?t=" + encodeURIComponent(token);
+  $("favicon").href = "/ui/icon.png?t=" + encodeURIComponent(token);
   const api = (path, body) => fetch(path, {
     method: body === undefined ? "GET" : "POST",
     headers: { "x-p2c-token": token, "content-type": "application/json" },
@@ -464,6 +485,29 @@
   ["pageOn", "micOn"].forEach((id) => $(id).onchange = pushAudio);
   ["pageGain", "micGain"].forEach((id) => $(id).oninput = pushAudio);
 
+  // ---------- updates ----------
+  $("updateBtn").onclick = async () => {
+    if (!confirm("Page2Cam will download the update, close, install it and start again. Continue?")) return;
+    $("updateBtn").disabled = true;
+    $("updateText").textContent = "Downloading the update… (this can take a few minutes)";
+    const r = await api("/api/update/install", {});
+    if (!r.ok) { $("updateText").textContent = "Update failed: " + await r.text(); $("updateBtn").disabled = false; }
+    else { $("updateText").textContent = "Installing the update. Page2Cam will restart by itself."; }
+  };
+  function showUpdate(u) {
+    const bar = $("updateBar");
+    if (!u || !u.state) { bar.hidden = true; return; }
+    bar.hidden = false;
+    bar.classList.toggle("err", /^error/.test(u.state));
+    if ($("updateBtn").disabled) return; // an install is running; keep its message
+    if (/^error/.test(u.state)) { $("updateText").textContent = "Update: " + u.state.replace(/^error: /, ""); }
+    else if (u.state === "installing") { $("updateText").textContent = "Installing the update…"; }
+    else { $("updateText").textContent = "Page2Cam " + u.version + " is available."; }
+    $("updateBtn").hidden = !u.can_install || u.state !== "available";
+    $("updateLink").hidden = u.can_install || !u.page_url;
+    $("updateLink").href = u.page_url || "#";
+  }
+
   // ---------- status ----------
   function setState(id, text) { const el = $(id); el.textContent = text || ""; el.classList.toggle("err", /^error/.test(text || "")); }
   function lamp(id, text, liveWord) {
@@ -495,6 +539,7 @@
       setState("webcamState", s.webcam === "none" ? "No webcam found. Plug one in and restart Page2Cam." : /^error/.test(s.webcam) ? s.webcam : "");
       document.querySelectorAll("[data-engine]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.engine === s.cutout_engine)));
       setState("cutoutState", s.cutout);
+      showUpdate(s.update);
       setState("micState", /^error/.test(s.mic) ? s.mic : s.mic === "none" ? "No microphone found." : "");
       const camOn = /^ok/.test(s.vcam);
       const mon = $("monitor");
