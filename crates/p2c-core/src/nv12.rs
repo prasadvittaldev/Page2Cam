@@ -1,6 +1,7 @@
 //! NV12 frames and the CPU BGRA -> NV12 conversion (BT.709, limited range).
 //!
 //! This is the reference the GPU shader output is compared against.
+#![allow(clippy::chunks_exact_to_as_chunks)]
 use crate::{Frame, FrameError};
 
 /// A tightly packed NV12 frame: a Y plane (`width * height`) followed by an
@@ -59,73 +60,100 @@ pub fn camera_size(w: u32, h: u32) -> (u32, u32) {
     ((ow as u32) & !1, (oh as u32) & !1)
 }
 
-/// Bilinear resample of a BGRA frame to `dw` x `dh` (pixel-centre aligned).
-fn scale_bilinear(src: &Frame, dw: u32, dh: u32) -> Vec<u8> {
-    let (sw, sh) = (src.width as usize, src.height as usize);
-    let (dw, dh) = (dw as usize, dh as usize);
-    let mut out = vec![0u8; dw * dh * 4];
-    // 16.16 positions
-    let xs = ((sw as u64) << 16) / dw as u64;
-    let ys = ((sh as u64) << 16) / dh as u64;
-    let sample = |sx: i64, sy: i64, c: usize| -> u32 {
-        let x = sx.clamp(0, sw as i64 - 1) as usize;
-        let y = sy.clamp(0, sh as i64 - 1) as usize;
-        src.data[(y * sw + x) * 4 + c] as u32
-    };
-    for dy in 0..dh {
-        let fy = ((dy as i64 * 2 + 1) * ys as i64 / 2) - 32768; // source y, 16.16
-        let y0 = fy >> 16;
-        let wy = (fy & 0xFFFF) as u32;
-        for dx in 0..dw {
-            let fx = ((dx as i64 * 2 + 1) * xs as i64 / 2) - 32768;
-            let x0 = fx >> 16;
-            let wx = (fx & 0xFFFF) as u32;
-            let o = (dy * dw + dx) * 4;
-            for c in 0..4 {
-                let top = sample(x0, y0, c) * (65536 - wx) + sample(x0 + 1, y0, c) * wx;
-                let bot = sample(x0, y0 + 1, c) * (65536 - wx) + sample(x0 + 1, y0 + 1, c) * wx;
-                let v = (top as u64 * (65536 - wy) as u64 + bot as u64 * wy as u64 + (1u64 << 31))
-                    >> 32;
-                out[o + c] = v as u8;
+/// Convert one pair of BGRA rows (width `w`, even) into two Y rows and one UV row.
+fn convert_row_pair(r0: &[u8], r1: &[u8], y0: &mut [u8], y1: &mut [u8], uv: &mut [u8]) {
+    let blocks = r0
+        .chunks_exact(8)
+        .zip(r1.chunks_exact(8))
+        .zip(y0.chunks_exact_mut(2).zip(y1.chunks_exact_mut(2)))
+        .zip(uv.chunks_exact_mut(2));
+    for (((a, b), (ya, yb)), uvo) in blocks {
+        let (mut su, mut sv) = (0i32, 0i32);
+        for (px, y) in [
+            (&a[0..4], 0usize),
+            (&a[4..8], 1),
+            (&b[0..4], 2),
+            (&b[4..8], 3),
+        ] {
+            let (b, g, r) = (px[0] as i32, px[1] as i32, px[2] as i32);
+            let yv = (16 + ((YR * r + YG * g + YB * b + 32768) >> 16)) as u8;
+            if y < 2 {
+                ya[y] = yv;
+            } else {
+                yb[y - 2] = yv;
             }
+            su += UR * r + UG * g + UB * b;
+            sv += VR * r + VG * g + VB * b;
+        }
+        uvo[0] = (128 + ((su + (1 << 17)) >> 18)).clamp(16, 240) as u8;
+        uvo[1] = (128 + ((sv + (1 << 17)) >> 18)).clamp(16, 240) as u8;
+    }
+}
+
+/// Horizontal taps for bilinear scaling: (x0 byte offset, x1 byte offset, weight of x1 in 0..=256).
+fn x_taps(sw: usize, dw: usize) -> Vec<(usize, usize, u32)> {
+    let xs = ((sw as u64) << 16) / dw as u64;
+    (0..dw)
+        .map(|dx| {
+            let fx = ((dx as i64 * 2 + 1) * xs as i64 / 2) - 32768; // 16.16 source x
+            let x0 = fx >> 16;
+            let w = (((fx & 0xFFFF) + 128) >> 8) as u32;
+            let c = |x: i64| x.clamp(0, sw as i64 - 1) as usize * 4;
+            (c(x0), c(x0 + 1), w)
+        })
+        .collect()
+}
+
+/// Bilinear-scale destination row `dy` of the source into `out` (BGRA, `taps.len()` pixels).
+fn scale_row(src: &Frame, dy: usize, dh: usize, taps: &[(usize, usize, u32)], out: &mut [u8]) {
+    let (sw, sh) = (src.width as usize, src.height as usize);
+    let ys = ((sh as u64) << 16) / dh as u64;
+    let fy = ((dy as i64 * 2 + 1) * ys as i64 / 2) - 32768;
+    let wy = (((fy & 0xFFFF) + 128) >> 8) as u32;
+    let row = |y: i64| {
+        let y = y.clamp(0, sh as i64 - 1) as usize;
+        &src.data[y * sw * 4..(y + 1) * sw * 4]
+    };
+    let (ra, rb) = (row(fy >> 16), row((fy >> 16) + 1));
+    for (o, &(x0, x1, wx)) in out.chunks_exact_mut(4).zip(taps) {
+        for c in 0..4 {
+            let top = ra[x0 + c] as u32 * (256 - wx) + ra[x1 + c] as u32 * wx;
+            let bot = rb[x0 + c] as u32 * (256 - wx) + rb[x1 + c] as u32 * wx;
+            o[c] = ((top * (256 - wy) + bot * wy + 32768) >> 16) as u8;
         }
     }
-    out
 }
 
 /// Convert BGRA to NV12 at `dw` x `dh` (BT.709 limited range). When the size
-/// differs from the source the frame is scaled bilinearly first. Each UV
-/// sample is the average of the four per-pixel U/V values of its 2x2 block.
-/// `dw` and `dh` must be even and non-zero.
+/// differs from the source the frame is scaled bilinearly (row by row, no
+/// full-size intermediate). Each UV sample is the average of the four
+/// per-pixel U/V values of its 2x2 block. `dw` and `dh` must be even and
+/// non-zero.
 pub fn bgra_to_nv12(src: &Frame, dw: u32, dh: u32) -> Nv12Frame {
     assert!(
         dw > 0 && dh > 0 && dw.is_multiple_of(2) && dh.is_multiple_of(2),
         "NV12 size must be even"
     );
-    let scaled;
-    let px: &[u8] = if src.width == dw && src.height == dh {
-        &src.data
-    } else {
-        scaled = scale_bilinear(src, dw, dh);
-        &scaled
-    };
     let (w, h) = (dw as usize, dh as usize);
     let mut data = vec![0u8; w * h * 3 / 2];
     let (yp, uv) = data.split_at_mut(w * h);
-    for by in 0..h / 2 {
-        for bx in 0..w / 2 {
-            let (mut su, mut sv) = (0i32, 0i32);
-            for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                let (x, y) = (bx * 2 + dx, by * 2 + dy);
-                let i = (y * w + x) * 4;
-                let (b, g, r) = (px[i] as i32, px[i + 1] as i32, px[i + 2] as i32);
-                yp[y * w + x] = (16 + ((YR * r + YG * g + YB * b + 32768) >> 16)) as u8;
-                su += UR * r + UG * g + UB * b;
-                sv += VR * r + VG * g + VB * b;
-            }
-            let o = by * w + bx * 2;
-            uv[o] = (128 + ((su + (1 << 17)) >> 18)).clamp(16, 240) as u8;
-            uv[o + 1] = (128 + ((sv + (1 << 17)) >> 18)).clamp(16, 240) as u8;
+    let ypairs = yp.chunks_exact_mut(w * 2).zip(uv.chunks_exact_mut(w));
+    if src.width == dw && src.height == dh {
+        let rows = src.data.chunks_exact(w * 8);
+        for ((yrows, uvrow), pair) in ypairs.zip(rows) {
+            let (r0, r1) = pair.split_at(w * 4);
+            let (y0, y1) = yrows.split_at_mut(w);
+            convert_row_pair(r0, r1, y0, y1, uvrow);
+        }
+    } else {
+        let taps = x_taps(src.width as usize, w);
+        let mut rows = vec![0u8; w * 8];
+        for (by, (yrows, uvrow)) in ypairs.enumerate() {
+            let (r0, r1) = rows.split_at_mut(w * 4);
+            scale_row(src, by * 2, h, &taps, r0);
+            scale_row(src, by * 2 + 1, h, &taps, r1);
+            let (y0, y1) = yrows.split_at_mut(w);
+            convert_row_pair(r0, r1, y0, y1, uvrow);
         }
     }
     Nv12Frame {
@@ -134,7 +162,6 @@ pub fn bgra_to_nv12(src: &Frame, dw: u32, dh: u32) -> Nv12Frame {
         data,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +229,35 @@ mod tests {
     fn scaling_keeps_solid_colour_and_is_fast_enough() {
         let n = bgra_to_nv12(&solid(64, 48, [0, 0, 255, 255]), 32, 24);
         assert!(near(n.data[0], 63) && near(n.data[32 * 24], 102));
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_bgra_to_nv12_1080p() {
+        fn median_ms(src: &Frame, dw: u32, dh: u32) -> f64 {
+            let mut v: Vec<f64> = (0..50)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(bgra_to_nv12(std::hint::black_box(src), dw, dh));
+                    t.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        }
+        let mk = |w: u32, h: u32| {
+            let data = (0..w as usize * h as usize * 4)
+                .map(|i| (i * 7 % 251) as u8)
+                .collect();
+            Frame::from_bgra(w, h, data).unwrap()
+        };
+        println!(
+            "1920x1080 same size: {:.2} ms",
+            median_ms(&mk(1920, 1080), 1920, 1080)
+        );
+        println!(
+            "3840x2160 -> 1920x1080: {:.2} ms",
+            median_ms(&mk(3840, 2160), 1920, 1080)
+        );
     }
 }
