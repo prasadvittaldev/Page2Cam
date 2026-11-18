@@ -388,7 +388,8 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let t0 = Instant::now();
-        let h = std::thread::spawn(move || write_video(sink, FrameSlot::new(), stop2, (4, 4, 30), t0));
+        let h =
+            std::thread::spawn(move || write_video(sink, FrameSlot::new(), stop2, (4, 4, 30), t0));
         std::thread::sleep(Duration::from_millis(3000));
         stop.store(true, Ordering::SeqCst);
         h.join().unwrap();

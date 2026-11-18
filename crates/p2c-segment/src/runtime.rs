@@ -66,8 +66,18 @@ pub fn session(model: &Path, prefer_gpu: bool) -> anyhow::Result<(Session, Devic
     anyhow::ensure!(model.is_file(), "model missing: {}", model.display());
     #[cfg(windows)]
     if prefer_gpu {
+        // DirectML requires memory pattern and parallel execution off
+        // ("or an error is returned"), and must be the EP we asked for.
         let dml = Session::builder(env()?)
             .map_err(anyhow::Error::from)
+            .and_then(|b| {
+                b.with_memory_pattern(false)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .and_then(|b| {
+                b.with_parallel_execution(false)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
             .and_then(|b| {
                 b.with_execution_providers([ort::ep::DirectML::default()
                     .build()
@@ -76,12 +86,19 @@ pub fn session(model: &Path, prefer_gpu: bool) -> anyhow::Result<(Session, Devic
             })
             .and_then(|mut b| b.commit_from_file(model).map_err(anyhow::Error::from));
         match dml {
-            Ok(s) => return Ok((s, Device::DirectMl)),
+            Ok(s) => {
+                tracing::info!(model = %model.display(), "running on the GPU (DirectML)");
+                return Ok((s, Device::DirectMl));
+            }
             Err(e) => tracing::warn!("DirectML unavailable, using CPU: {e:#}"),
         }
     }
     let _ = prefer_gpu;
+    // CPU on purpose: stop ONNX Runtime's automatic device policy from
+    // picking another device behind our back (so the status stays truthful).
     let s = Session::builder(env()?)?
+        .with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
         .commit_from_file(model)
         .with_context(|| format!("opening {}", model.display()))?;
     Ok((s, Device::Cpu))
