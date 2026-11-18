@@ -2,27 +2,47 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::Frame;
+use crate::{Frame, Mask};
 
-/// Holds only the newest frame. Producers overwrite; consumers read the latest
+/// Holds only the newest value. Producers overwrite; consumers read the latest
 /// without draining a queue. `seq` counts puts so consumers can detect staleness.
-#[derive(Clone, Default)]
-pub struct FrameSlot {
-    inner: Arc<Mutex<(Option<Arc<Frame>>, u64)>>,
+pub struct Slot<T> {
+    inner: Arc<Mutex<(Option<Arc<T>>, u64)>>,
 }
 
-impl FrameSlot {
+/// Latest video frame.
+pub type FrameSlot = Slot<Frame>;
+/// Latest cut-out mask.
+pub type MaskSlot = Slot<Mask>;
+
+impl<T> Clone for Slot<T> {
+    fn clone(&self) -> Self {
+        Slot {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> Default for Slot<T> {
+    fn default() -> Self {
+        Slot {
+            inner: Arc::new(Mutex::new((None, 0))),
+        }
+    }
+}
+
+impl<T> Slot<T> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn put(&self, f: Frame) {
+    pub fn put(&self, v: T) {
         let mut g = self.inner.lock();
-        g.0 = Some(Arc::new(f));
+        g.0 = Some(Arc::new(v));
         g.1 += 1;
     }
 
-    pub fn latest(&self) -> Option<Arc<Frame>> {
+    pub fn latest(&self) -> Option<Arc<T>> {
         self.inner.lock().0.clone()
     }
 
@@ -49,6 +69,14 @@ mod tests {
         s.put(Frame::new_black(4, 2));
         assert_eq!(s.latest().unwrap().width, 4);
         assert_eq!(s.seq(), 2);
+    }
+
+    #[test]
+    fn slot_holds_any_type() {
+        let s: Slot<crate::Mask> = Slot::new();
+        assert!(s.latest().is_none());
+        s.put(crate::Mask::new(2, 1, vec![0, 255]).unwrap());
+        assert_eq!((s.latest().unwrap().data[1], s.seq()), (255, 1));
     }
 
     #[test]
