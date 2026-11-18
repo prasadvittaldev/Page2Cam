@@ -11,6 +11,12 @@ pub fn status_gpu(adapter: &str) -> String {
     format!("GPU: {adapter}")
 }
 
+/// Status text: this run uses the CPU because Chromium closed unexpectedly
+/// twice on the GPU (R28's `--gpu-override cpu`).
+pub fn status_gpu_override() -> String {
+    status_fallback("Chromium closed unexpectedly twice on the GPU; CPU for this session")
+}
+
 /// Status text: Chromium ignored the adapter switch and renders on
 /// `adapter`, so the video moved there.
 pub fn status_gpu_chromium_chose(adapter: &str) -> String {
@@ -110,6 +116,10 @@ mod tests {
             "CPU (fallback: device lost)"
         );
         assert_eq!(STATUS_COMPAT, "CPU (compatibility)");
+        assert_eq!(
+            status_gpu_override(),
+            "CPU (fallback: Chromium closed unexpectedly twice on the GPU; CPU for this session)"
+        );
         assert_eq!(
             status_gpu_chromium_chose("Intel(R) UHD Graphics"),
             "GPU: Intel(R) UHD Graphics (Chromium chose it)"

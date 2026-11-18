@@ -923,6 +923,8 @@ mod tests {
             "gpu_choice",
             "gpu_running",
             "restart_needed",
+            "gpu_override",
+            "cutout_gpu",
         ] {
             assert!(v["status"].get(k).is_some(), "missing {k}");
         }

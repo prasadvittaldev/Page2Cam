@@ -254,10 +254,17 @@ fn run() -> anyhow::Result<()> {
     // shared textures), else the CPU compositor. Decided before CEF starts.
     let video = Arc::new(Mutex::new(String::new()));
     let video_start = start_video(&gpu_choice, spec, cli.test_pattern, &video);
-    *video.lock() = video_start.status.clone();
+    // R28 forced the CPU for this run: say why (the admin offers to try the
+    // GPU again).
+    let gpu_override = cli.gpu_override.is_some();
+    *video.lock() = if gpu_override && video_start.gpu.is_none() {
+        video::status_gpu_override()
+    } else {
+        video_start.status.clone()
+    };
     tracing::info!(
         "video: {}; cut-out GPU: {}",
-        video_start.status,
+        video.lock(),
         cutout_adapter
             .as_ref()
             .map_or("none (CPU)", |a| a.name.as_str())
@@ -335,6 +342,8 @@ fn run() -> anyhow::Result<()> {
         encoder: encoder_status.clone(),
         gpu_saved: Mutex::new(gpu_saved),
         gpu_running,
+        gpu_override,
+        cutout_gpu: cutout_adapter.as_ref().map(|a| a.name.clone()),
         exit: Arc::default(),
         quit_main: Mutex::new(None),
     });

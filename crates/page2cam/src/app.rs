@@ -57,6 +57,10 @@ pub struct App {
     pub gpu_saved: Mutex<String>,
     /// The `gpu` setting this run started with (incl. `--gpu-override`).
     pub gpu_running: String,
+    /// Started with `--gpu-override` (Chromium closed unexpectedly on the GPU).
+    pub gpu_override: bool,
+    /// The adapter DirectML runs the cut-out on (`None`: no hardware GPU).
+    pub cutout_gpu: Option<String>,
     /// Why the browser loop ended (read by `main` after it returns).
     pub exit: Arc<crate::restart::ExitFlags>,
     /// Ends the wait in `--test-pattern` mode (no browser to shut down).
@@ -156,6 +160,18 @@ impl App {
             (false, true) => running,
             (false, false) => format!("{running}. {}", st.note),
         }
+    }
+
+    /// Where the cut-out runs while it is in use (see [`cutout_device_text`]).
+    fn cutout_device(&self) -> String {
+        let Some(seg) = &self.segmenter else {
+            return String::new();
+        };
+        if !self.layout.read().style.is_cutout() {
+            return String::new();
+        }
+        let st = seg.status();
+        cutout_device_text(self.cutout_gpu.as_deref(), st.active.and(st.device))
     }
 
     /// Delay the mic by the cut-out's processing time plus the output pipeline's so lips match the
@@ -354,6 +370,8 @@ impl Controls for App {
             video: display_video(&self.video.lock()),
             encoder: encoder_text(&self.encoder.lock(), self.stream.encoder_fallback()),
             restart_needed: restart_needed(&gpu_saved, &self.gpu_running),
+            gpu_override: self.gpu_override,
+            cutout_gpu: self.cutout_device(),
             gpu_choice: gpu_saved,
             gpu_running: self.gpu_running.clone(),
         }
@@ -496,6 +514,16 @@ pub fn check_gpu_choice(choice: &str, list: &[GpuInfo]) -> anyhow::Result<String
         "unknown GPU choice {choice:?} (not \"auto\", \"cpu\" or a GPU on this PC)"
     );
     Ok(c)
+}
+
+/// Where the running cut-out model is (`device`: `None` when not running):
+/// the DirectML adapter's name, "CPU", or "".
+pub fn cutout_device_text(adapter: Option<&str>, device: Option<p2c_segment::Device>) -> String {
+    match device {
+        Some(p2c_segment::Device::DirectMl) => adapter.unwrap_or("GPU").to_string(),
+        Some(p2c_segment::Device::Cpu) => "CPU".into(),
+        None => String::new(),
+    }
 }
 
 /// The encoder line: the probed encoder, or x264 with the reason when a
@@ -679,6 +707,20 @@ mod tests {
         assert!(exit.restart.load(std::sync::atomic::Ordering::SeqCst));
         rx.recv_timeout(std::time::Duration::from_secs(3))
             .expect("closer not called");
+    }
+
+    #[test]
+    fn cutout_device_names_the_gpu() {
+        use p2c_segment::Device;
+        let nv = Some("NVIDIA RTX 2000 Ada Generation Laptop GPU");
+        assert_eq!(
+            cutout_device_text(nv, Some(Device::DirectMl)),
+            "NVIDIA RTX 2000 Ada Generation Laptop GPU"
+        );
+        assert_eq!(cutout_device_text(None, Some(Device::DirectMl)), "GPU");
+        assert_eq!(cutout_device_text(nv, Some(Device::Cpu)), "CPU");
+        // Not running: nothing to show.
+        assert_eq!(cutout_device_text(nv, None), "");
     }
 
     #[test]

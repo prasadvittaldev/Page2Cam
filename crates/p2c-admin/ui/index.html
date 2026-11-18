@@ -224,11 +224,13 @@
         <input type="range" id="pipSize" min="5" max="50" step="1">
       </div>
       <div class="state" id="webcamState"></div>
-      <p class="sub"><label for="gpuSel">Video processing</label></p>
-      <select class="wide" id="gpuSel" title="Which graphics chip builds the picture. Changes apply after a restart."></select>
+      <div id="gpuPick" hidden>
+        <p class="sub"><label for="gpuSel">Video processing</label></p>
+        <select class="wide" id="gpuSel" title="Which graphics chip builds the picture. Changes apply after a restart."></select>
+      </div>
       <div class="state video-state" id="videoState"></div>
       <div class="row restart-row" id="restartRow" hidden>
-        <span>Restart Page2Cam to apply</span>
+        <span id="restartText">Restart Page2Cam to apply</span>
         <button class="btn primary" id="restartBtn">Restart now</button>
       </div>
     </section>
@@ -541,6 +543,8 @@
       if (!r.ok) return;
       const list = await r.json();
       gpuSel.replaceChildren(...list.map((g) => new Option(gpuLabel(g), g.name)));
+      // No graphics chip to choose (e.g. Linux, Remote Desktop): no picker.
+      $("gpuPick").hidden = !list.some((g) => g.kind === "discrete" || g.kind === "onboard");
       gpusLoaded = true; gpuChoice = null; syncGpu();
     } catch {}
   }
@@ -606,11 +610,12 @@
       syncGpu();
       if (Date.now() > videoErrUntil) {
         const v = $("videoState");
-        v.textContent = [s.video, s.encoder && "encoder " + s.encoder].filter(Boolean).join(" · ");
+        v.textContent = [s.video, s.cutout_gpu && "cut-out on " + s.cutout_gpu, s.encoder && "encoder " + s.encoder].filter(Boolean).join(" · ");
         v.classList.toggle("err", /fallback/.test(s.video));
         v.title = s.gpu_running ? "Running with: " + (s.gpu_running === "auto" ? "Auto" : s.gpu_running) : "";
       }
       $("restartRow").hidden = !s.restart_needed;
+      $("restartText").textContent = s.gpu_override ? "Restart to try the GPU again" : "Restart Page2Cam to apply";
       showUpdate(s.update);
       setState("micState", /^error/.test(s.mic) ? s.mic : s.mic === "none" ? "No microphone found." : "");
       const camOn = /^ok/.test(s.vcam);

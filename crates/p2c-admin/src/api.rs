@@ -166,6 +166,12 @@ pub struct Status {
     pub gpu_running: String,
     /// The saved choice differs from the running one: a restart applies it.
     pub restart_needed: bool,
+    /// This run was started on the CPU because Chromium closed unexpectedly
+    /// twice on the GPU (`--gpu-override cpu`): a restart tries the GPU again.
+    pub gpu_override: bool,
+    /// Where the cut-out model runs while it is in use: the GPU's name,
+    /// "GPU", "CPU", or "" (cut-out not running).
+    pub cutout_gpu: String,
 }
 
 /// One entry of the "Video processing" picker.
