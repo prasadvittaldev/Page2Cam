@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use p2c_core::{CHANNELS, SAMPLE_RATE};
 
@@ -15,6 +17,100 @@ pub struct StreamConfig {
     /// Raw video input format: `"bgra"` (`Output::bgra`) or `"nv12"`
     /// (`Output::nv12`, BT.709 limited range).
     pub pix_fmt: &'static str,
+    /// H.264 encoder. `StreamController::start` replaces this with the
+    /// controller's own (`set_encoder`).
+    pub encoder: Encoder,
+}
+
+/// H.264 encoder behind the RTMP stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Encoder {
+    Nvenc,
+    Qsv,
+    Amf,
+    #[default]
+    X264,
+}
+
+impl Encoder {
+    /// The ffmpeg `-c:v` name.
+    pub fn ffmpeg_name(self) -> &'static str {
+        match self {
+            Encoder::Nvenc => "h264_nvenc",
+            Encoder::Qsv => "h264_qsv",
+            Encoder::Amf => "h264_amf",
+            Encoder::X264 => "libx264",
+        }
+    }
+}
+
+impl std::fmt::Display for Encoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Encoder::Nvenc => "NVENC",
+            Encoder::Qsv => "Quick Sync",
+            Encoder::Amf => "AMF",
+            Encoder::X264 => "x264",
+        })
+    }
+}
+
+/// Encoders to try for a GPU vendor (PCI vendor id), best first; x264 always last.
+pub fn candidates(vendor_id: Option<u32>) -> Vec<Encoder> {
+    let mut v = match vendor_id {
+        Some(0x10DE) => vec![Encoder::Nvenc],
+        Some(0x8086) => vec![Encoder::Qsv],
+        Some(0x1002) => vec![Encoder::Amf],
+        _ => vec![],
+    };
+    v.push(Encoder::X264);
+    v
+}
+
+/// Whether `e` really encodes here: runs ffmpeg on one black frame to a null
+/// output (an `-encoders` listing says nothing about the driver or the GPU).
+/// Gives up after 10 s.
+pub fn probe(ffmpeg: &Path, e: Encoder) -> bool {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=256x144:r=30",
+        "-frames:v",
+        "1",
+        "-c:v",
+        e.ffmpeg_name(),
+        "-f",
+        "null",
+        "-",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// Full publish URL. Contains the key: never log it unredacted.
@@ -85,40 +181,67 @@ pub fn ffmpeg_args(cfg: &StreamConfig, audio_port: u16) -> Vec<String> {
     a.push(CHANNELS.to_string());
     a.push("-i".into());
     a.push(format!("tcp://127.0.0.1:{audio_port}"));
-    for s in [
-        "-map",
-        "0:v",
-        "-map",
-        "1:a",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-bf",
-        "2",
-        "-pix_fmt",
-        "yuv420p",
-        "-b:v",
-        &kbps,
-        "-maxrate",
-        &kbps,
-        "-bufsize",
-        &buf,
-        "-g",
-        &gop,
-        "-keyint_min",
-        &gop,
-        "-sc_threshold",
-        "0",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-ar",
-        "48000",
-        "-f",
-        "flv",
-    ] {
+    a.extend(
+        [
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            cfg.encoder.ffmpeg_name(),
+        ]
+        .map(String::from),
+    );
+    let rate = |a: &mut Vec<String>, with_buf: bool| {
+        a.extend(["-b:v", &kbps, "-maxrate", &kbps].map(String::from));
+        if with_buf {
+            a.extend(["-bufsize", &buf].map(String::from));
+        }
+    };
+    match cfg.encoder {
+        Encoder::X264 => {
+            a.extend(["-preset", "veryfast", "-bf", "2", "-pix_fmt", "yuv420p"].map(String::from));
+            rate(&mut a, true);
+            a.extend(["-g", &gop, "-keyint_min", &gop, "-sc_threshold", "0"].map(String::from));
+        }
+        Encoder::Nvenc => {
+            a.extend(
+                [
+                    "-preset", "p5", "-tune", "hq", "-rc", "cbr", "-pix_fmt", "nv12",
+                ]
+                .map(String::from),
+            );
+            rate(&mut a, true);
+            a.extend(["-g", &gop, "-bf", "2"].map(String::from));
+        }
+        Encoder::Qsv => {
+            a.extend(["-preset", "medium", "-pix_fmt", "nv12"].map(String::from));
+            rate(&mut a, false);
+            a.extend(["-g", &gop, "-bf", "2"].map(String::from));
+        }
+        Encoder::Amf => {
+            a.extend(["-quality", "balanced", "-rc", "cbr", "-pix_fmt", "nv12"].map(String::from));
+            rate(&mut a, true);
+            a.extend(["-g", &gop, "-bf", "2"].map(String::from));
+        }
+    }
+    if cfg.pix_fmt == "nv12" {
+        // Say BT.709 limited in the H.264 VUI whatever the encoder does.
+        a.extend(
+            [
+                "-colorspace",
+                "bt709",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-color_range",
+                "tv",
+            ]
+            .map(String::from),
+        );
+    }
+    for s in ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-f", "flv"] {
         a.push(s.to_string());
     }
     a.push(target_url(cfg));
@@ -165,7 +288,144 @@ mod tests {
             fps: 30,
             video_kbps: 4500,
             pix_fmt: "bgra",
+            encoder: Encoder::X264,
         }
+    }
+
+    fn with(e: Encoder) -> String {
+        ffmpeg_args(
+            &StreamConfig {
+                encoder: e,
+                video_kbps: 6000,
+                ..cfg()
+            },
+            50123,
+        )
+        .join(" ")
+    }
+
+    #[test]
+    fn nvidia_tries_nvenc_first() {
+        assert_eq!(
+            candidates(Some(0x10DE)),
+            vec![Encoder::Nvenc, Encoder::X264]
+        );
+        assert_eq!(candidates(Some(0x8086)), vec![Encoder::Qsv, Encoder::X264]);
+        assert_eq!(candidates(Some(0x1002)), vec![Encoder::Amf, Encoder::X264]);
+    }
+
+    #[test]
+    fn unknown_vendor_is_x264_only() {
+        assert_eq!(candidates(Some(0x1234)), vec![Encoder::X264]);
+        assert_eq!(candidates(None), vec![Encoder::X264]);
+    }
+
+    #[test]
+    fn display_names() {
+        let n: Vec<_> = [Encoder::Nvenc, Encoder::Qsv, Encoder::Amf, Encoder::X264]
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(n, ["NVENC", "Quick Sync", "AMF", "x264"]);
+    }
+
+    #[test]
+    fn nvenc_args_cbr_gop_bframes() {
+        let s = with(Encoder::Nvenc);
+        for want in [
+            "-c:v h264_nvenc",
+            "-preset p5",
+            "-tune hq",
+            "-rc cbr",
+            "-b:v 6000k",
+            "-maxrate 6000k",
+            "-bufsize 12000k",
+            "-g 60",
+            "-bf 2",
+        ] {
+            assert!(s.contains(want), "{want} in {s}");
+        }
+        assert!(
+            !s.contains("libx264") && !s.contains("-sc_threshold"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn qsv_args_cbr_gop_bframes() {
+        let s = with(Encoder::Qsv);
+        for want in [
+            "-c:v h264_qsv",
+            "-preset medium",
+            "-b:v 6000k",
+            "-maxrate 6000k",
+            "-g 60",
+            "-bf 2",
+        ] {
+            assert!(s.contains(want), "{want} in {s}");
+        }
+        assert!(!s.contains("libx264"), "{s}");
+    }
+
+    #[test]
+    fn amf_args_cbr_gop_bframes() {
+        let s = with(Encoder::Amf);
+        for want in [
+            "-c:v h264_amf",
+            "-quality balanced",
+            "-rc cbr",
+            "-b:v 6000k",
+            "-g 60",
+            "-bf 2",
+        ] {
+            assert!(s.contains(want), "{want} in {s}");
+        }
+        assert!(!s.contains("libx264"), "{s}");
+    }
+
+    #[test]
+    fn x264_args_unchanged() {
+        let s = with(Encoder::X264);
+        assert!(
+            s.contains(
+                "-c:v libx264 -preset veryfast -bf 2 -pix_fmt yuv420p -b:v 6000k \
+                 -maxrate 6000k -bufsize 12000k -g 60 -keyint_min 60 -sc_threshold 0 -c:a aac"
+            ),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn nv12_output_is_tagged_bt709_limited() {
+        for e in [Encoder::Nvenc, Encoder::Qsv, Encoder::Amf, Encoder::X264] {
+            let s = ffmpeg_args(
+                &StreamConfig {
+                    pix_fmt: "nv12",
+                    encoder: e,
+                    ..cfg()
+                },
+                1,
+            )
+            .join(" ");
+            assert!(
+                s.contains(
+                    "-colorspace bt709 -color_primaries bt709 -color_trc bt709 \
+                     -color_range tv -c:a aac"
+                ),
+                "{e}: {s}"
+            );
+        }
+        assert!(!with(Encoder::Nvenc).contains("-color_trc"));
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_finds_working_encoder() {
+        let ff = find_ffmpeg().expect("ffmpeg on PATH");
+        assert!(probe(&ff, Encoder::X264));
+        assert!(probe(&ff, Encoder::Nvenc), "NVENC on the NVIDIA laptop");
+        assert!(!probe(&ff, Encoder::Amf), "no AMD GPU here");
+        eprintln!("qsv: {}", probe(&ff, Encoder::Qsv));
     }
 
     #[test]
@@ -188,9 +448,16 @@ mod tests {
             !b.contains("-colorspace") && !b.contains("-color_range"),
             "{b}"
         );
+        let norm = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
         assert_eq!(
-            b.replace("-pix_fmt bgra", ""),
-            s.replace("-pix_fmt nv12 -colorspace bt709 -color_range tv", "")
+            norm(b.replace("-pix_fmt bgra", "")),
+            norm(
+                s.replace("-pix_fmt nv12 -colorspace bt709 -color_range tv", "")
+                    .replace(
+                        "-colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv",
+                        ""
+                    )
+            )
         );
     }
 

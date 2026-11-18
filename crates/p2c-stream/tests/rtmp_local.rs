@@ -46,6 +46,7 @@ fn streams_h264_and_aac_to_rtmp() {
         fps: 30,
         video_kbps: 800,
         pix_fmt: "bgra",
+        encoder: p2c_stream::Encoder::X264,
     };
     c.start(cfg, &find_ffmpeg().expect("ffmpeg on PATH"))
         .unwrap();

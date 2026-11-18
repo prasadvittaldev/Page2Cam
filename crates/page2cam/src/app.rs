@@ -48,6 +48,9 @@ pub struct App {
     /// What makes the video: "GPU: <adapter>", "CPU (fallback: <reason>)",
     /// "CPU (compatibility)" (changes at run time on a fallback).
     pub video: Arc<Mutex<String>>,
+    /// Encoder for the next stream: "probing…", "NVENC", "Quick Sync", "AMF" or "x264".
+    #[allow(dead_code)] // shown in the admin status next
+    pub encoder: Arc<Mutex<String>>,
 }
 
 /// Longest mic delay applied for the cut-out (ms).
@@ -263,6 +266,7 @@ impl Controls for App {
             fps: self.fps,
             video_kbps: self.video_kbps,
             pix_fmt: self.stream_pix_fmt,
+            encoder: p2c_stream::Encoder::X264, // replaced by the controller (set_encoder)
         };
         self.stream.start(cfg, &ffmpeg)
     }

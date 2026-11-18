@@ -2,5 +2,7 @@
 mod args;
 mod controller;
 
-pub use args::{ffmpeg_args, find_ffmpeg, redact, target_url, StreamConfig};
+pub use args::{
+    candidates, ffmpeg_args, find_ffmpeg, probe, redact, target_url, Encoder, StreamConfig,
+};
 pub use controller::{StreamController, StreamSink, StreamState};

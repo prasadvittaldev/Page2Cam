@@ -258,6 +258,9 @@ fn run() -> anyhow::Result<()> {
         updater.spawn_checks();
     }
 
+    // Hardware H.264 encoder: probed in the background (a real 1-frame
+    // encode per candidate); x264 until it finishes or if none works.
+    let encoder_status = Arc::new(Mutex::new("probing…".to_string()));
     let app = Arc::new(App {
         browser: OnceLock::new(),
         layout,
@@ -289,7 +292,30 @@ fn run() -> anyhow::Result<()> {
         latencies: Mutex::new(Default::default()),
         updater: updater.clone(),
         video: video.clone(),
+        encoder: encoder_status.clone(),
     });
+
+    // Applies to the next stream start; a live stream is not restarted.
+    {
+        let vendor = cutout_adapter.as_ref().map(|a| a.vendor_id);
+        let (app, status) = (app.clone(), encoder_status.clone());
+        let spawned = std::thread::Builder::new()
+            .name("p2c-encoder-probe".into())
+            .spawn(move || {
+                let found = p2c_stream::find_ffmpeg().and_then(|ff| {
+                    p2c_stream::candidates(vendor)
+                        .into_iter()
+                        .find(|&e| p2c_stream::probe(&ff, e))
+                });
+                let e = found.unwrap_or(p2c_stream::Encoder::X264);
+                tracing::info!("stream encoder: {e}");
+                app.stream.set_encoder(e);
+                *status.lock() = e.to_string();
+            });
+        if spawned.is_err() {
+            *encoder_status.lock() = p2c_stream::Encoder::X264.to_string();
+        }
+    }
 
     // The ticker switched to the CPU compositor: say so, and make Chromium
     // paint on the CPU (once the browser exists; see the `run` callback).

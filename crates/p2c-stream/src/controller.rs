@@ -13,7 +13,7 @@ use p2c_compositor::{FrameSink, Output};
 use p2c_core::{Frame, Nv12Frame, Slot};
 use parking_lot::Mutex;
 
-use crate::{ffmpeg_args, redact, StreamConfig};
+use crate::{ffmpeg_args, redact, Encoder, StreamConfig};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamState {
@@ -102,6 +102,8 @@ pub struct StreamController {
     active: Arc<AtomicBool>,
     state: Arc<Mutex<StreamState>>,
     running: Mutex<Option<Running>>,
+    /// Used by the next `start` (a live stream keeps the one it began with).
+    encoder: Mutex<Encoder>,
 }
 
 impl StreamController {
@@ -112,6 +114,7 @@ impl StreamController {
             active: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(StreamState::Idle)),
             running: Mutex::new(None),
+            encoder: Mutex::new(Encoder::X264),
         }
     }
 
@@ -120,6 +123,11 @@ impl StreamController {
             slot: self.slot.clone(),
             active: self.active.clone(),
         }
+    }
+
+    /// Encoder for the next stream start; a stream already live is not restarted.
+    pub fn set_encoder(&self, e: Encoder) {
+        *self.encoder.lock() = e;
     }
 
     pub fn state(&self) -> StreamState {
@@ -135,11 +143,12 @@ impl StreamController {
         result
     }
 
-    fn spawn(&self, cfg: StreamConfig, ffmpeg: &Path) -> anyhow::Result<()> {
+    fn spawn(&self, mut cfg: StreamConfig, ffmpeg: &Path) -> anyhow::Result<()> {
         anyhow::ensure!(!cfg.url.trim().is_empty(), "enter the stream server URL");
         let listener = TcpListener::bind("127.0.0.1:0").context("opening the audio socket")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
+        cfg.encoder = *self.encoder.lock();
         let args = ffmpeg_args(&cfg, port);
         tracing::info!("starting ffmpeg: {}", redact(&args.join(" "), &cfg.key));
         let mut cmd = Command::new(ffmpeg);
@@ -645,6 +654,7 @@ mod tests {
             fps: 30,
             video_kbps: 500,
             pix_fmt: "bgra",
+            encoder: crate::Encoder::X264,
         };
         let err = c
             .start(cfg, std::path::Path::new("/nonexistent/ffmpeg"))
