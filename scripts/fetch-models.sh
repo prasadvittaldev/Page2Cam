@@ -24,6 +24,7 @@ FILES=(
   "test-person.png|https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/selfie_segmentation_landscape.png|7b50f5ca48025bf0c5ea2d982b88f2ff2ecdf30c2529bf8c0ebaa4b29a95dc3a"
   "ort-$ORT_VER.nupkg|https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$ORT_VER/microsoft.ml.onnxruntime.$ORT_VER.nupkg|4b978d5065b85e7004b6c6f60ca494bd978fbe6836cbf0a0b52d82b61ab99638"
   "ort-directml-$ORT_VER.nupkg|https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/$ORT_VER/microsoft.ml.onnxruntime.directml.$ORT_VER.nupkg|57e9f11b73437bef7a309496135d4c1f96b1a8e9ddba60013fa27bfc1d788681"
+  "vc_redist.x64.exe|https://aka.ms/vs/17/release/vc_redist.x64.exe|cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b"
   "directml-1.15.4.nupkg|https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/1.15.4/microsoft.ai.directml.1.15.4.nupkg|4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9"
 )
 
@@ -55,6 +56,10 @@ cp "$CACHE/rvm_mobilenetv3_fp32.onnx" "$CACHE/selfie_landscape.onnx" "$CACHE/tes
 unzip -p "$CACHE/ort-$ORT_VER.nupkg" runtimes/linux-x64/native/libonnxruntime.so > "$ORT/linux/libonnxruntime.so"
 unzip -p "$CACHE/ort-directml-$ORT_VER.nupkg" runtimes/win-x64/native/onnxruntime.dll > "$ORT/windows/onnxruntime.dll"
 unzip -p "$CACHE/directml-1.15.4.nupkg" bin/x64-win/DirectML.dll > "$ORT/windows/DirectML.dll"
+# onnxruntime.dll needs the Visual C++ 2015-2022 runtime; install-camera.cmd
+# installs it. (aka.ms always serves the latest build: if the checksum stops
+# matching, check the new file and update the pin.)
+cp "$CACHE/vc_redist.x64.exe" "$ORT/windows/"
 mkdir -p "$ORT/windows/licenses"
 unzip -p "$CACHE/directml-1.15.4.nupkg" LICENSE.txt > "$ORT/windows/licenses/DirectML-LICENSE.txt"
 unzip -p "$CACHE/directml-1.15.4.nupkg" ThirdPartyNotices.txt > "$ORT/windows/licenses/DirectML-ThirdPartyNotices.txt"

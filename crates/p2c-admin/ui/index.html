@@ -359,9 +359,11 @@
     let w = style === "cutout-full" ? H / aspect() : pip.width * W;
     let h = style === "cutout-full" ? H : w * aspect();
     if (w > aw || h > ah) { const s = Math.min(aw / w, ah / h); w *= s; h = Math.min(h * s, ah); }
-    const x = mx + clamp01(pip.x) * (aw - w);
+    // Full-size may overhang each side by a quarter of its width (FULL_OVERHANG).
+    const over = style === "cutout-full" ? w * 0.25 : 0;
+    const x = mx - over + clamp01(pip.x) * (aw - w + 2 * over);
     const y = style === "box" ? my + clamp01(pip.y) * (ah - h) : H - h;
-    return { x, y, w, h, mx, my, style };
+    return { x, y, w, h, mx, my, over, style };
   }
   function layoutPip() {
     const r = screen.getBoundingClientRect();
@@ -391,7 +393,7 @@
         const w = start.box.width, h = start.box.height;
         const left = start.box.left - r.left + (ev.clientX - start.x);
         const top = start.box.top - r.top + (ev.clientY - start.y);
-        pip.x = clamp01((left - mx) / Math.max(W - 2 * mx - w, 1));
+        pip.x = clamp01((left - mx + g.over) / Math.max(W - 2 * mx - w + 2 * g.over, 1));
         // Cut-outs stand on the bottom edge: only sideways moves.
         if (g.style === "box") pip.y = clamp01((top - my) / Math.max(H - 2 * my - h, 1));
       }

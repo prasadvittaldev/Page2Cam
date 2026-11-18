@@ -46,8 +46,13 @@ pub fn init(lib_dir: &Path) -> anyhow::Result<()> {
     if ENV.get().is_some() {
         return Ok(());
     }
+    let hint = if cfg!(windows) {
+        " (if this file is present, run install-camera.cmd as administrator: it installs the Microsoft Visual C++ runtime it needs)"
+    } else {
+        ""
+    };
     let env = ort::init_from(&lib)
-        .with_context(|| format!("loading {}", lib.display()))?
+        .with_context(|| format!("loading {}{hint}", lib.display()))?
         .with_name("page2cam")
         .build()
         .with_context(|| format!("starting {}", lib.display()))?;

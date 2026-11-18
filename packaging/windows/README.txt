@@ -83,8 +83,11 @@ Common messages:
                                           -> the driver works but page2cam.exe is
                                              not running (start it).
   "ffmpeg was not found"                  -> ffmpeg.exe must stay in this folder.
-  "cut-out unavailable: ..."              -> onnxruntime.dll, DirectML.dll and the
-                                             models folder must stay in this folder.
+  "cut-out unavailable: ..."              -> run install-camera.cmd as administrator
+                                             again (it installs the Microsoft Visual
+                                             C++ runtime the cut-out needs), and keep
+                                             onnxruntime.dll, DirectML.dll and the
+                                             models folder in this folder.
 
 
 SETTINGS

@@ -37,8 +37,23 @@ pub struct App {
     pub segmenter: Option<Segmenter>,
     /// Where operator choices (style, engine) are saved.
     pub settings_path: Option<std::path::PathBuf>,
-    /// Mic delay currently applied, in ms.
+    /// Mic delay currently applied, in ms, and recent cut-out latencies.
     pub mic_delay_ms: Mutex<u32>,
+    pub latencies: Mutex<std::collections::VecDeque<u32>>,
+}
+
+/// Longest mic delay applied for the cut-out (ms).
+const MAX_MIC_DELAY_MS: u32 = 150;
+
+/// Mic delay for these recent cut-out latencies: their median (so one slow
+/// frame doesn't cause a jump), capped.
+pub fn smoothed_delay(samples: &[u32]) -> u32 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut v = samples.to_vec();
+    v.sort_unstable();
+    v[v.len() / 2].min(MAX_MIC_DELAY_MS)
 }
 
 impl App {
@@ -117,18 +132,28 @@ impl App {
     }
 
     /// Delay the mic by the cut-out's processing time so lips match the
-    /// voice on the stream. Changes under 20 ms are ignored to avoid churn.
+    /// voice on the stream: median of the last ~2 s of latencies, capped.
+    /// Changes under 20 ms are ignored to avoid churn.
     pub fn update_mic_delay(&self) {
-        let want = match &self.segmenter {
+        let latest = match &self.segmenter {
             Some(seg) if self.layout.read().style.is_cutout() => {
                 let st = seg.status();
-                if st.active.is_some() {
-                    st.latency_ms
-                } else {
-                    0
-                }
+                st.active.map(|_| st.latency_ms)
             }
-            _ => 0,
+            _ => None,
+        };
+        let want = {
+            let mut l = self.latencies.lock();
+            match latest {
+                Some(ms) => {
+                    l.push_back(ms);
+                    if l.len() > 8 {
+                        l.pop_front();
+                    }
+                }
+                None => l.clear(),
+            }
+            smoothed_delay(l.make_contiguous())
         };
         let mut cur = self.mic_delay_ms.lock();
         if want.abs_diff(*cur) > 20 || (want == 0 && *cur != 0) {
@@ -312,5 +337,25 @@ impl Controls for App {
         seg.set_choice(choice);
         self.save_choice("cutout_engine", engine);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::smoothed_delay;
+
+    #[test]
+    fn delay_ignores_one_slow_frame() {
+        assert_eq!(smoothed_delay(&[31, 30, 300, 32, 31]), 31);
+    }
+
+    #[test]
+    fn delay_is_capped() {
+        assert_eq!(smoothed_delay(&[400; 5]), 150);
+    }
+
+    #[test]
+    fn no_samples_no_delay() {
+        assert_eq!(smoothed_delay(&[]), 0);
     }
 }

@@ -33,15 +33,20 @@ pub struct Mixer {
     delay: Arc<parking_lot::Mutex<MicDelay>>,
 }
 
+/// The mic is played `frames` behind real time by keeping that much audio
+/// queued: after a reset, an underrun or a late mic start it waits until the
+/// backlog is built up again, and it skips ahead if the backlog grows past
+/// the target plus some slack.
 #[derive(Default)]
 struct MicDelay {
-    /// Current delay in frames.
+    /// Target backlog in frames (0 = no delay).
     frames: usize,
-    /// Frames of silence still to insert before the mic.
-    insert: usize,
-    /// Frames of queued mic audio still to skip.
-    skip: usize,
+    /// Waiting for the backlog to reach `frames`.
+    priming: bool,
 }
+
+/// Backlog above the target that is tolerated before skipping (20 ms).
+const DELAY_SLACK_FRAMES: usize = 960;
 
 impl Mixer {
     pub fn new(page: AudioRing, mic: AudioRing, settings: MixSettings) -> Self {
@@ -61,22 +66,14 @@ impl Mixer {
         *self.settings.read()
     }
 
-    /// Delay the mic by `ms` relative to now (to line up with a video path
-    /// that lags by that much). Growing inserts silence once; shrinking skips
-    /// queued mic audio. Capped by the mic ring's capacity.
+    /// Play the mic `ms` late (to line up with a video path that lags by that
+    /// much). Kept through stream restarts and mic restarts. Limited by the
+    /// mic ring's capacity.
     pub fn set_mic_delay_ms(&self, ms: u32) {
         let want = ms as usize * p2c_core::SAMPLE_RATE as usize / 1000;
         let mut d = self.delay.lock();
         if want > d.frames {
-            let grow = want - d.frames;
-            let cancel = grow.min(d.skip);
-            d.skip -= cancel;
-            d.insert += grow - cancel;
-        } else {
-            let shrink = d.frames - want;
-            let cancel = shrink.min(d.insert);
-            d.insert -= cancel;
-            d.skip += shrink - cancel;
+            d.priming = true;
         }
         d.frames = want;
     }
@@ -85,6 +82,8 @@ impl Mixer {
     pub fn reset(&self) {
         self.page.clear();
         self.mic.clear();
+        let mut d = self.delay.lock();
+        d.priming = d.frames > 0;
     }
 
     /// `frames` stereo frames (2 * frames samples).
@@ -93,28 +92,36 @@ impl Mixer {
         let mut out = vec![0.0f32; frames * 2];
         let mut tmp = vec![0.0f32; frames * 2];
         let ch = p2c_core::CHANNELS as usize;
-        let mic_offset = {
+        let hold_mic = {
             let mut d = self.delay.lock();
-            while d.skip > 0 {
-                let n = d.skip.min(frames);
-                let got = self.mic.pop_into(&mut tmp[..n * ch]) / ch;
-                d.skip -= got;
-                if got < n {
-                    d.skip = 0; // nothing more queued: caught up
+            if d.frames == 0 {
+                d.priming = false;
+            } else {
+                let queued = self.mic.len_samples() / ch;
+                if queued == 0 {
+                    d.priming = true; // underrun or restart: build the delay again
+                }
+                if d.priming && queued >= d.frames {
+                    d.priming = false;
+                }
+                if !d.priming && queued > d.frames + DELAY_SLACK_FRAMES {
+                    let mut drop = vec![0.0f32; (queued - d.frames) * ch];
+                    self.mic.pop_into(&mut drop);
                 }
             }
-            let ins = d.insert.min(frames);
-            d.insert -= ins;
-            ins * ch
+            d.priming
         };
-        for (ring, on, gain, offset) in [
-            (&self.page, s.page_on, s.page_gain, 0),
-            (&self.mic, s.mic_on, s.mic_gain, mic_offset),
+        for (ring, on, gain, hold) in [
+            (&self.page, s.page_on, s.page_gain, false),
+            (&self.mic, s.mic_on, s.mic_gain, hold_mic),
         ] {
+            if hold {
+                continue;
+            }
             tmp.iter_mut().for_each(|x| *x = 0.0);
-            let n = ring.pop_into(&mut tmp[offset..]);
+            let n = ring.pop_into(&mut tmp);
             if on {
-                for (o, v) in out[offset..].iter_mut().zip(&tmp[offset..offset + n]) {
+                for (o, v) in out.iter_mut().zip(&tmp[..n]) {
                     *o += v * gain;
                 }
             }
@@ -173,28 +180,51 @@ mod tests {
     }
 
     #[test]
-    fn mic_delay_inserts_silence() {
+    fn mic_delay_waits_for_backlog() {
+        // 10 ms = 480 frames: mic audio is held back until that much is queued.
         let (m, _page, mic) = mixer(MixSettings::default());
-        mic.push(&[0.5; 2000]);
         m.set_mic_delay_ms(10);
-        let out = m.pull(1000);
+        mic.push(&[0.5; 480]); // 240 frames
         assert!(
-            out[..960].iter().all(|s| *s == 0.0),
-            "first 480 frames not silent"
+            m.pull(240).iter().all(|s| *s == 0.0),
+            "played before the delay"
         );
-        assert!(out[960..].iter().all(|s| *s == 0.5));
+        mic.push(&[0.5; 480]); // 480 queued now
+        assert!(m.pull(240).iter().all(|s| *s == 0.5));
     }
 
     #[test]
-    fn mic_delay_shrink_drops_samples() {
+    fn mic_delay_survives_reset_and_late_mic() {
+        // Stream restarts clear the rings; the mic may also start later.
         let (m, _page, mic) = mixer(MixSettings::default());
-        let ramp: Vec<f32> = (0..2000).map(|i| (i / 2) as f32 / 1000.0).collect();
-        mic.push(&ramp);
         m.set_mic_delay_ms(10);
-        assert!(m.pull(480).iter().all(|s| *s == 0.0));
-        m.set_mic_delay_ms(0);
-        // 480 queued frames are skipped to catch up.
-        assert_eq!(m.pull(1), vec![0.48, 0.48]);
+        assert!(m.pull(100).iter().all(|s| *s == 0.0));
+        mic.push(&[0.5; 960]);
+        assert!(m.pull(240).iter().all(|s| *s == 0.5));
+        m.reset();
+        mic.push(&[0.5; 480]); // 240 frames < 480
+        assert!(
+            m.pull(240).iter().all(|s| *s == 0.0),
+            "delay lost after reset"
+        );
+    }
+
+    #[test]
+    fn mic_delay_shrink_skips_backlog() {
+        let (m, _page, mic) = mixer(MixSettings::default());
+        let ramp: Vec<f32> = (0..4000).map(|i| (i / 2) as f32 / 10000.0).collect();
+        mic.push(&ramp); // 2000 frames queued
+        m.set_mic_delay_ms(10);
+        // Backlog 2000 > 480 + 960 slack: skip down to 480 frames queued.
+        let out = m.pull(1);
+        assert_eq!(out, vec![0.152, 0.152]);
+    }
+
+    #[test]
+    fn no_delay_plays_immediately() {
+        let (m, _page, mic) = mixer(MixSettings::default());
+        mic.push(&[0.5; 2]);
+        assert_eq!(m.pull(1), vec![0.5, 0.5]);
     }
 
     #[test]

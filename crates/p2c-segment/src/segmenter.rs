@@ -117,6 +117,12 @@ const RETRY_OPEN: Duration = Duration::from_secs(5);
 const IDLE: Duration = Duration::from_millis(50);
 const POLL: Duration = Duration::from_millis(3);
 const TOO_SLOW: &str = "Quality was too slow on this PC, switched to Fast";
+/// A webcam gap longer than this starts the engine's memory afresh.
+const STALL: Duration = Duration::from_secs(1);
+/// After this many failed inferences in a row, reopen the engine.
+const MAX_ERRORS: u32 = 10;
+/// How often the cut-out rate is written to the log while running.
+const LOG_EVERY: Duration = Duration::from_secs(30);
 
 struct Worker {
     opener: Opener,
@@ -140,6 +146,10 @@ struct Worker {
     window_count: u32,
     masks_per_sec: f32,
     last_error_log: Option<Instant>,
+    was_enabled: bool,
+    pending_reset: bool,
+    errors_in_row: u32,
+    last_rate_log: Instant,
 }
 
 impl Worker {
@@ -165,6 +175,10 @@ impl Worker {
             window_count: 0,
             masks_per_sec: 0.0,
             last_error_log: None,
+            was_enabled: false,
+            pending_reset: false,
+            errors_in_row: 0,
+            last_rate_log: Instant::now(),
         }
     }
 
@@ -183,6 +197,11 @@ impl Worker {
                 self.open_failed_at = None;
                 self.note.clear();
             }
+            if enabled && !self.was_enabled && self.engine.is_some() {
+                // Back from Box style: don't reuse memory of old frames.
+                self.pending_reset = true;
+            }
+            self.was_enabled = enabled;
             let pause = if enabled { self.step() } else { Some(IDLE) };
             if !enabled {
                 self.masks_per_sec = 0.0;
@@ -239,8 +258,13 @@ impl Worker {
         }
         let now = Instant::now();
         if let (Some(t), true) = (self.last_seq_at, self.last_seq != 0) {
-            let frames = (seq - self.last_seq).max(1) as u32;
-            self.cam_interval = now.duration_since(t) / frames;
+            let gap = now.duration_since(t);
+            if gap > STALL {
+                self.pending_reset = true;
+            } else {
+                let frames = (seq - self.last_seq).max(1) as u32;
+                self.cam_interval = gap / frames;
+            }
         }
         self.last_seq = seq;
         self.last_seq_at = Some(now);
@@ -248,8 +272,9 @@ impl Worker {
 
         let engine = self.engine.as_mut()?;
         let size = (frame.width, frame.height);
-        if self.last_size.is_some_and(|s| s != size) {
+        if self.last_size.is_some_and(|s| s != size) || self.pending_reset {
             engine.reset();
+            self.pending_reset = false;
         }
         self.last_size = Some(size);
 
@@ -263,6 +288,7 @@ impl Worker {
                 self.out.put(f);
                 self.latency = took;
                 self.window_count += 1;
+                self.errors_in_row = 0;
                 if self.note.starts_with("cut-out error") {
                     self.note.clear();
                 }
@@ -275,6 +301,15 @@ impl Worker {
                 {
                     tracing::warn!("cut-out error: {e:#}");
                     self.last_error_log = Some(Instant::now());
+                }
+                self.errors_in_row += 1;
+                if self.errors_in_row >= MAX_ERRORS {
+                    // E.g. GPU lost after sleep: start the engine again (the
+                    // runtime falls back to the CPU if the GPU won't open).
+                    tracing::warn!(engine = ?self.active, "reopening the cut-out engine after repeated errors");
+                    self.errors_in_row = 0;
+                    self.drop_engine();
+                    return None;
                 }
             }
         }
@@ -299,6 +334,18 @@ impl Worker {
             self.masks_per_sec = self.window_count as f32 / el.as_secs_f32();
             self.window_count = 0;
             self.window_start = Instant::now();
+        }
+        if self.last_rate_log.elapsed() >= LOG_EVERY {
+            self.last_rate_log = Instant::now();
+            if let (Some(a), Some(d)) = (self.active, self.device) {
+                tracing::info!(
+                    engine = %a,
+                    device = %d,
+                    masks_per_sec = format!("{:.1}", self.masks_per_sec),
+                    latency_ms = self.latency.as_millis() as u64,
+                    "cut-out running"
+                );
+            }
         }
     }
 
@@ -331,11 +378,13 @@ mod tests {
         delay: Duration,
         value: f32,
         counts: Counts,
+        fail: bool,
     }
 
     impl Engine for FakeEngine {
         fn infer(&mut self, _: &Frame) -> anyhow::Result<(Vec<f32>, u32, u32)> {
             std::thread::sleep(self.delay);
+            anyhow::ensure!(!self.fail, "device lost");
             self.counts.infers.fetch_add(1, Ordering::SeqCst);
             Ok((vec![self.value; 4], 2, 2))
         }
@@ -358,6 +407,7 @@ mod tests {
                 delay,
                 value: 1.0,
                 counts: counts.clone(),
+                fail: false,
             }) as Box<dyn Engine>)
         })
     }
@@ -492,6 +542,70 @@ mod tests {
         assert!(
             counts.opens.load(Ordering::SeqCst) > opens,
             "switch did not open a fresh engine"
+        );
+        s.stop();
+    }
+
+    #[test]
+    fn segmenter_resets_when_reenabled_or_after_stall() {
+        let counts = Counts::default();
+        let (cam, out) = (FrameSlot::new(), FrameSlot::new());
+        let s = Segmenter::spawn(
+            opener(1, 1, counts.clone()),
+            cam.clone(),
+            out,
+            EngineChoice::Quality,
+        );
+        s.set_enabled(true);
+        {
+            let _f = Feeder::start(cam.clone(), 64, 36);
+            ms(200);
+            assert_eq!(counts.resets.load(Ordering::SeqCst), 0);
+            // Box style and back: old recurrent state must not be reused.
+            s.set_enabled(false);
+            ms(100);
+            s.set_enabled(true);
+            ms(200);
+        }
+        let after_reenable = counts.resets.load(Ordering::SeqCst);
+        assert!(after_reenable >= 1, "no reset after re-enabling");
+        // Webcam stalls for over a second, then comes back.
+        ms(1300);
+        let _f = Feeder::start(cam, 64, 36);
+        ms(200);
+        assert!(
+            counts.resets.load(Ordering::SeqCst) > after_reenable,
+            "no reset after a stall"
+        );
+        s.stop();
+    }
+
+    #[test]
+    fn segmenter_reopens_engine_after_repeated_errors() {
+        let counts = Counts::default();
+        let c = counts.clone();
+        let opener: Opener = Box::new(move |_| {
+            c.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FakeEngine {
+                delay: Duration::from_millis(1),
+                value: 1.0,
+                counts: c.clone(),
+                fail: true,
+            }) as Box<dyn Engine>)
+        });
+        let (cam, out) = (FrameSlot::new(), FrameSlot::new());
+        let _f = Feeder::start(cam.clone(), 64, 36);
+        let s = Segmenter::spawn(opener, cam, out, EngineChoice::Quality);
+        s.set_enabled(true);
+        ms(1000);
+        assert!(
+            counts.opens.load(Ordering::SeqCst) >= 2,
+            "engine never reopened"
+        );
+        assert!(
+            s.status().note.contains("device lost"),
+            "{}",
+            s.status().note
         );
         s.stop();
     }

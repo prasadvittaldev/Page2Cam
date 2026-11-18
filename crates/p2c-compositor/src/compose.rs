@@ -17,7 +17,7 @@ pub fn compose(page: Option<&Frame>, pip: Option<(&Frame, &PipLayout)>, out: &mu
                 blend(scaled.buffer(), w, h, out, x, y);
             } else {
                 let scaled = scale(cam, w, h);
-                blit(scaled.buffer(), w, h, out, x, y);
+                blit(scaled.buffer(), w, h, out, x as u32, y);
             }
         }
     }
@@ -96,14 +96,24 @@ fn scale_straight(src: &Frame, dw: u32, dh: u32) -> Image<'static> {
     dst
 }
 
-/// Alpha-blend a BGRA `src` (w x h; A = coverage) over `out` at (x, y).
-fn blend(src: &[u8], w: u32, h: u32, out: &mut Frame, x: u32, y: u32) {
+/// Alpha-blend a BGRA `src` (w x h; A = coverage) over `out` at (x, y),
+/// clipping columns that fall outside the output.
+fn blend(src: &[u8], w: u32, h: u32, out: &mut Frame, x: i32, y: u32) {
+    let first = (-x).max(0) as usize; // first visible source column
+    let last = (out.width as i64 - x as i64).clamp(0, w as i64) as usize;
+    if first >= last {
+        return;
+    }
+    let cols = last - first;
+    let dx = (x.max(0)) as usize;
     let row = w as usize * 4;
     let ostride = out.width as usize * 4;
     for r in 0..h as usize {
-        let o = (y as usize + r) * ostride + x as usize * 4;
-        let dst = out.data[o..o + row].as_chunks_mut::<4>().0;
-        let s = src[r * row..(r + 1) * row].as_chunks::<4>().0;
+        let o = (y as usize + r) * ostride + dx * 4;
+        let dst = out.data[o..o + cols * 4].as_chunks_mut::<4>().0;
+        let s = src[r * row + first * 4..r * row + last * 4]
+            .as_chunks::<4>()
+            .0;
         for (d, s) in dst.iter_mut().zip(s) {
             let a = s[3] as u32;
             if a == 0 {
@@ -195,6 +205,33 @@ mod tests {
             out.pixel(1, 0)
         );
         assert_eq!(out.pixel(2, 0)[0], 0);
+    }
+
+    #[test]
+    fn cutout_full_clips_at_frame_edges() {
+        // 16:9 cam slid fully left: the left quarter of the cam is off-frame.
+        let mut out = Frame::new_black(64, 36);
+        let page = solid(64, 36, [255, 255, 255, 255]);
+        let mut cam = solid(16, 9, [0, 0, 0, 255]);
+        for y in 0..9 {
+            for x in 0..4 {
+                let i = (y * 16 + x) * 4;
+                cam.data[i..i + 4].copy_from_slice(&[0, 0, 255, 255]); // red left quarter
+            }
+        }
+        let mut l = full_layout(crate::OverlayStyle::CutoutFull);
+        l.x = 0.0;
+        compose(Some(&page), Some((&cam, &l)), &mut out);
+        assert_eq!(
+            out.pixel(2, 18)[..3],
+            [0, 0, 0],
+            "left edge should show the cam's 2nd quarter"
+        );
+        assert_eq!(
+            out.pixel(63, 18)[..3],
+            [255, 255, 255],
+            "right quarter stays page"
+        );
     }
 
     #[test]

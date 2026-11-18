@@ -2,6 +2,8 @@
 
 /// Fraction of the output width/height kept clear around the PIP.
 const MARGIN: f32 = 0.02;
+/// How far a full-size cut-out may slide past each edge, as a fraction of its width.
+const FULL_OVERHANG: f32 = 0.25;
 
 /// Where and how big the webcam overlay is.
 ///
@@ -85,7 +87,8 @@ impl Default for PipLayout {
     }
 }
 
-/// Pixel rect `(x, y, w, h)` of the PIP, always fully inside the output.
+/// Pixel rect `(x, y, w, h)` of the PIP. Inside the output, except that a
+/// full-size cut-out may overhang the left/right edge (x < 0 or x + w > out_w).
 /// Box: 2% margins, `x`/`y` place it. Cut-out small: side margins, bottom
 /// edge on the frame's bottom, `y` ignored. Cut-out full: full height
 /// (shrunk to fit the width), bottom-anchored, `x` slides it, `width` ignored.
@@ -96,7 +99,7 @@ pub fn pip_rect(
     cam_h: u32,
     out_w: u32,
     out_h: u32,
-) -> Option<(u32, u32, u32, u32)> {
+) -> Option<(i32, u32, u32, u32)> {
     if !layout.visible || cam_w == 0 || cam_h == 0 || out_w == 0 || out_h == 0 {
         return None;
     }
@@ -128,7 +131,15 @@ pub fn pip_rect(
     if w == 0 || h == 0 {
         return None;
     }
-    let x = mx + ((layout.x.clamp(0.0, 1.0) * (avail_w - w) as f32).round() as u32);
+    let x = match layout.style {
+        // May overhang each side by a quarter of its width, so it can be moved
+        // even when it fills the width (a 16:9 camera on a 16:9 output).
+        OverlayStyle::CutoutFull => {
+            let over = w as f32 * FULL_OVERHANG;
+            (-over + layout.x.clamp(0.0, 1.0) * ((avail_w - w) as f32 + 2.0 * over)).round() as i32
+        }
+        _ => (mx + ((layout.x.clamp(0.0, 1.0) * (avail_w - w) as f32).round() as u32)) as i32,
+    };
     let y = match layout.style {
         OverlayStyle::Box => {
             my + ((layout.y.clamp(0.0, 1.0) * (avail_h - h) as f32).round() as u32)
@@ -181,7 +192,7 @@ mod tests {
             };
             let (px, py, w, h) = pip_rect(&l, 1280, 720, 1920, 1080).unwrap();
             assert!(
-                px + w <= 1920 && py + h <= 1080,
+                px >= 0 && px as u32 + w <= 1920 && py + h <= 1080,
                 "{x},{y} -> {px},{py} {w}x{h}"
             );
         }
@@ -194,7 +205,7 @@ mod tests {
             style: OverlayStyle::Box,
         };
         let (px, py, w, h) = pip_rect(&l, 1280, 720, 1920, 1080).unwrap();
-        assert!(px + w <= 1920 && py + h <= 1080);
+        assert!(px >= 0 && px as u32 + w <= 1920 && py + h <= 1080);
     }
 
     fn cutout(style: OverlayStyle, x: f32, width: f32) -> PipLayout {
@@ -241,6 +252,24 @@ mod tests {
             1080,
         );
         assert_eq!(r, Some((240, 0, 1440, 1080)));
+    }
+
+    #[test]
+    fn cutout_full_16x9_slides_past_edges() {
+        // A widescreen camera fills the width; it may slide a quarter of its
+        // width off either side so the operator can still move themselves.
+        let at = |x| {
+            pip_rect(
+                &cutout(OverlayStyle::CutoutFull, x, 0.1),
+                1280,
+                720,
+                1920,
+                1080,
+            )
+        };
+        assert_eq!(at(0.0), Some((-480, 0, 1920, 1080)));
+        assert_eq!(at(0.5), Some((0, 0, 1920, 1080)));
+        assert_eq!(at(1.0), Some((480, 0, 1920, 1080)));
     }
 
     #[test]

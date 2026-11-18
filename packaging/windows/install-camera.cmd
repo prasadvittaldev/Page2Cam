@@ -37,6 +37,12 @@ rem Folder for the driver's log file, writable by the camera service.
 mkdir "%ProgramData%\Page2Cam" 2>nul
 icacls "%ProgramData%\Page2Cam" /grant *S-1-5-19:(OI)(CI)M *S-1-5-32-545:(OI)(CI)M >nul
 
+rem The cut-out (background removal) needs the Microsoft Visual C++ runtime.
+if exist "%~dp0vc_redist.x64.exe" (
+  echo Installing the Microsoft Visual C++ runtime ^(needed for the cut-out^)...
+  "%~dp0vc_redist.x64.exe" /install /quiet /norestart
+)
+
 regsvr32 /s "%DEST%\p2c_vcam_win_source.dll"
 if errorlevel 1 (
   echo Registering the camera driver failed.

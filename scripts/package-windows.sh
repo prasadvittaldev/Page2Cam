@@ -40,7 +40,8 @@ cp "$ROOT"/packaging/windows/* "$OUT/"
 echo "==> Cut-out models and ONNX Runtime"
 "$ROOT/scripts/fetch-models.sh"
 # The app looks for the runtime next to the exe and the models in models\.
-cp "$ROOT/third_party/onnxruntime/windows/onnxruntime.dll" "$ROOT/third_party/onnxruntime/windows/DirectML.dll" "$OUT/"
+cp "$ROOT/third_party/onnxruntime/windows/onnxruntime.dll" "$ROOT/third_party/onnxruntime/windows/DirectML.dll" \
+   "$ROOT/third_party/onnxruntime/windows/vc_redist.x64.exe" "$OUT/"
 mkdir -p "$OUT/models" "$OUT/licenses"
 cp "$ROOT/third_party/models/rvm_mobilenetv3_fp32.onnx" "$ROOT/third_party/models/selfie_landscape.onnx" "$OUT/models/"
 cp "$ROOT"/third_party/onnxruntime/windows/licenses/* "$OUT/licenses/"
@@ -66,6 +67,16 @@ if [ ! -f "$FFMPEG_CACHE/ffmpeg.exe" ]; then
   rm -rf "$tmp"
 fi
 cp "$FFMPEG_CACHE/ffmpeg.exe" "$OUT/"
+
+echo "==> Checking"
+# Everything the cut-out needs at run time must be in the folder.
+for f in page2cam.exe onnxruntime.dll DirectML.dll vc_redist.x64.exe models/rvm_mobilenetv3_fp32.onnx models/selfie_landscape.onnx; do
+  [ -s "$OUT/$f" ] || { echo "missing from package: $f" >&2; exit 1; }
+done
+# onnxruntime.dll is loaded at run time, never linked.
+if llvm-readobj --coff-imports "$OUT/page2cam.exe" | grep -qi onnxruntime; then
+  echo "page2cam.exe must not import onnxruntime.dll" >&2; exit 1
+fi
 
 echo "==> Zipping"
 (cd "$ROOT/dist" && zip -qr -9 "$(basename "$ZIP")" "$(basename "$OUT")")

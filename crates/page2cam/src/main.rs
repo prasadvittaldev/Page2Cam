@@ -221,6 +221,7 @@ fn run() -> anyhow::Result<()> {
         segmenter,
         settings_path: config::save_path(cli.config.as_deref()),
         mic_delay_ms: Mutex::new(0),
+        latencies: Mutex::new(Default::default()),
     });
 
     // Keep the mic in step with the cut-out's processing delay.
