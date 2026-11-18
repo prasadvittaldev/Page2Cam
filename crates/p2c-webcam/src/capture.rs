@@ -69,7 +69,15 @@ impl WebcamCapture {
                         return;
                     }
                 };
+                let started = std::time::Instant::now();
+                let mut frames = 0u32;
+                let mut reported = false;
                 while !stop2.load(Ordering::Relaxed) {
+                    if !reported && started.elapsed() >= Duration::from_secs(5) {
+                        let fps = frames as f64 / started.elapsed().as_secs_f64();
+                        tracing::info!(camera = %cam.name, "webcam measured {fps:.1} fps");
+                        reported = true;
+                    }
                     let frame = match camera.frame() {
                         Ok(f) => f,
                         Err(e) => {
@@ -84,7 +92,10 @@ impl WebcamCapture {
                         break;
                     };
                     match crate::decode::to_bgra(fmt, res.width(), res.height(), frame.buffer()) {
-                        Ok(f) => slot.put(f),
+                        Ok(f) => {
+                            slot.put(f);
+                            frames += 1;
+                        }
                         Err(e) => tracing::debug!(error = %e, "dropping undecodable webcam frame"),
                     }
                 }
@@ -139,6 +150,20 @@ fn open(cam: &CameraInfo) -> anyhow::Result<Camera> {
     let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(want));
     let mut camera = Camera::new(CameraIndex::Index(cam.index), format)
         .with_context(|| format!("opening webcam {}", cam.name))?;
+    // Prefer a mode that really delivers ~30 fps (some webcams default to a
+    // slow high-resolution mode). If listing fails, keep the Closest request.
+    match camera.compatible_camera_formats() {
+        Ok(modes) => {
+            tracing::debug!(camera = %cam.name, ?modes, "webcam modes");
+            if let Some(m) = crate::format::choose_format(&modes) {
+                let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(m));
+                if let Err(e) = camera.set_camera_requset(req) {
+                    tracing::warn!(camera = %cam.name, error = %e, "could not select webcam mode {m}");
+                }
+            }
+        }
+        Err(e) => tracing::debug!(camera = %cam.name, error = %e, "cannot list webcam modes"),
+    }
     camera
         .open_stream()
         .with_context(|| format!("starting webcam {}", cam.name))?;
