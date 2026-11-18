@@ -1,6 +1,7 @@
 //! IMFMediaStream2: hands out one sample per RequestSample, filled from the
 //! newest page2cam frame (or a "waiting for Page2Cam" pattern).
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use windows::core::{implement, ComObject, IUnknown, Interface, Result, GUID, HRESULT};
 use windows::Win32::Foundation::S_OK;
@@ -43,6 +44,12 @@ struct State {
     frame_w: u32,
     frame_h: u32,
     frame_time_ms: u64,
+    /// Pixel layout of `frame`.
+    frame_fmt: p2c_shm::PixelFormat,
+    /// The app writes a frame format we do not understand: show the waiting picture.
+    version_mismatch: bool,
+    /// When the version mismatch was last written to vcam.log.
+    version_logged: Option<Instant>,
     tick: u64,
     scratch: Vec<u8>,
 }
@@ -69,6 +76,11 @@ fn media_type(w: u32, h: u32, nv12: bool) -> Result<IMFMediaType> {
         let bpp = if nv12 { 12 } else { 32 };
         t.SetUINT32(&MF_MT_AVG_BITRATE, w * h * bpp * FPS)?;
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
+        if nv12 {
+            // The app converts with BT.709, limited range (p2c_core::bgra_to_nv12).
+            t.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+            t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+        }
         Ok(t)
     }
 }
@@ -111,6 +123,9 @@ pub(crate) fn create(index: u32) -> Result<ComObject<MediaStream>> {
             frame_w: 0,
             frame_h: 0,
             frame_time_ms: 0,
+            frame_fmt: p2c_shm::PixelFormat::Bgra,
+            version_mismatch: false,
+            version_logged: None,
             tick: 0,
             scratch: Vec::new(),
         }),
@@ -220,24 +235,53 @@ impl State {
     fn refresh_frame(&mut self) {
         if let Some(base) = super::shared::base() {
             let mut buf = std::mem::take(&mut self.scratch);
-            if let Ok(info) = unsafe { p2c_shm::read_frame(base, &mut buf) } {
-                if info.format == p2c_shm::PixelFormat::Bgra && info.time_ms != self.frame_time_ms {
-                    std::mem::swap(&mut self.frame, &mut buf);
-                    self.frame_w = info.width;
-                    self.frame_h = info.height;
-                    self.frame_time_ms = info.time_ms;
+            match unsafe { p2c_shm::read_frame(base, &mut buf) } {
+                Ok(info) => {
+                    self.version_mismatch = false;
+                    if info.time_ms != self.frame_time_ms {
+                        std::mem::swap(&mut self.frame, &mut buf);
+                        self.frame_w = info.width;
+                        self.frame_h = info.height;
+                        self.frame_time_ms = info.time_ms;
+                        self.frame_fmt = info.format;
+                    }
                 }
+                Err(p2c_shm::ReadError::Version { found }) => {
+                    // App and camera driver disagree: never guess at the bytes.
+                    self.version_mismatch = true;
+                    if self
+                        .version_logged
+                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+                    {
+                        self.version_logged = Some(Instant::now());
+                        super::log(&format!(
+                            "frame format v{found} not supported — reinstall Page2Cam"
+                        ));
+                    }
+                }
+                // Mid-write or nothing yet: keep the previous frame.
+                Err(p2c_shm::ReadError::Busy | p2c_shm::ReadError::NoFrame) => {}
             }
             self.scratch = buf;
         }
     }
 
-    /// BGRA source for this sample: the page2cam frame, or a waiting pattern.
-    fn source_frame(&mut self) -> (Vec<u8>, u32, u32) {
+    /// Source for this sample: the page2cam frame (NV12 or BGRA, see
+    /// `frame_fmt`) or the BGRA waiting pattern, and whether it is the frame.
+    fn source_frame(&mut self) -> (Vec<u8>, u32, u32, p2c_shm::PixelFormat, bool) {
         self.refresh_frame();
         self.tick += 1;
-        if !self.frame.is_empty() && now_ms().saturating_sub(self.frame_time_ms) < STALE_MS {
-            return (std::mem::take(&mut self.frame), self.frame_w, self.frame_h);
+        if !self.version_mismatch
+            && !self.frame.is_empty()
+            && now_ms().saturating_sub(self.frame_time_ms) < STALE_MS
+        {
+            return (
+                std::mem::take(&mut self.frame),
+                self.frame_w,
+                self.frame_h,
+                self.frame_fmt,
+                true,
+            );
         }
         // Dark slate with a slow light band: "camera works, start Page2Cam".
         let (w, h) = (160u32, 90u32);
@@ -249,11 +293,12 @@ impl State {
                 px.extend_from_slice(&[v + 8, v + 4, v, 255]);
             }
         }
-        (px, w, h)
+        (px, w, h, p2c_shm::PixelFormat::Bgra, false)
     }
 
     fn fill(&mut self, sample: &IMFSample) -> Result<()> {
-        let (src, sw, sh) = self.source_frame();
+        use p2c_shm::PixelFormat;
+        let (src, sw, sh, fmt, is_frame) = self.source_frame();
         let (w, h, nv12) = (self.width, self.height, self.nv12);
         // Build a tightly packed image, then copy rows using the buffer's pitch
         // (which may be negative for bottom-up RGB buffers).
@@ -263,12 +308,21 @@ impl State {
             (w as usize * 4, h as usize)
         };
         let mut packed = vec![0u8; row_bytes * rows];
-        if nv12 {
-            p2c_shm::fill_nv12(&src, sw, sh, &mut packed, row_bytes, w, h);
-        } else {
-            p2c_shm::fill_rgb32(&src, sw, sh, &mut packed, row_bytes, w, h);
+        match (fmt, nv12) {
+            (PixelFormat::Nv12, true) => {
+                p2c_shm::nv12_to_nv12(&src, sw, sh, &mut packed, row_bytes, w, h)
+            }
+            (PixelFormat::Nv12, false) => {
+                p2c_shm::nv12_to_rgb32(&src, sw, sh, &mut packed, row_bytes, w, h)
+            }
+            (PixelFormat::Bgra, true) => {
+                p2c_shm::fill_nv12(&src, sw, sh, &mut packed, row_bytes, w, h)
+            }
+            (PixelFormat::Bgra, false) => {
+                p2c_shm::fill_rgb32(&src, sw, sh, &mut packed, row_bytes, w, h)
+            }
         }
-        if sw == self.frame_w && sh == self.frame_h && !src.is_empty() {
+        if is_frame {
             self.frame = src; // give the page2cam frame back for reuse
         }
         unsafe {

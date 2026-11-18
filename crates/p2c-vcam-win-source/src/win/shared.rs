@@ -69,16 +69,26 @@ fn open() -> Option<Mapping> {
             }
         };
         let view = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, p2c_shm::MAPPING_SIZE);
-        let view = if view.Value.is_null() {
-            MapViewOfFile(handle, FILE_MAP_READ, 0, 0, p2c_shm::MAPPING_SIZE)
-        } else {
+        let writable = !view.Value.is_null();
+        let view = if writable {
             view
+        } else {
+            MapViewOfFile(handle, FILE_MAP_READ, 0, 0, p2c_shm::MAPPING_SIZE)
         };
         if view.Value.is_null() {
             super::log("MapViewOfFile failed");
             return None;
         }
-        super::log("frame mapping ready");
+        if writable {
+            // Tells the app which frame format this DLL reads, so it can
+            // report an out-of-date camera driver.
+            p2c_shm::set_dll_version(view.Value as *mut u8);
+        }
+        super::log(&format!(
+            "frame mapping ready (format v{}{})",
+            p2c_shm::VERSION,
+            if writable { "" } else { ", read-only" }
+        ));
         Some(Mapping {
             _handle: handle,
             view,
