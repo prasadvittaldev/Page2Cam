@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 pub mod runtime;
+pub mod tensor;
 
 pub use runtime::Device;
 
