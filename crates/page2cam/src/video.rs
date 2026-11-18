@@ -20,6 +20,9 @@ pub fn status_fallback(reason: &str) -> String {
 /// i.e. the 0.3.0 behaviour.
 pub const STATUS_COMPAT: &str = "CPU (compatibility)";
 
+/// Status text: `--test-pattern` (it paints into the CPU page slot).
+pub const STATUS_TEST_PATTERN: &str = "CPU (test pattern)";
+
 /// How long Chromium may take to deliver its first GPU frame (a dGPU can
 /// need 1-3 s to wake up and the page to load).
 pub const FIRST_TEXTURE_WITHIN: Duration = Duration::from_secs(5);

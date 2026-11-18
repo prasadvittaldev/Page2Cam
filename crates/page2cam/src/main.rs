@@ -293,7 +293,10 @@ fn run() -> anyhow::Result<()> {
 
     // The ticker switched to the CPU compositor: say so, and make Chromium
     // paint on the CPU (once the browser exists; see the `run` callback).
-    let fell_back = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // `fell_back` is held while it is set and the browser read here, and
+    // while the browser is set and the flag read in the `run` callback, so
+    // exactly one of the two sees the other and switches the browser.
+    let fell_back = Arc::new(Mutex::new(false));
     let events_thread = {
         let (app, fell_back) = (app.clone(), fell_back.clone());
         std::thread::Builder::new()
@@ -305,7 +308,8 @@ fn run() -> anyhow::Result<()> {
                     let s = video::status_fallback(&reason);
                     tracing::warn!("video: {s}");
                     *app.video.lock() = s;
-                    fell_back.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let mut f = fell_back.lock();
+                    *f = true;
                     if let Some(b) = app.browser.get() {
                         b.recreate_cpu();
                     }
@@ -377,11 +381,14 @@ fn run() -> anyhow::Result<()> {
             if let Err(e) = ctrlc::set_handler(move || h.shutdown()) {
                 tracing::error!(error = %e, "could not install Ctrl-C handler");
             }
-            let _ = app2.browser.set(handle.clone());
-            // A fallback before the browser existed: switch it now.
-            // (recreate_cpu is idempotent, so a race with the events thread is harmless.)
-            if fell_back2.load(std::sync::atomic::Ordering::SeqCst) {
-                handle.recreate_cpu();
+            {
+                // A fallback before the browser existed: switch it now (see
+                // `fell_back`).
+                let f = fell_back2.lock();
+                let _ = app2.browser.set(handle.clone());
+                if *f {
+                    handle.recreate_cpu();
+                }
             }
             if let Some(stats) = watch {
                 spawn_watchdog(stats, fallback2, fell_back2, quit2);
@@ -444,7 +451,7 @@ fn start_video(choice: &p2c_d3d::GpuChoice, spec: OutputSpec, test_pattern: bool
             return cpu(video::STATUS_COMPAT.into());
         }
         // The test pattern paints into the CPU page slot.
-        p2c_d3d::GpuChoice::Gpu(_) if test_pattern => return cpu("CPU (test pattern)".into()),
+        p2c_d3d::GpuChoice::Gpu(_) if test_pattern => return cpu(video::STATUS_TEST_PATTERN.into()),
         p2c_d3d::GpuChoice::Gpu(a) => a,
     };
     let holder = p2c_d3d::PageHolder::default();
@@ -470,7 +477,7 @@ fn start_video(choice: &p2c_d3d::GpuChoice, spec: OutputSpec, test_pattern: bool
 fn start_video(_choice: &p2c_d3d::GpuChoice, spec: OutputSpec, _test_pattern: bool) -> VideoStart {
     VideoStart {
         producer: Box::new(CpuProducer::new(spec)),
-        status: "CPU".into(),
+        status: video::STATUS_COMPAT.into(),
         gpu: None,
     }
 }
@@ -523,7 +530,7 @@ fn gpu_page(
 fn spawn_watchdog(
     stats: Arc<video::TextureStats>,
     fallback: p2c_compositor::FallbackTrigger,
-    fell_back: Arc<std::sync::atomic::AtomicBool>,
+    fell_back: Arc<Mutex<bool>>,
     quit: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let start = std::time::Instant::now();
@@ -531,7 +538,7 @@ fn spawn_watchdog(
         .name("p2c-gpu-watchdog".into())
         .spawn(move || {
             use std::sync::atomic::Ordering::SeqCst;
-            while !quit.load(SeqCst) && !fell_back.load(SeqCst) {
+            while !quit.load(SeqCst) && !*fell_back.lock() {
                 if let Some(reason) = stats.verdict(start.elapsed()) {
                     fallback.fall_back(reason);
                     return;

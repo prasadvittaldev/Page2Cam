@@ -756,3 +756,71 @@ fn ticker_falls_back_to_cpu_after_second_device_loss() {
     assert_eq!(last.data, cpu.data, "not the CPU compositor's frame");
     println!("fell back on {}: {reason}", a.name);
 }
+
+#[test]
+#[ignore]
+fn hung_rebuild_errors_within_a_second_and_ticker_falls_back() {
+    use p2c_compositor::{FrameSink, Output, ProducerEvent, Ticker};
+    if !cfg!(debug_assertions) {
+        println!("P2C_FAKE_DEVICE_LOSS is debug-only; skipped");
+        return;
+    }
+    let a = hardware().into_iter().min_by_key(|a| a.perf_rank).unwrap();
+    let _fake = FakeLoss::after(5);
+    let inputs = no_inputs();
+
+    // The producer alone: after the loss, a rebuild that hangs (here 5 s)
+    // becomes an error after ~1 s, and stays one.
+    let mut p = RecoveringProducer::new(a.luid, spec(64, 36), PageHolder::default()).unwrap();
+    p.delay_rebuild_for_test(Duration::from_secs(5));
+    for _ in 0..5 {
+        p.produce(&inputs, false).unwrap();
+    }
+    assert!(
+        p.produce(&inputs, false).is_err(),
+        "device loss not reported"
+    );
+    let start = Instant::now();
+    let e = loop {
+        match p.produce(&inputs, false) {
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(Some(_)) => panic!("frame from a hung rebuild"),
+            Err(e) => break e,
+        }
+        assert!(start.elapsed() < Duration::from_secs(3), "no deadline");
+    };
+    let waited = start.elapsed();
+    println!("  hung rebuild reported after {waited:?}: {e:#}");
+    assert!(waited <= Duration::from_millis(1200), "{waited:?}");
+    assert!(p.produce(&inputs, false).is_err(), "error not kept");
+
+    // In the ticker: Failed, and frames keep flowing.
+    struct Count(Arc<std::sync::atomic::AtomicUsize>);
+    impl FrameSink for Count {
+        fn push(&mut self, _: &Output) -> anyhow::Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let mut p = RecoveringProducer::new(a.luid, spec(64, 36), PageHolder::default()).unwrap();
+    p.delay_rebuild_for_test(Duration::from_secs(5));
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = Ticker::spawn(
+        spec(64, 36),
+        Some(p2c_core::FrameSlot::new()),
+        None,
+        None,
+        Arc::new(parking_lot::RwLock::new(PipLayout::default())),
+        Box::new(p),
+        vec![Box::new(Count(n.clone()))],
+        tx,
+    );
+    let ev = rx.recv_timeout(Duration::from_secs(3));
+    let before = n.load(std::sync::atomic::Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(300));
+    t.stop();
+    let ProducerEvent::Failed(reason) = ev.expect("ticker never fell back");
+    println!("  ticker fell back: {reason}");
+    assert!(n.load(std::sync::atomic::Ordering::SeqCst) >= before + 5);
+}

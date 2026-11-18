@@ -160,8 +160,10 @@ fn is_redraw(prev: Option<&Output>, o: &Output) -> bool {
 }
 
 /// After a fallback, how long to keep the last frame while the CPU page
-/// (the recreated browser's first paint) is missing.
-const WAIT_FOR_CPU_PAGE: Duration = Duration::from_secs(3);
+/// (the recreated browser's first paint) is missing. After that the CPU
+/// compositor runs without a page (black, live webcam) until the page comes:
+/// the camera never freezes for longer than this.
+const WAIT_FOR_CPU_PAGE: Duration = Duration::from_secs(1);
 
 /// Composited frames that sinks may hold at once (the ticker's previous
 /// output, the stream slot, the preview slot) plus one to draw into.
@@ -388,7 +390,8 @@ impl Ticker {
     /// in a row, or [`FallbackTrigger::fall_back`] is called, the ticker
     /// switches to a [`CpuProducer`] for good and sends
     /// [`ProducerEvent::Failed`] on `events` (once). Until the first CPU page
-    /// frame arrives (up to 3 s) it keeps pushing the last output.
+    /// frame arrives it keeps pushing the last output for up to 1 s, then
+    /// composites without a page (black, live webcam).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         spec: OutputSpec,
@@ -1054,6 +1057,66 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         t.stop();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn missing_cpu_page_holds_at_most_1s_then_shows_live_pip() {
+        // The recreated browser never paints: after ~1 s the CPU compositor
+        // draws a black page with the live webcam rather than freezing.
+        const MAGENTA: [u8; 4] = [255, 0, 255, 255];
+        let cam = FrameSlot::new();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (c, stop2) = (cam.clone(), stop.clone());
+        let feeder = std::thread::spawn(move || {
+            let mut i = 0u32;
+            while !stop2.load(Ordering::SeqCst) {
+                let px = if i.is_multiple_of(2) { GREEN } else { MAGENTA };
+                c.put(Frame::from_bgra(16, 9, px.repeat(16 * 9)).unwrap());
+                i += 1;
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let samples: Samples = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = Ticker::spawn(
+            small_spec(),
+            Some(FrameSlot::new()),
+            Some(cam),
+            None,
+            Arc::new(parking_lot::RwLock::new(crate::PipLayout::preset(
+                crate::Corner::BottomRight,
+                0.25,
+            ))),
+            Box::new(Fake::new(|n| n > 3)),
+            // PIP centre (the 16x9 PIP sits at (47, 26)).
+            vec![Box::new(Sampler(samples.clone(), 55, 30))],
+            tx,
+        );
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let at = std::time::Instant::now();
+        std::thread::sleep(Duration::from_millis(1600));
+        t.stop();
+        stop.store(true, Ordering::SeqCst);
+        feeder.join().unwrap();
+        let s = samples.lock();
+        let first_live = s
+            .iter()
+            .find(|(t, px)| *t > at && *px != BLUE)
+            .expect("still frozen on the last frame");
+        assert!(
+            first_live.0 <= at + Duration::from_millis(1200),
+            "held {:?}",
+            first_live.0.duration_since(at)
+        );
+        let late: Vec<_> = s
+            .iter()
+            .filter(|(t, _)| *t > at + Duration::from_millis(1250))
+            .map(|x| x.1)
+            .collect();
+        assert!(
+            late.contains(&GREEN) && late.contains(&MAGENTA),
+            "PIP not live: {late:?}"
+        );
     }
 
     #[test]
