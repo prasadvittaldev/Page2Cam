@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -102,6 +102,27 @@ pub trait OutputProducer: Send {
     fn can_fall_back(&self) -> bool {
         true
     }
+    /// Ticks between composing a frame and the tick whose `Output` carries
+    /// it (a GPU readback ring maps the frame from N-2 ticks ago). 0 when the
+    /// output is available on the tick that composed it.
+    fn pipeline_frames(&self) -> u32 {
+        0
+    }
+}
+
+/// How many ticks of the last `PIPELINE_WINDOW` ticks are looked at for the
+/// pipeline latency.
+const PIPELINE_WINDOW: usize = 60;
+
+/// Median of the recent `pipeline_frames` values times the tick period (ms,
+/// whole ms, rounded down); 0 without samples.
+pub(crate) fn median_pipeline_ms(frames: &[u32], fps: u32) -> u32 {
+    if frames.is_empty() {
+        return 0;
+    }
+    let mut v = frames.to_vec();
+    v.sort_unstable();
+    (v[v.len() / 2] as u64 * 1000 / fps.max(1) as u64) as u32
 }
 
 /// What the ticker reports about its producer.
@@ -294,6 +315,7 @@ impl OutputProducer for CpuProducer {
 /// Runs compositing at a fixed rate on its own thread.
 pub struct Ticker {
     stop: Arc<AtomicBool>,
+    pipeline_ms: Arc<AtomicU32>,
     handle: JoinHandle<()>,
     trigger: FallbackTrigger,
 }
@@ -406,6 +428,8 @@ impl Ticker {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let trigger = FallbackTrigger::default();
+        let pipeline_ms = Arc::new(AtomicU32::new(0));
+        let pipeline_out = pipeline_ms.clone();
         let mut slot = ProducerSlot {
             spec,
             name: producer.name(),
@@ -429,6 +453,8 @@ impl Ticker {
                 let mut k: u32 = 0;
                 let mut cam_fresh = Freshness::default();
                 let mut mask_fresh = Freshness::default();
+                let mut pipe_frames: std::collections::VecDeque<u32> =
+                    std::collections::VecDeque::with_capacity(PIPELINE_WINDOW + 1);
                 let (mut compose_t, mut sinks_t) =
                     (DurationStats::default(), DurationStats::default());
                 let (mut ticks, mut redrawn, mut skipped) = (0u32, 0u32, 0u32);
@@ -456,6 +482,15 @@ impl Ticker {
                         // Warned (rate-limited) by the slot.
                         Ok(None) | Err(_) => true,
                     };
+                    // After the produce call, so a fallback this tick counts at once.
+                    pipe_frames.push_back(slot.producer.pipeline_frames());
+                    if pipe_frames.len() > PIPELINE_WINDOW {
+                        pipe_frames.pop_front();
+                    }
+                    pipeline_out.store(
+                        median_pipeline_ms(pipe_frames.make_contiguous(), spec.fps),
+                        Ordering::Relaxed,
+                    );
                     let t1 = Instant::now();
                     compose_t.record(t1 - t0);
                     let stripped;
@@ -516,9 +551,22 @@ impl Ticker {
             .expect("spawn ticker thread");
         Ticker {
             stop,
+            pipeline_ms,
             handle,
             trigger,
         }
+    }
+
+    /// Time from the tick that composed a frame to the tick whose output
+    /// carries it (median of the last ~60 ticks; 0 on the CPU path). The mic
+    /// is delayed by this.
+    pub fn pipeline_latency_ms(&self) -> u32 {
+        self.pipeline_ms.load(Ordering::Relaxed)
+    }
+
+    /// The same value, shareable with other threads.
+    pub fn pipeline_latency(&self) -> Arc<AtomicU32> {
+        self.pipeline_ms.clone()
     }
 
     /// A handle that switches this ticker to the CPU compositor.
@@ -601,6 +649,45 @@ mod tests {
                 .push((std::time::Instant::now(), f.pixel(self.1, self.2)));
             Ok(())
         }
+    }
+
+    #[test]
+    fn pipeline_median_ignores_a_short_blip() {
+        assert_eq!(median_pipeline_ms(&[], 30), 0);
+        assert_eq!(median_pipeline_ms(&[2; 10], 30), 66);
+        let mut v = vec![2u32; 40];
+        v.extend([0; 5]);
+        assert_eq!(median_pipeline_ms(&v, 30), 66);
+        assert_eq!(median_pipeline_ms(&[0; 7], 30), 0);
+    }
+
+    #[test]
+    fn ticker_reports_pipeline_latency_of_its_producer() {
+        struct Lagging(Fake);
+        impl OutputProducer for Lagging {
+            fn produce(&mut self, i: &TickInputs, p: bool) -> anyhow::Result<Option<Output>> {
+                self.0.produce(i, p)
+            }
+            fn name(&self) -> String {
+                "Lagging".into()
+            }
+            fn pipeline_frames(&self) -> u32 {
+                2
+            }
+        }
+        let page = FrameSlot::new();
+        page.put(Frame::new_black(64, 36));
+        let (_s, t, _rx) = spawn_fake(Box::new(Lagging(Fake::new(|_| false))), page);
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(t.pipeline_latency_ms(), 66);
+        t.stop();
+        // The CPU producer has none.
+        let page = FrameSlot::new();
+        page.put(Frame::new_black(64, 36));
+        let (_s, t, _rx) = spawn_fake(Box::new(CpuProducer::new(small_spec())), page);
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(t.pipeline_latency_ms(), 0);
+        t.stop();
     }
 
     #[test]

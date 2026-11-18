@@ -328,6 +328,7 @@ fn run() -> anyhow::Result<()> {
         settings_path: config::save_path(cli.config.as_deref()),
         mic_delay_ms: Mutex::new(0),
         latencies: Mutex::new(Default::default()),
+        pipeline_ms: ticker.pipeline_latency(),
         updater: updater.clone(),
         video: video.clone(),
         encoder: encoder_status.clone(),

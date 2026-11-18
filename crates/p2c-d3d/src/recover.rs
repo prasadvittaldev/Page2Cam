@@ -171,4 +171,8 @@ impl OutputProducer for RecoveringProducer {
     fn name(&self) -> String {
         "GPU".into()
     }
+
+    fn pipeline_frames(&self) -> u32 {
+        self.producer.pipeline_frames()
+    }
 }

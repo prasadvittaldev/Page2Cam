@@ -45,6 +45,8 @@ pub struct App {
     /// Mic delay currently applied, in ms, and recent cut-out latencies.
     pub mic_delay_ms: Mutex<u32>,
     pub latencies: Mutex<std::collections::VecDeque<u32>>,
+    /// Output pipeline latency in ms (from the ticker; 0 on the CPU path).
+    pub pipeline_ms: Arc<std::sync::atomic::AtomicU32>,
     pub updater: Arc<crate::update::Updater>,
     /// What makes the video: "GPU: <adapter>", "CPU (fallback: <reason>)",
     /// "CPU (compatibility)" (changes at run time on a fallback).
@@ -62,7 +64,7 @@ pub struct App {
 }
 
 /// Longest mic delay applied for the cut-out (ms).
-const MAX_MIC_DELAY_MS: u32 = 150;
+const MAX_MIC_DELAY_MS: u32 = 250;
 
 /// Mic delay for these recent cut-out latencies: their median (so one slow
 /// frame doesn't cause a jump), capped.
@@ -73,6 +75,12 @@ pub fn smoothed_delay(samples: &[u32]) -> u32 {
     let mut v = samples.to_vec();
     v.sort_unstable();
     v[v.len() / 2].min(MAX_MIC_DELAY_MS)
+}
+
+/// Mic delay: the cut-out's median latency plus the output pipeline's (the
+/// GPU readback ring holds frames back), capped.
+pub fn mic_delay(inference: &[u32], pipeline_ms: u32) -> u32 {
+    (smoothed_delay(inference) + pipeline_ms).min(MAX_MIC_DELAY_MS)
 }
 
 impl App {
@@ -150,7 +158,7 @@ impl App {
         }
     }
 
-    /// Delay the mic by the cut-out's processing time so lips match the
+    /// Delay the mic by the cut-out's processing time plus the output pipeline's so lips match the
     /// voice on the stream: median of the last ~2 s of latencies, capped.
     /// Changes under 20 ms are ignored to avoid churn.
     pub fn update_mic_delay(&self) {
@@ -172,7 +180,10 @@ impl App {
                 }
                 None => l.clear(),
             }
-            smoothed_delay(l.make_contiguous())
+            mic_delay(
+                l.make_contiguous(),
+                self.pipeline_ms.load(std::sync::atomic::Ordering::Relaxed),
+            )
         };
         let mut cur = self.mic_delay_ms.lock();
         if want.abs_diff(*cur) > 20 || (want == 0 && *cur != 0) {
@@ -634,11 +645,26 @@ mod tests {
 
     #[test]
     fn delay_is_capped() {
-        assert_eq!(smoothed_delay(&[400; 5]), 150);
+        assert_eq!(smoothed_delay(&[400; 5]), 250);
     }
 
     #[test]
     fn no_samples_no_delay() {
         assert_eq!(smoothed_delay(&[]), 0);
+    }
+
+    #[test]
+    fn mic_delay_adds_pipeline_latency() {
+        assert_eq!(mic_delay(&[30, 30, 30], 66), 96);
+        // No cut-out: only the output pipeline delays the video.
+        assert_eq!(mic_delay(&[], 66), 66);
+        assert_eq!(mic_delay(&[], 0), 0);
+    }
+
+    #[test]
+    fn mic_delay_capped_at_250() {
+        assert_eq!(MAX_MIC_DELAY_MS, 250);
+        assert_eq!(mic_delay(&[200; 5], 100), 250);
+        assert_eq!(mic_delay(&[], 400), 250);
     }
 }
