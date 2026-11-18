@@ -487,7 +487,7 @@
 
   // ---------- updates ----------
   $("updateBtn").onclick = async () => {
-    if (!confirm("Page2Cam will download the update, close, install it and start again. Continue?")) return;
+    if (!confirm("Installing the update closes Page2Cam and briefly turns off all cameras on this PC.\n\nLeave any call or live stream first.\n\nPage2Cam will download the update, install it and start again. Continue?")) return;
     $("updateBtn").disabled = true;
     $("updateText").textContent = "Downloading the update… (this can take a few minutes)";
     const r = await api("/api/update/install", {});
@@ -503,7 +503,9 @@
     if (/^error/.test(u.state)) { $("updateText").textContent = "Update: " + u.state.replace(/^error: /, ""); }
     else if (u.state === "installing") { $("updateText").textContent = "Installing the update…"; }
     else { $("updateText").textContent = "Page2Cam " + u.version + " is available."; }
-    $("updateBtn").hidden = !u.can_install || u.state !== "available";
+    // Also offer the button after a failed attempt, so it can be retried.
+    $("updateBtn").hidden = !u.can_install || !u.version || !(u.state === "available" || /^error/.test(u.state));
+    $("updateBtn").textContent = /^error/.test(u.state) ? "Try again" : "Install update";
     $("updateLink").hidden = u.can_install || !u.page_url;
     $("updateLink").href = u.page_url || "#";
   }

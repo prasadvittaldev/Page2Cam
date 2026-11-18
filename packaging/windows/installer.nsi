@@ -63,10 +63,32 @@ Function StartAppAsUser
   Exec '"$WINDIR\explorer.exe" "$INSTDIR\page2cam.exe"'
 FunctionEnd
 
-; Close Page2Cam and release the camera driver so its files can be replaced.
+; Only ever install into (and so uninstall from) a folder named Page2Cam, so
+; uninstalling can never delete a folder like C:\Program Files or D:\.
+Function .onVerifyInstDir
+  ${GetFileName} "$INSTDIR" $0
+  StrCmp $0 "${APP}" +2
+    Abort
+FunctionEnd
+
+; Let Page2Cam close by itself (the in-app updater asks it to), then make sure.
 !macro StopEverything
-  nsExec::Exec 'taskkill /IM page2cam.exe /T /F'
-  Sleep 1500
+  StrCpy $R9 0
+  ${Do}
+    nsExec::ExecToStack 'cmd /c tasklist /FI "IMAGENAME eq page2cam.exe" /NH | find /I "page2cam.exe"'
+    Pop $R8
+    Pop $R7
+    ${If} $R8 != 0
+      ${Break}
+    ${EndIf}
+    IntOp $R9 $R9 + 1
+    ${If} $R9 > 30
+      nsExec::Exec 'taskkill /IM page2cam.exe /T /F'
+      Sleep 1500
+      ${Break}
+    ${EndIf}
+    Sleep 500
+  ${Loop}
   nsExec::Exec 'net stop FrameServerMonitor /y'
   nsExec::Exec 'net stop FrameServer /y'
 !macroend
@@ -83,10 +105,15 @@ Section "Install"
     ExecWait '"$SYSDIR\regsvr32.exe" /s /u "$INSTDIR\p2c_vcam_win_source.dll"'
     Delete "$INSTDIR\p2c_vcam_win_source.dll"
     ${If} ${FileExists} "$INSTDIR\p2c_vcam_win_source.dll"
-      Rename "$INSTDIR\p2c_vcam_win_source.dll" "$INSTDIR\p2c_vcam_win_source.old"
-      Delete /REBOOTOK "$INSTDIR\p2c_vcam_win_source.old"
+      ; Still locked: move it aside under a unique name, delete at restart.
+      System::Call 'kernel32::GetTickCount()i.r0'
+      Rename "$INSTDIR\p2c_vcam_win_source.dll" "$INSTDIR\p2c_vcam_win_source.$0.old"
+      Delete /REBOOTOK "$INSTDIR\p2c_vcam_win_source.$0.old"
     ${EndIf}
   ${EndIf}
+  ; A settings file from an old portable copy here would override (and block
+  ; saving) the user's settings in %APPDATA%.
+  Delete "$INSTDIR\page2cam.toml"
 
   ; Files from an older version that are no longer shipped (models, locales).
   RMDir /r "$INSTDIR\models"
@@ -144,11 +171,16 @@ SectionEnd
 
 Section "Uninstall"
   SetShellVarContext all
+  ; Refuse to touch a folder that isn't a Page2Cam install.
+  ${IfNot} ${FileExists} "$INSTDIR\page2cam.exe"
+    MessageBox MB_ICONSTOP|MB_OK "This folder doesn't look like a Page2Cam installation; nothing was removed." /SD IDOK
+    Abort
+  ${EndIf}
   !insertmacro StopEverything
   ExecWait '"$SYSDIR\regsvr32.exe" /s /u "$INSTDIR\p2c_vcam_win_source.dll"'
   DeleteRegKey HKLM "Software\Classes\CLSID\${CLSID}"
   Delete /REBOOTOK "$INSTDIR\p2c_vcam_win_source.dll"
-  Delete /REBOOTOK "$INSTDIR\p2c_vcam_win_source.old"
+  Delete /REBOOTOK "$INSTDIR\p2c_vcam_win_source.*.old"
   RMDir /r /REBOOTOK "$INSTDIR"
   RMDir /r "$APPDATA\${APP}"
   Delete "$SMPROGRAMS\${APP}.lnk"

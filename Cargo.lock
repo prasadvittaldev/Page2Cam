@@ -2537,7 +2537,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
- "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]

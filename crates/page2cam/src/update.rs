@@ -93,14 +93,21 @@ impl Updater {
             "this copy of Page2Cam was not installed with the installer; download the new version from GitHub: {}",
             release.page_url
         );
-        self.set_state("installing");
+        {
+            // Only one install at a time (two tabs, double clicks).
+            let mut info = self.info.lock();
+            anyhow::ensure!(
+                info.state != "installing",
+                "the update is already being installed"
+            );
+            info.state = "installing".into();
+        }
         let result = (|| {
-            let dir = std::env::temp_dir().join("page2cam-update");
-            std::fs::create_dir_all(&dir)?;
+            let dir = fresh_download_dir()?;
             tracing::info!(version = %release.version, "downloading the update");
             let setup = p2c_update::download_verified(&release, &dir)?;
-            tracing::info!(installer = %setup.display(), "update verified; starting the installer");
-            run_installer_elevated(&setup)
+            tracing::info!(installer = %setup.path.display(), "update verified; starting the installer");
+            setup.launch_elevated("/S /RELAUNCH")
         })();
         if let Err(e) = &result {
             tracing::warn!("update failed: {e:#}");
@@ -114,26 +121,27 @@ impl Updater {
     }
 }
 
-/// Start the installer silently with administrator rights (Windows asks the
-/// user once). `/RELAUNCH` makes it start Page2Cam again when done.
-fn run_installer_elevated(setup: &std::path::Path) -> anyhow::Result<()> {
-    anyhow::ensure!(cfg!(windows), "self-update is only available on Windows");
-    let path = setup.display().to_string().replace('\'', "''");
-    let script =
-        format!("Start-Process -FilePath '{path}' -ArgumentList '/S','/RELAUNCH' -Verb RunAs");
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+/// A new, uniquely named folder under %TEMP% for this download; older
+/// Page2Cam update folders (~300 MB each) are removed first.
+fn fresh_download_dir() -> anyhow::Result<std::path::PathBuf> {
+    let tmp = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(&tmp) {
+        for e in entries.flatten() {
+            if e.file_name()
+                .to_string_lossy()
+                .starts_with("page2cam-update")
+            {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
     }
-    let out = cmd.output()?;
-    anyhow::ensure!(
-        out.status.success(),
-        "Windows did not start the installer (was the permission prompt declined?)"
-    );
-    Ok(())
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let dir = tmp.join(format!("page2cam-update-{}-{nonce:x}", std::process::id()));
+    std::fs::create_dir(&dir)?;
+    Ok(dir)
 }
 
 /// True when this exe was put in place by the installer (it writes
@@ -204,6 +212,15 @@ mod tests {
         assert!(!u.info().can_install);
         let e = u.install().unwrap_err().to_string();
         assert!(e.contains("GitHub"), "{e}");
+    }
+
+    #[test]
+    fn second_install_while_installing_is_refused() {
+        let u = updater(true, Some("0.3.0"));
+        u.check_once();
+        u.set_state("installing");
+        let e = u.install().unwrap_err().to_string();
+        assert!(e.contains("already"), "{e}");
     }
 
     #[test]

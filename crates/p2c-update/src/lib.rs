@@ -22,6 +22,7 @@ pub fn fetch_latest() -> anyhow::Result<Option<Release>> {
         "20",
         "-H",
         "Accept: application/vnd.github+json",
+        "--url",
         &url,
     ])?;
     parse_release(&String::from_utf8_lossy(&out))
@@ -38,32 +39,109 @@ pub fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
         "1800",
         "-o",
         &dest,
+        "--url",
         url,
     ])?;
     Ok(())
 }
 
-/// Download a release's installer into `dir` and return its path, but only if
-/// its hash is listed in a SHA256SUMS signed with [`RELEASE_PUBLIC_KEY`].
-pub fn download_verified(r: &Release, dir: &Path) -> anyhow::Result<std::path::PathBuf> {
-    let sums = String::from_utf8(curl(&["-fsSL", "--max-time", "60", &r.sums_url])?)?;
-    let sig = String::from_utf8(curl(&["-fsSL", "--max-time", "60", &r.sig_url])?)?;
+/// A downloaded installer whose hash matched the signed SHA256SUMS. The file
+/// stays open with write/delete sharing denied, so nothing can swap it before
+/// [`VerifiedInstaller::launch_elevated`] starts it.
+pub struct VerifiedInstaller {
+    pub path: std::path::PathBuf,
+    _lock: std::fs::File,
+}
+
+/// Download a release's installer into `dir`, but only accept it if its hash is
+/// listed in a SHA256SUMS signed with [`RELEASE_PUBLIC_KEY`].
+pub fn download_verified(r: &Release, dir: &Path) -> anyhow::Result<VerifiedInstaller> {
+    let sums = String::from_utf8(curl(&["-fsSL", "--max-time", "60", "--url", &r.sums_url])?)?;
+    let sig = String::from_utf8(curl(&["-fsSL", "--max-time", "60", "--url", &r.sig_url])?)?;
     verify_sums(&sums, &sig, RELEASE_PUBLIC_KEY)?;
     let want = expected_hash(&sums, &r.setup_name)
         .ok_or_else(|| anyhow::anyhow!("{} is not listed in SHA256SUMS", r.setup_name))?
         .to_ascii_lowercase();
     let path = dir.join(&r.setup_name);
     download(&r.setup_url, &path)?;
-    let got = file_sha256(&path)?;
+    let mut lock = open_locked(&path)?;
+    let got = sha256_of(&mut lock)?;
     if got != want {
+        drop(lock);
         let _ = std::fs::remove_file(&path);
         anyhow::bail!("the downloaded installer is damaged (checksum mismatch); try again");
     }
-    Ok(path)
+    Ok(VerifiedInstaller { path, _lock: lock })
+}
+
+/// Open for reading while denying other writers/deleters (Windows).
+fn open_locked(path: &Path) -> anyhow::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        o.share_mode(0x0000_0001); // FILE_SHARE_READ only
+    }
+    Ok(o.open(path)?)
+}
+
+impl VerifiedInstaller {
+    /// Start the installer with administrator rights (Windows asks the user)
+    /// while the file is still locked against changes.
+    pub fn launch_elevated(self, args: &str) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        {
+            win::run_as_admin(&self.path, args)?;
+            drop(self);
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = args;
+            anyhow::bail!("installing updates is only available on Windows")
+        }
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn run_as_admin(exe: &Path, args: &str) -> anyhow::Result<()> {
+        let file = wide(exe.as_os_str());
+        let params = wide(std::ffi::OsStr::new(args));
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOASYNC,
+            lpVerb: w!("runas"),
+            lpFile: PCWSTR(file.as_ptr()),
+            lpParameters: PCWSTR(params.as_ptr()),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        // SAFETY: all pointers point at NUL-terminated buffers that outlive the call.
+        unsafe { ShellExecuteExW(&mut info) }.map_err(|e| {
+            anyhow::anyhow!(
+                "Windows did not start the installer (was the permission prompt declined?): {e}"
+            )
+        })
+    }
 }
 
 fn curl(args: &[&str]) -> anyhow::Result<Vec<u8>> {
     let mut cmd = std::process::Command::new("curl");
+    // HTTPS only, including redirects (GitHub sends downloads to its CDN).
+    cmd.args(["--proto", "=https", "--proto-redir", "=https"]);
     cmd.args(["-A", concat!("Page2Cam/", env!("CARGO_PKG_VERSION"))])
         .args(args);
     #[cfg(windows)]
@@ -127,12 +205,22 @@ pub fn parse_release(json: &str) -> anyhow::Result<Option<Release>> {
         return Ok(None);
     };
     let version = format!("{a}.{b}.{c}");
+    // Only files from this project's own releases: never anything the API
+    // response points elsewhere, and never text curl could take as an option.
+    let download_prefix = format!("https://github.com/{REPO}/releases/download/");
     let find = |name: &str| {
         gh.assets
             .iter()
             .find(|x| x.name == name)
             .map(|x| x.browser_download_url.clone())
+            .filter(|u| u.starts_with(&download_prefix))
     };
+    if !gh
+        .html_url
+        .starts_with(&format!("https://github.com/{REPO}/releases/"))
+    {
+        return Ok(None);
+    }
     let setup_name = format!("Page2Cam-Setup-{version}.exe");
     let (Some(setup_url), Some(sums_url), Some(sig_url)) = (
         find(&setup_name),
@@ -179,9 +267,13 @@ pub fn expected_hash<'a>(sums: &'a str, file_name: &str) -> Option<&'a str> {
 
 /// Hex SHA-256 of a file.
 pub fn file_sha256(path: &Path) -> anyhow::Result<String> {
+    sha256_of(&mut std::fs::File::open(path)?)
+}
+
+/// Hex SHA-256 of everything readable from `f`.
+fn sha256_of(f: &mut std::fs::File) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
@@ -217,27 +309,46 @@ mod tests {
       "tag_name": "v0.2.0",
       "html_url": "https://github.com/prasadvittaldev/Page2Cam/releases/tag/v0.2.0",
       "assets": [
-        {"name": "Page2Cam-windows-x64.zip", "browser_download_url": "https://x/zip"},
+        {"name": "Page2Cam-windows-x64.zip", "browser_download_url": "https://github.com/prasadvittaldev/Page2Cam/releases/download/v0.2.0/Page2Cam-windows-x64.zip"},
         {"name": "Page2Cam-Setup-0.2.0.exe", "browser_download_url": "https://x/setup"},
-        {"name": "SHA256SUMS", "browser_download_url": "https://x/sums"},
-        {"name": "SHA256SUMS.sig", "browser_download_url": "https://x/sig"}
+        {"name": "SHA256SUMS", "browser_download_url": "https://github.com/prasadvittaldev/Page2Cam/releases/download/v0.2.0/SHA256SUMS"},
+        {"name": "SHA256SUMS.sig", "browser_download_url": "https://github.com/prasadvittaldev/Page2Cam/releases/download/v0.2.0/SHA256SUMS.sig"}
       ]
     }"#;
 
     #[test]
     fn finds_installer_and_checksums() {
-        let r = parse_release(RELEASE_JSON).unwrap().unwrap();
+        let json = RELEASE_JSON.replace(
+            "https://x/setup",
+            "https://github.com/prasadvittaldev/Page2Cam/releases/download/v0.2.0/Page2Cam-Setup-0.2.0.exe",
+        );
+        let r = parse_release(&json).unwrap().unwrap();
         assert_eq!(r.version, "0.2.0");
         assert_eq!(r.setup_name, "Page2Cam-Setup-0.2.0.exe");
-        assert_eq!(
-            (
-                r.setup_url.as_str(),
-                r.sums_url.as_str(),
-                r.sig_url.as_str()
-            ),
-            ("https://x/setup", "https://x/sums", "https://x/sig")
-        );
+        assert!(r.setup_url.ends_with("/v0.2.0/Page2Cam-Setup-0.2.0.exe"));
+        assert!(r.sums_url.ends_with("/v0.2.0/SHA256SUMS"));
+        assert!(r.sig_url.ends_with("/v0.2.0/SHA256SUMS.sig"));
         assert!(r.page_url.ends_with("/v0.2.0"));
+    }
+
+    #[test]
+    fn hostile_urls_are_rejected() {
+        // Only files from this project's own GitHub releases are accepted.
+        for bad in [
+            "-K/host/share/cfg",
+            "http://github.com/prasadvittaldev/Page2Cam/releases/download/v0.2.0/x",
+            "file:///C:/x.exe",
+            "https://evil.example/Page2Cam-Setup-0.2.0.exe",
+            "https://github.com/someone/else/releases/download/v0.2.0/x",
+        ] {
+            let json = RELEASE_JSON.replace("https://x/setup", bad);
+            assert_eq!(parse_release(&json).unwrap(), None, "{bad}");
+        }
+        let json = RELEASE_JSON.replace(
+            "https://github.com/prasadvittaldev/Page2Cam/releases/tag/v0.2.0",
+            "javascript:alert(1)",
+        );
+        assert_eq!(parse_release(&json).unwrap(), None);
     }
 
     #[test]

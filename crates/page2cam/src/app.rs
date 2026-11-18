@@ -321,12 +321,18 @@ impl Controls for App {
 
     fn install_update(&self) -> anyhow::Result<()> {
         self.updater.install()?;
-        // The installer waits for us to exit, then restarts Page2Cam.
+        // The installer waits (up to ~15 s) for Page2Cam to close, then
+        // replaces it and starts it again. Close shortly, after this request
+        // has been answered.
         tracing::info!("closing for the update");
-        match self.browser.get() {
-            Some(b) => b.shutdown(),
-            None => std::process::exit(0),
-        }
+        let browser = self.browser.get().cloned();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            match browser {
+                Some(b) => b.shutdown(),
+                None => std::process::exit(0),
+            }
+        });
         Ok(())
     }
 
