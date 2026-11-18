@@ -63,6 +63,17 @@ Before building, prove on the Intel+NVIDIA laptop:
 - Same with the Intel LUID (onboard-only machines).
 If the adapter switch does not work, or only partly (e.g. only with the Windows per-app graphics preference set), **continue without stopping (user's decision)** with the fallback design: composite on whatever adapter Chromium actually uses (find it from the shared texture: open it via the adapter whose LUID matches the texture's, trying each hardware adapter), and the GPU picker then only steers the cut-out model. Report the spike results to the user either way.
 
+**Spike results (2026-11-18, user's laptop, CEF 156, `https://bground-all.vercel.app/back12`, 1920×1080, `windowless_frame_rate` 30, `shared_texture_enabled = 1`).** DXGI adapters: Intel UHD LUID `0x00000000_0x0002c3e9` (= `0,181225`), NVIDIA RTX 2000 Ada LUID `0x00000000_0x0002c996` (= `0,182678`).
+
+| Run | `use-adapter-luid` value | paints/s (steady) | texture | GPU process load on | opened by (`OpenSharedResource1`) | `CopyResource` |
+|---|---|---|---|---|---|---|
+| NVIDIA | `0,182678` | 30 | 1920×1080 `B8G8R8A8_UNORM`, misc `0x802` (SHARED \| SHARED_NTHANDLE) | NVIDIA only (0.6–1.8 %) | NVIDIA (Intel: `E_INVALIDARG`) | ok (readback pixel matches page) |
+| Intel | `0,181225` | 30 | same | Intel only (~9 %) | Intel (NVIDIA: `E_INVALIDARG`) | ok |
+| unset | — | 30 | same | Intel (8.6–12 %) | Intel (NVIDIA: `E_INVALIDARG`) | ok |
+| NVIDIA / Intel, hex | `0,2c996` / `0,2c3e9` | 0 | — | GPU process fails EGL init 3× | — | — (CEF **FATAL "GPU process isn't usable. Goodbye."** — the whole app process exits) |
+
+Branch taken: **plan as written.** Working switch syntax: `--use-adapter-luid=<HighPart>,<LowPart>` with both parts in **decimal** (Chromium `ui/gl/gl_display.cc`: `StringToInt(high)`, `StringToUint(low)`; only used for ANGLE D3D11). No extra switches were needed for accelerated paint. A LUID that parses but matches no adapter (or doesn't parse) kills the browser process, so the app must only pass a LUID it has just enumerated via DXGI. Default Chromium (no switch) renders on the Intel, so without the switch our D3D11 device must be on the Intel to open the texture.
+
 ### Decisions settled after review (marked "builder-check call": made by the designer, not the user — check while reading)
 
 - **Output size** (builder-check call): the GPU path renders at the configured output size (any size `Config` accepts, 320×240 … 3840×2160). The stream gets that size. The camera gets NV12 at the configured size if ≤1920×1080, otherwise a GPU-downscaled copy that fits 1920×1080 (aspect kept) — an extra small pass, only when the output is larger than 1080p.
