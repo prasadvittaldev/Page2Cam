@@ -176,7 +176,16 @@ impl FrameSink for WinVcamSink {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         // SAFETY: the view is MAPPING_SIZE bytes, page-aligned, and stays mapped while self lives.
-        unsafe { p2c_shm::write_frame(v.view.Value as *mut u8, f.width, f.height, &f.data, now) };
+        unsafe {
+            p2c_shm::write_frame(
+                v.view.Value as *mut u8,
+                p2c_shm::PixelFormat::Bgra,
+                f.width,
+                f.height,
+                &f.data,
+                now,
+            )
+        };
         Ok(())
     }
 }

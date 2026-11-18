@@ -220,8 +220,8 @@ impl State {
     fn refresh_frame(&mut self) {
         if let Some(base) = super::shared::base() {
             let mut buf = std::mem::take(&mut self.scratch);
-            if let Some(info) = unsafe { p2c_shm::read_frame(base, &mut buf) } {
-                if info.time_ms != self.frame_time_ms {
+            if let Ok(info) = unsafe { p2c_shm::read_frame(base, &mut buf) } {
+                if info.format == p2c_shm::PixelFormat::Bgra && info.time_ms != self.frame_time_ms {
                     std::mem::swap(&mut self.frame, &mut buf);
                     self.frame_w = info.width;
                     self.frame_h = info.height;
