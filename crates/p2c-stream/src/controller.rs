@@ -125,6 +125,8 @@ impl StreamController {
         *self.state.lock() = StreamState::Connecting;
         self.mixer.reset();
         self.active.store(true, Ordering::Relaxed);
+        // One timeline for both writers: video frame 0 and audio sample 0 = t0.
+        let t0 = Instant::now();
 
         let mut threads = Vec::new();
         {
@@ -134,13 +136,13 @@ impl StreamController {
                 (cfg.width, cfg.height, cfg.fps),
             );
             threads.push(thread("p2c-stream-video", move || {
-                write_video(stdin, slot, stop, spec)
+                write_video(stdin, slot, stop, spec, t0)
             }));
         }
         {
             let (mixer, stop) = (self.mixer.clone(), stop.clone());
             threads.push(thread("p2c-stream-audio", move || {
-                write_audio(listener, mixer, stop)
+                write_audio(listener, mixer, stop, t0)
             }));
         }
         {
@@ -188,42 +190,58 @@ fn thread(name: &str, f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
         .expect("spawn stream thread")
 }
 
-/// Write exactly `fps` frames per second (repeating the latest one when the
-/// compositor is slower), so video timing stays locked to audio.
+/// Write exactly `fps` frames per second of wall-clock time since `t0`
+/// (repeating the latest frame when the compositor is slower). After a stall
+/// it catches up with repeated frames instead of restarting its clock, so
+/// video and audio (paced from the same `t0`) stay on one timeline.
 fn write_video(
-    mut stdin: std::process::ChildStdin,
+    mut stdin: impl Write,
     slot: FrameSlot,
     stop: Arc<AtomicBool>,
     (w, h, fps): (u32, u32, u32),
+    t0: Instant,
 ) {
     let period = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let black = Frame::new_black(w, h);
-    let mut start = Instant::now();
-    let mut n: u32 = 0;
+    let mut n: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         let latest = slot.latest();
         let f = latest
             .as_deref()
             .filter(|f| f.width == w && f.height == h)
             .unwrap_or(&black);
-        if stdin.write_all(&f.data).is_err() {
+        // Frames that should exist by now (one at t0, then one per period).
+        let due = (t0.elapsed().as_secs_f64() / period.as_secs_f64()) as u64 + 1;
+        let mut failed = false;
+        loop {
+            if stdin.write_all(&f.data).is_err() {
+                failed = true;
+                break;
+            }
+            n += 1;
+            if n >= due || stop.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        if failed {
             break;
         }
-        n += 1;
-        let deadline = start + period * n;
+        let deadline = t0 + period.mul_f64(n as f64);
         let now = Instant::now();
         if deadline > now {
             std::thread::sleep(deadline - now);
-        } else if now - deadline > Duration::from_secs(1) {
-            // Fell far behind (slow encoder): restart the clock rather than burst.
-            start = now;
-            n = 0;
         }
     }
 }
 
+/// Stereo frames of silence that put audio on the video's timeline when
+/// ffmpeg connects `lead` after video started.
+fn lead_in_frames(lead: Duration) -> usize {
+    (lead.as_secs_f64() * p2c_core::SAMPLE_RATE as f64).round() as usize
+}
+
 /// Accept ffmpeg's audio connection, then send 10 ms of mixed audio per tick.
-fn write_audio(listener: TcpListener, mixer: Mixer, stop: Arc<AtomicBool>) {
+fn write_audio(listener: TcpListener, mixer: Mixer, stop: Arc<AtomicBool>, t0: Instant) {
     let accept_deadline = Instant::now() + Duration::from_secs(20);
     let mut sock = loop {
         if stop.load(Ordering::Relaxed) || Instant::now() > accept_deadline {
@@ -238,7 +256,14 @@ fn write_audio(listener: TcpListener, mixer: Mixer, stop: Arc<AtomicBool>) {
     let _ = sock.set_nodelay(true);
     const FRAMES: usize = 480; // 10 ms at 48 kHz
     let period = Duration::from_millis(10);
-    let start = Instant::now();
+    // Video started at t0; fill the time before ffmpeg connected with silence
+    // so audio sample 0 lines up with video frame 0.
+    let lead = lead_in_frames(t0.elapsed());
+    let silence = vec![0u8; lead * p2c_core::CHANNELS as usize * 4];
+    if sock.write_all(&silence).is_err() {
+        return;
+    }
+    let start = t0 + Duration::from_secs_f64(lead as f64 / p2c_core::SAMPLE_RATE as f64);
     let mut n: u32 = 0;
     let mut bytes = Vec::with_capacity(FRAMES * 8);
     while !stop.load(Ordering::Relaxed) {
@@ -321,6 +346,62 @@ fn read_until_any(r: &mut impl BufRead, out: &mut Vec<u8>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Counts frames written; blocks once (simulating an ffmpeg stall).
+    struct StallingSink {
+        frames: Arc<std::sync::atomic::AtomicUsize>,
+        frame_len: usize,
+        buf: usize,
+        stall_at: usize,
+        stall: Duration,
+    }
+
+    impl Write for StallingSink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.buf += b.len();
+            while self.buf >= self.frame_len {
+                self.buf -= self.frame_len;
+                let n = self.frames.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == self.stall_at {
+                    std::thread::sleep(self.stall);
+                }
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn video_stays_on_the_wall_clock_after_a_stall() {
+        // Audio is paced from the same start; video must catch up after a 1.5 s
+        // stall instead of restarting its clock, or the sound ends up late.
+        let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = StallingSink {
+            frames: frames.clone(),
+            frame_len: 4 * 4 * 4,
+            buf: 0,
+            stall_at: 10,
+            stall: Duration::from_millis(1500),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let t0 = Instant::now();
+        let h = std::thread::spawn(move || write_video(sink, FrameSlot::new(), stop2, (4, 4, 30), t0));
+        std::thread::sleep(Duration::from_millis(3000));
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        let n = frames.load(Ordering::SeqCst) as i64;
+        // 3 s at 30 fps = 90 frames (+1 for the frame at t=0).
+        assert!((n - 91).abs() <= 3, "wrote {n} frames in 3 s");
+    }
+
+    #[test]
+    fn audio_lead_in_matches_time_since_video_start() {
+        assert_eq!(lead_in_frames(Duration::from_millis(250)), 12_000);
+        assert_eq!(lead_in_frames(Duration::ZERO), 0);
+    }
 
     #[test]
     fn missing_ffmpeg_reports_error() {
