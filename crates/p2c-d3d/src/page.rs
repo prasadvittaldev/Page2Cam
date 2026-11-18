@@ -43,8 +43,17 @@ struct PageInner {
     seq: AtomicU64,
     /// Result of probing the other adapters after a failed open: `None` =
     /// not probed since the last successful open.
-    probe: Mutex<Option<Option<u64>>>,
+    probe: Mutex<Option<Probe>>,
     probes: AtomicU32,
+}
+
+/// Which adapter opens Chromium's texture, when ours doesn't.
+#[derive(Clone)]
+struct Probe {
+    /// Another adapter that opens it (`None`: no adapter does).
+    mismatch: Option<u64>,
+    /// Why our open failed, with adapter names.
+    reason: String,
 }
 
 struct PageState {
@@ -143,17 +152,35 @@ impl PageInput {
             return e.context("OpenSharedResource1: device lost");
         }
         let mut probe = inner.probe.lock().unwrap_or_else(|p| p.into_inner());
-        let found = *probe.get_or_insert_with(|| {
-            inner.probes.fetch_add(1, Ordering::Relaxed);
-            open_on_matching_adapter(handle, &crate::enumerate()).filter(|l| *l != gpu.luid())
-        });
-        match found {
-            Some(l) => e.context(format!(
-                "page texture is on adapter LUID {l:#x}, our device is on {:#x}",
-                gpu.luid()
-            )),
-            None => e.context("OpenSharedResource1 failed on every adapter"),
-        }
+        let reason = probe
+            .get_or_insert_with(|| {
+                inner.probes.fetch_add(1, Ordering::Relaxed);
+                // A fresh list: LUIDs are never kept from an older one.
+                let adapters = crate::enumerate();
+                let name = |l: u64| {
+                    adapters
+                        .iter()
+                        .find(|a| a.luid == l)
+                        .map_or_else(|| format!("adapter LUID {l:#x}"), |a| a.name.clone())
+                };
+                let mismatch =
+                    open_on_matching_adapter(handle, &adapters).filter(|l| *l != gpu.luid());
+                let reason = match mismatch {
+                    Some(l) => format!(
+                        "Chromium renders on {}, our device is on {}",
+                        name(l),
+                        name(gpu.luid())
+                    ),
+                    None => format!(
+                        "no GPU opens Chromium's page texture (our device: {})",
+                        name(gpu.luid())
+                    ),
+                };
+                Probe { mismatch, reason }
+            })
+            .reason
+            .clone();
+        e.context(reason)
     }
 
     /// How many times other adapters were probed for a handle (diagnostics/tests).
@@ -168,13 +195,15 @@ impl PageInput {
     }
 
     /// The LUID of the adapter that does open Chromium's textures, when it is
-    /// not ours (the device must be recreated there).
+    /// not ours (the device must be recreated there). Cleared by the next
+    /// successful open.
     pub fn adapter_mismatch(&self) -> Option<u64> {
         self.inner
             .probe
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .flatten()
+            .as_ref()
+            .and_then(|p| p.mismatch)
     }
 
     /// Our copy of the latest page (BGRA, shader resource).

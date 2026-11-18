@@ -793,6 +793,10 @@ fn hung_rebuild_errors_within_a_second_and_ticker_falls_back() {
     println!("  hung rebuild reported after {waited:?}: {e:#}");
     assert!(waited <= Duration::from_millis(1200), "{waited:?}");
     assert!(p.produce(&inputs, false).is_err(), "error not kept");
+    // The ticker's wait for the CPU page counts from the start of the hold,
+    // so the two waits don't add up (M1).
+    let held = p.holding_since().expect("hold start kept after giving up");
+    assert!(held <= start && start - held < Duration::from_millis(100));
 
     // In the ticker: Failed, and frames keep flowing.
     struct Count(Arc<std::sync::atomic::AtomicUsize>);
@@ -823,4 +827,66 @@ fn hung_rebuild_errors_within_a_second_and_ticker_falls_back() {
     let ProducerEvent::Failed(reason) = ev.expect("ticker never fell back");
     println!("  ticker fell back: {reason}");
     assert!(n.load(std::sync::atomic::Ordering::SeqCst) >= before + 5);
+}
+
+// ---- Chromium on another adapter (Review Focus #3) ----
+
+#[test]
+#[ignore]
+fn producer_moves_to_the_adapter_chromium_renders_on() {
+    let all = hardware();
+    if all.len() < 2 {
+        println!("needs two hardware adapters; skipped");
+        return;
+    }
+    for (a, b) in [(&all[0], &all[1]), (&all[1], &all[0])] {
+        // We start on A; Chromium ignored the adapter switch and renders on B.
+        let holder = PageHolder::default();
+        let mut p = RecoveringProducer::new(a.luid, spec(64, 36), holder.clone()).unwrap();
+        let moved = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let m = moved.clone();
+            p.on_adapter_change(Box::new(move |ad: &AdapterInfo| {
+                m.lock().unwrap().push(ad.name.clone())
+            }));
+        }
+        let chromium = Gpu::new(b.luid).unwrap();
+        let src = gradient(64, 36, 5);
+        let shared = chromium.create_shared_bgra(&src).unwrap();
+        let e = holder.on_shared_texture(shared.handle()).unwrap_err();
+        let msg = format!("{e:#}");
+        // The reason names both adapters, not raw LUIDs.
+        assert!(msg.contains(&b.name) && msg.contains(&a.name), "{msg}");
+        let start = Instant::now();
+        let mut frames = 0;
+        while p.gpu().luid() != b.luid {
+            assert!(start.elapsed() < Duration::from_secs(10), "never moved");
+            // Every call succeeds: the ticker never falls back to the CPU.
+            if p
+                .produce(&no_inputs(), false)
+                .unwrap_or_else(|e| panic!("{} -> {}: {e:#}", a.name, b.name))
+                .is_some()
+            {
+                frames += 1;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        println!(
+            "  moved {} -> {} in {:?} ({frames} frames meanwhile)",
+            a.name,
+            b.name,
+            start.elapsed()
+        );
+        // Chromium's textures now open on our device.
+        holder.on_shared_texture(shared.handle()).unwrap();
+        let page = holder.current().unwrap();
+        assert_eq!(page.seq(), 1);
+        assert_eq!(page.adapter_mismatch(), None);
+        assert_eq!(*moved.lock().unwrap(), vec![b.name.clone()]);
+        let back = p.gpu().read_bgra(&page.texture()).unwrap();
+        assert_eq!(back.data, src.data);
+        for _ in 0..5 {
+            p.produce(&no_inputs(), false).unwrap();
+        }
+    }
 }

@@ -252,8 +252,9 @@ fn run() -> anyhow::Result<()> {
 
     // Video: the GPU compositor on the chosen adapter (Chromium hands it
     // shared textures), else the CPU compositor. Decided before CEF starts.
-    let video_start = start_video(&gpu_choice, spec, cli.test_pattern);
-    let video = Arc::new(Mutex::new(video_start.status.clone()));
+    let video = Arc::new(Mutex::new(String::new()));
+    let video_start = start_video(&gpu_choice, spec, cli.test_pattern, &video);
+    *video.lock() = video_start.status.clone();
     tracing::info!(
         "video: {}; cut-out GPU: {}",
         video_start.status,
@@ -581,8 +582,15 @@ struct GpuVideo {
 /// GPU mode: device, page input and GPU compositor on the chosen adapter.
 /// Any failure here starts in CPU mode for this run (CEF has not started, so
 /// Chromium simply gets no adapter switch).
+/// `video` is the status text; it is updated if the producer later moves to
+/// the adapter Chromium really renders on.
 #[cfg(windows)]
-fn start_video(choice: &p2c_d3d::GpuChoice, spec: OutputSpec, test_pattern: bool) -> VideoStart {
+fn start_video(
+    choice: &p2c_d3d::GpuChoice,
+    spec: OutputSpec,
+    test_pattern: bool,
+    video: &Arc<Mutex<String>>,
+) -> VideoStart {
     let cpu = |status: String| VideoStart {
         producer: Box::new(CpuProducer::new(spec)),
         status,
@@ -599,15 +607,25 @@ fn start_video(choice: &p2c_d3d::GpuChoice, spec: OutputSpec, test_pattern: bool
     };
     let holder = p2c_d3d::PageHolder::default();
     match p2c_d3d::RecoveringProducer::new(a.luid, spec, holder.clone()) {
-        Ok(p) => VideoStart {
-            producer: Box::new(p),
+        Ok(mut p) => {
+            // Chromium ignored the adapter switch: the producer moved to its
+            // adapter (Chromium is left as it is; DirectML stays).
+            let status = video.clone();
+            p.on_adapter_change(Box::new(move |chosen: &p2c_d3d::AdapterInfo| {
+                let s = video::status_gpu_chromium_chose(&chosen.name);
+                tracing::warn!("video: {s}");
+                *status.lock() = s;
+            }));
+            VideoStart {
+                producer: Box::new(p),
             status: video::status_gpu(&a.name),
-            gpu: Some(GpuVideo {
-                adapter: a.clone(),
-                holder,
-                stats: Arc::default(),
-            }),
-        },
+                gpu: Some(GpuVideo {
+                    adapter: a.clone(),
+                    holder,
+                    stats: Arc::default(),
+                }),
+            }
+        }
         Err(e) => {
             let reason = format!("GPU {} unusable: {e:#}", a.name);
             tracing::warn!("{reason}");
@@ -617,7 +635,12 @@ fn start_video(choice: &p2c_d3d::GpuChoice, spec: OutputSpec, test_pattern: bool
 }
 
 #[cfg(not(windows))]
-fn start_video(_choice: &p2c_d3d::GpuChoice, spec: OutputSpec, _test_pattern: bool) -> VideoStart {
+fn start_video(
+    _choice: &p2c_d3d::GpuChoice,
+    spec: OutputSpec,
+    _test_pattern: bool,
+    _video: &Arc<Mutex<String>>,
+) -> VideoStart {
     VideoStart {
         producer: Box::new(CpuProducer::new(spec)),
         status: video::STATUS_COMPAT.into(),
