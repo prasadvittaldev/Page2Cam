@@ -47,7 +47,7 @@ impl Default for Config {
             admin_port: 8765,
             open_admin: true,
             rtmp_url: "rtmp://a.rtmp.youtube.com/live2".into(),
-            video_kbps: 4500,
+            video_kbps: 6000,
             overlay_style: "box".into(),
             cutout_engine: "quality".into(),
         }
@@ -323,7 +323,8 @@ mod tests {
         assert_eq!(c.rtmp_url, "rtmp://a.rtmp.youtube.com/live2");
         assert_eq!(
             (c.video_kbps, c.admin_port, c.open_admin),
-            (4500, 8765, true)
+            // YouTube's minimum for 1080p30 H.264 is 5000 kbps.
+            (6000, 8765, true)
         );
         let c = Config {
             video_kbps: 100,

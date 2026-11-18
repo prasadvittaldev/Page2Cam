@@ -22,9 +22,10 @@ overlay_style = "box"
 # Cut-out engine: quality (cleaner edges) or fast (smooth on any PC).
 cutout_engine = "quality"
 
-# YouTube Live server and video quality (kbit/s).
+# YouTube Live server and video quality (kbit/s). YouTube asks for at least
+# 5000 for 1080p; use 6000-9000 if your upload speed allows.
 rtmp_url = "rtmp://a.rtmp.youtube.com/live2"
-video_kbps = 4500
+video_kbps = 6000
 
 # Control page.
 admin_port = 8765

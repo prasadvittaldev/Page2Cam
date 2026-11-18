@@ -87,8 +87,8 @@ pub fn ffmpeg_args(cfg: &StreamConfig, audio_port: u16) -> Vec<String> {
         "libx264",
         "-preset",
         "veryfast",
-        "-tune",
-        "zerolatency",
+        "-bf",
+        "2",
         "-pix_fmt",
         "yuv420p",
         "-b:v",
@@ -178,6 +178,8 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("-c:a aac -b:a 128k"), "{s}");
+        // YouTube recommends B-frames; zerolatency would turn them off.
+        assert!(!s.contains("zerolatency") && s.contains("-bf 2"), "{s}");
         assert_eq!(
             a.last().unwrap(),
             "rtmp://a.rtmp.youtube.com/live2/abcd-1234-secret"
