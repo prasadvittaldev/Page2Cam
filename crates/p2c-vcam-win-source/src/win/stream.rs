@@ -246,23 +246,29 @@ impl State {
                         self.frame_fmt = info.format;
                     }
                 }
-                Err(p2c_shm::ReadError::Version { found }) => {
-                    // App and camera driver disagree: never guess at the bytes.
-                    self.version_mismatch = true;
-                    if self
-                        .version_logged
-                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
-                    {
-                        self.version_logged = Some(Instant::now());
-                        super::log(&format!(
-                            "frame format v{found} not supported — reinstall Page2Cam"
-                        ));
-                    }
-                }
+                Err(p2c_shm::ReadError::Version { found }) => self.driver_mismatch(|| {
+                    format!("frame format v{found} not supported — reinstall Page2Cam")
+                }),
+                Err(p2c_shm::ReadError::Format { found }) => self.driver_mismatch(|| {
+                    format!("unknown frame format {found} — reinstall Page2Cam")
+                }),
                 // Mid-write or nothing yet: keep the previous frame.
                 Err(p2c_shm::ReadError::Busy | p2c_shm::ReadError::NoFrame) => {}
             }
             self.scratch = buf;
+        }
+    }
+
+    /// App and camera driver disagree: never guess at the bytes. Shows the
+    /// waiting picture; logs `msg` at most once a minute.
+    fn driver_mismatch(&mut self, msg: impl FnOnce() -> String) {
+        self.version_mismatch = true;
+        if self
+            .version_logged
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+        {
+            self.version_logged = Some(Instant::now());
+            super::log(&msg());
         }
     }
 

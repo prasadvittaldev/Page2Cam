@@ -1,7 +1,8 @@
 //! Frame hand-off between the Page2Cam app and its Windows camera DLL.
 //!
 //! The DLL (running inside the Windows Frame Server service) creates a named
-//! file mapping; the app writes BGRA frames into it with a seqlock; the DLL
+//! file mapping; the app writes frames into it with a seqlock (NV12, BT.709
+//! limited range, from the Windows app; BGRA is still understood); the DLL
 //! copies the newest consistent frame into each camera sample.
 mod convert;
 mod layout;

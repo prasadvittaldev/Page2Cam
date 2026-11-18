@@ -73,6 +73,9 @@ pub enum ReadError {
     Busy,
     /// The writer uses another protocol version.
     Version { found: u32 },
+    /// The writer uses a pixel format this reader doesn't know (a newer app):
+    /// like `Version`, app and camera driver must be installed together.
+    Format { found: u32 },
 }
 
 /// Write one tightly packed frame. Returns false if it doesn't fit or the
@@ -143,7 +146,12 @@ pub unsafe fn read_frame(base: *const u8, out: &mut Vec<u8>) -> Result<FrameInfo
     );
     let format = std::ptr::read_volatile(&h.format);
     let Some(fmt) = PixelFormat::from_u32(format) else {
-        return Err(ReadError::Busy);
+        // Only a consistent read counts (a torn one is just Busy).
+        fence(Ordering::Acquire);
+        if h.seq.load(Ordering::Acquire) != s1 {
+            return Err(ReadError::Busy);
+        }
+        return Err(ReadError::Format { found: format });
     };
     if width == 0 || height == 0 || width > MAX_WIDTH || height > MAX_HEIGHT {
         return Err(ReadError::Busy);
@@ -270,6 +278,21 @@ mod tests {
         // Writing frames must not clobber it.
         unsafe { write_frame(base, PixelFormat::Bgra, 2, 2, &[7; 16], 1) };
         assert_eq!(unsafe { dll_version(base) }, VERSION);
+    }
+
+    #[test]
+    fn unknown_format_is_reported_not_busy() {
+        // A newer app with a pixel format this DLL doesn't know: not a stall.
+        let mut m = mem();
+        let base = m.as_mut_ptr() as *mut u8;
+        unsafe {
+            write_frame(base, PixelFormat::Bgra, 2, 2, &[7; 16], 1);
+            (*(base as *mut Header)).format = 7;
+        }
+        assert_eq!(
+            unsafe { read_frame(base, &mut Vec::new()) },
+            Err(ReadError::Format { found: 7 })
+        );
     }
 
     #[test]
