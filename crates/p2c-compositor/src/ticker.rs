@@ -108,6 +108,13 @@ pub trait OutputProducer: Send {
     fn pipeline_frames(&self) -> u32 {
         0
     }
+    /// Since when this producer has been holding its output (`Ok(None)`
+    /// while it recovers, e.g. rebuilding a lost GPU device), if it is. A
+    /// fallback that follows counts its wait for the CPU page from then, so
+    /// the two waits don't add up.
+    fn holding_since(&self) -> Option<Instant> {
+        None
+    }
 }
 
 /// How many ticks of the last `PIPELINE_WINDOW` ticks are looked at for the
@@ -183,7 +190,10 @@ fn is_redraw(prev: Option<&Output>, o: &Output) -> bool {
 /// After a fallback, how long to keep the last frame while the CPU page
 /// (the recreated browser's first paint) is missing. After that the CPU
 /// compositor runs without a page (black, live webcam) until the page comes:
-/// the camera never freezes for longer than this.
+/// the camera never freezes for longer than this. Counted from when the
+/// failed producer began holding its output
+/// ([`OutputProducer::holding_since`]), so a timed-out device rebuild and
+/// this wait together stay at about 1 s.
 const WAIT_FOR_CPU_PAGE: Duration = Duration::from_secs(1);
 
 /// Composited frames that sinks may hold at once (the ticker's previous
@@ -389,11 +399,18 @@ impl ProducerSlot {
             return;
         }
         tracing::warn!(from = %self.name, %reason, "video falls back to the CPU compositor");
+        // The output has been frozen since the old producer began holding
+        // it (e.g. a timed-out device rebuild): the page wait counts from then.
+        let frozen_since = self
+            .producer
+            .holding_since()
+            .unwrap_or_else(Instant::now)
+            .min(Instant::now());
         self.producer = Box::new(CpuProducer::new(self.spec));
         self.name = self.producer.name();
         self.fell_back = true;
         self.errors = 0;
-        self.wait_for_page = has_prev.then(Instant::now);
+        self.wait_for_page = has_prev.then_some(frozen_since);
         let _ = self.events.send(ProducerEvent::Failed(reason));
     }
 }
@@ -1204,6 +1221,87 @@ mod tests {
             late.contains(&GREEN) && late.contains(&MAGENTA),
             "PIP not live: {late:?}"
         );
+    }
+
+    /// Draws BLUE three times, then holds its output (`Ok(None)`, like a
+    /// device rebuild) for 1 s and then fails for good (rebuild timed out).
+    struct Holding {
+        n: u32,
+        since: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
+        frame: Arc<Frame>,
+    }
+
+    impl OutputProducer for Holding {
+        fn produce(&mut self, _: &TickInputs, _: bool) -> anyhow::Result<Option<Output>> {
+            self.n += 1;
+            if self.n <= 3 {
+                return Ok(Some(Output {
+                    bgra: Some(self.frame.clone()),
+                    ..Output::default()
+                }));
+            }
+            let since = *self.since.lock().get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() < Duration::from_secs(1) {
+                return Ok(None);
+            }
+            anyhow::bail!("rebuild timed out")
+        }
+        fn name(&self) -> String {
+            "Holding".into()
+        }
+        fn holding_since(&self) -> Option<std::time::Instant> {
+            *self.since.lock()
+        }
+    }
+
+    #[test]
+    fn rebuild_timeout_then_missing_page_freezes_at_most_1_2s_in_all() {
+        const MAGENTA: [u8; 4] = [255, 0, 255, 255];
+        let cam = FrameSlot::new();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (c, stop2) = (cam.clone(), stop.clone());
+        let feeder = std::thread::spawn(move || {
+            let mut i = 0u32;
+            while !stop2.load(Ordering::SeqCst) {
+                let px = if i.is_multiple_of(2) { GREEN } else { MAGENTA };
+                c.put(Frame::from_bgra(16, 9, px.repeat(16 * 9)).unwrap());
+                i += 1;
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let since = Arc::new(parking_lot::Mutex::new(None));
+        let samples: Samples = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = Ticker::spawn(
+            small_spec(),
+            Some(FrameSlot::new()),
+            Some(cam),
+            None,
+            Arc::new(parking_lot::RwLock::new(crate::PipLayout::preset(
+                crate::Corner::BottomRight,
+                0.25,
+            ))),
+            Box::new(Holding {
+                n: 0,
+                since: since.clone(),
+                frame: Arc::new(Frame::from_bgra(64, 36, BLUE.repeat(64 * 36)).unwrap()),
+            }),
+            vec![Box::new(Sampler(samples.clone(), 55, 30))],
+            tx,
+        );
+        rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        t.stop();
+        stop.store(true, Ordering::SeqCst);
+        feeder.join().unwrap();
+        let held_from = since.lock().expect("never held");
+        let s = samples.lock();
+        let first_live = s
+            .iter()
+            .find(|(t, px)| *t > held_from && *px != BLUE)
+            .expect("still frozen on the last frame");
+        let froze = first_live.0.duration_since(held_from);
+        assert!(froze <= Duration::from_millis(1200), "froze {froze:?}");
     }
 
     #[test]
