@@ -57,10 +57,16 @@ pub trait Engine: Send {
     fn device(&self) -> Device;
 }
 
-/// Open the real engine for `choice` from the `models` folder `dir`.
-pub fn open_engine(dir: &Path, choice: EngineChoice) -> anyhow::Result<Box<dyn Engine>> {
+/// Open the real engine for `choice` from the `models` folder `dir`. `gpu` is
+/// the DXGI adapter index for Quality (DirectML); `None` keeps it on the CPU.
+/// Fast always runs on the CPU.
+pub fn open_engine(
+    dir: &Path,
+    choice: EngineChoice,
+    gpu: Option<u32>,
+) -> anyhow::Result<Box<dyn Engine>> {
     Ok(match choice {
-        EngineChoice::Quality => Box::new(RvmEngine::open(dir)?),
+        EngineChoice::Quality => Box::new(RvmEngine::open(dir, gpu)?),
         EngineChoice::Fast => Box::new(FastEngine::open(dir)?),
     })
 }
@@ -78,7 +84,7 @@ impl FastEngine {
     pub fn open(dir: &Path) -> anyhow::Result<FastEngine> {
         // Tiny model: the CPU is fast enough and avoids GPU upload overhead.
         let (session, device) =
-            runtime::session(&dir.join(SELFIE_MODEL), false, runtime::ModelSize::Small)?;
+            runtime::session(&dir.join(SELFIE_MODEL), None, runtime::ModelSize::Small)?;
         Ok(FastEngine { session, device })
     }
 }
@@ -120,9 +126,9 @@ fn empty_rec() -> [(Vec<i64>, Vec<f32>); 4] {
 }
 
 impl RvmEngine {
-    pub fn open(dir: &Path) -> anyhow::Result<RvmEngine> {
+    pub fn open(dir: &Path, gpu: Option<u32>) -> anyhow::Result<RvmEngine> {
         let (session, device) =
-            runtime::session(&dir.join(RVM_MODEL), true, runtime::ModelSize::Large)?;
+            runtime::session(&dir.join(RVM_MODEL), gpu, runtime::ModelSize::Large)?;
         Ok(RvmEngine {
             session,
             device,

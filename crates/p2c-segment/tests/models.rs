@@ -7,6 +7,14 @@ fn ort_dir() -> std::path::PathBuf {
         .join(if cfg!(windows) { "windows" } else { "linux" })
 }
 
+/// The adapter the 0.3.0 behaviour used: Windows' high-performance GPU.
+fn auto_gpu() -> Option<u32> {
+    match p2c_d3d::choose(&p2c_d3d::enumerate(), &p2c_d3d::GpuSetting::Auto).0 {
+        p2c_d3d::GpuChoice::Gpu(a) => Some(a.index),
+        p2c_d3d::GpuChoice::Cpu { .. } => None,
+    }
+}
+
 fn describe(s: &ort::session::Session) -> (Vec<String>, Vec<String>) {
     for i in s.inputs() {
         println!("  in  {} {:?}", i.name(), i.dtype());
@@ -29,7 +37,7 @@ fn both_models_load_and_report_shapes() {
     println!("RVM:");
     let (rvm, dev) = runtime::session(
         &models.join("rvm_mobilenetv3_fp32.onnx"),
-        false,
+        None,
         runtime::ModelSize::Large,
     )
     .unwrap();
@@ -48,7 +56,7 @@ fn both_models_load_and_report_shapes() {
     println!("MediaPipe selfie:");
     let (mp, _) = runtime::session(
         &models.join("selfie_landscape.onnx"),
-        false,
+        None,
         runtime::ModelSize::Small,
     )
     .unwrap();
@@ -92,7 +100,7 @@ fn engines_cut_out_person() {
         p2c_segment::EngineChoice::Fast,
         p2c_segment::EngineChoice::Quality,
     ] {
-        let mut engine = p2c_segment::open_engine(&models, choice).unwrap();
+        let mut engine = p2c_segment::open_engine(&models, choice, auto_gpu()).unwrap();
         let frame = person_frame();
         let mut took = std::time::Duration::ZERO;
         let mut mask = None;
@@ -211,17 +219,19 @@ fn bench_engines() {
         run_selfie(&mut old)
     });
     drop(old);
-    let (mut new, _) = runtime::session(&selfie, false, runtime::ModelSize::Small).unwrap();
+    let (mut new, _) = runtime::session(&selfie, None, runtime::ModelSize::Small).unwrap();
     bench("Fast, 2 threads, no spinning (after)", || {
         run_selfie(&mut new)
     });
 
-    let mut fast = p2c_segment::open_engine(&models, p2c_segment::EngineChoice::Fast).unwrap();
+    let mut fast =
+        p2c_segment::open_engine(&models, p2c_segment::EngineChoice::Fast, auto_gpu()).unwrap();
     bench("Fast engine incl. resize 1280x720 -> 256x144", || {
         fast.infer(&frame).unwrap();
     });
 
-    let mut q = p2c_segment::open_engine(&models, p2c_segment::EngineChoice::Quality).unwrap();
+    let mut q =
+        p2c_segment::open_engine(&models, p2c_segment::EngineChoice::Quality, auto_gpu()).unwrap();
     let label = format!("Quality engine on {}", q.device());
     bench(&label, || {
         q.infer(&frame).unwrap();

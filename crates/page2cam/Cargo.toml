@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 p2c-core.workspace = true
 p2c-compositor.workspace = true
+p2c-d3d.workspace = true
 p2c-vcam.workspace = true
 p2c-browser.workspace = true
 p2c-webcam.workspace = true

@@ -189,12 +189,37 @@ fn run() -> anyhow::Result<()> {
     };
     let webcam_slot = webcam.as_ref().map(|(slot, _, _)| slot.clone());
 
+    // GPU: resolved once from the `gpu` setting against a fresh adapter list
+    // (adapter LUIDs are never stored: a stale one crashes Chromium).
+    let adapters = p2c_d3d::enumerate();
+    let (gpu_choice, gpu_note) = p2c_d3d::choose(&adapters, &p2c_d3d::GpuSetting::parse(&cfg.gpu));
+    match &gpu_choice {
+        p2c_d3d::GpuChoice::Gpu(a) => {
+            tracing::info!(adapter = %a.name, index = a.index, "GPU chosen")
+        }
+        p2c_d3d::GpuChoice::Cpu { reason } => tracing::info!(%reason, "GPU not used"),
+    }
+    if let Some(n) = &gpu_note {
+        tracing::info!("{n}");
+    }
+    // CPU compatibility mode keeps the 0.3.0 behaviour: the cut-out still uses
+    // the high-performance GPU if there is a hardware adapter.
+    let cutout_gpu = match &gpu_choice {
+        p2c_d3d::GpuChoice::Gpu(a) => Some(a.index),
+        p2c_d3d::GpuChoice::Cpu { .. } => {
+            match p2c_d3d::choose(&adapters, &p2c_d3d::GpuSetting::Auto).0 {
+                p2c_d3d::GpuChoice::Gpu(a) => Some(a.index),
+                p2c_d3d::GpuChoice::Cpu { .. } => None,
+            }
+        }
+    };
+
     // Cut-out: segmentation runs on its own thread and publishes the person
     // mask; the ticker combines it with the newest webcam frame.
     let matte = p2c_core::MaskSlot::new();
     let segmenter = webcam_slot
         .as_ref()
-        .map(|cam| start_segmenter(&cfg, cam.clone(), matte.clone()));
+        .map(|cam| start_segmenter(&cfg, cam.clone(), matte.clone(), cutout_gpu));
     if let Some(seg) = &segmenter {
         let l = *layout.read();
         seg.set_enabled(l.visible && l.style.is_cutout());
@@ -412,6 +437,7 @@ fn start_segmenter(
     cfg: &Config,
     webcam: FrameSlot,
     matte: p2c_core::MaskSlot,
+    gpu: Option<u32>,
 ) -> p2c_segment::Segmenter {
     let runtime_dir = p2c_segment::runtime_dir();
     let models = p2c_segment::models_dir();
@@ -422,7 +448,7 @@ fn start_segmenter(
     }
     let choice = p2c_segment::EngineChoice::parse(&cfg.cutout_engine).unwrap_or_default();
     let opener: p2c_segment::Opener = Box::new(move |c| match &loaded {
-        Ok(()) => p2c_segment::open_engine(&models, c),
+        Ok(()) => p2c_segment::open_engine(&models, c, gpu),
         Err(e) => anyhow::bail!("{e}"),
     });
     p2c_segment::Segmenter::spawn(opener, webcam, matte, choice)

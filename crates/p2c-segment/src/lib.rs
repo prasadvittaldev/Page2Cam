@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 pub mod engine;
 #[cfg(windows)]
-pub mod gpu;
 pub mod policy;
 pub mod post;
 pub mod runtime;

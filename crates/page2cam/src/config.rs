@@ -33,6 +33,8 @@ pub struct Config {
     pub cutout_engine: String,
     /// Look for new versions on GitHub (a small request every few hours).
     pub check_updates: bool,
+    /// GPU for the cut-out and video: auto | cpu | exact adapter name.
+    pub gpu: String,
 }
 
 impl Default for Config {
@@ -53,6 +55,7 @@ impl Default for Config {
             overlay_style: "box".into(),
             cutout_engine: "quality".into(),
             check_updates: true,
+            gpu: "auto".into(),
         }
     }
 }
@@ -238,6 +241,15 @@ mod tests {
             ..Config::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn gpu_defaults_to_auto() {
+        let c = Config::default();
+        assert_eq!(c.gpu, "auto");
+        assert!(c.validate().is_ok());
+        let c: Config = toml::from_str("gpu = \"NVIDIA RTX 2000 Ada\"").unwrap();
+        assert!(c.validate().is_ok());
     }
 
     #[test]

@@ -81,25 +81,21 @@ pub fn cpu_threads(size: ModelSize, available: usize) -> usize {
     }
 }
 
-/// Open `model`. With `prefer_gpu` on Windows, DirectML is tried first (on
-/// the high-performance GPU) and the CPU is used if that fails. Returns the
-/// device actually in use.
+/// Open `model`. With `gpu` (a DXGI plain-order adapter index) on Windows,
+/// DirectML is tried first on that adapter and the CPU is used if that fails.
+/// `None` means CPU only. Returns the device actually in use.
 pub fn session(
     model: &Path,
-    prefer_gpu: bool,
+    gpu: Option<u32>,
     size: ModelSize,
 ) -> anyhow::Result<(Session, Device)> {
     anyhow::ensure!(model.is_file(), "model missing: {}", model.display());
     #[cfg(windows)]
-    if prefer_gpu {
+    if let Some(index) = gpu {
         // DirectML requires memory pattern and parallel execution off
         // ("or an error is returned"), and must be the EP we asked for.
-        // Run on the high-performance GPU, named by index (see `gpu`).
-        let gpu = crate::gpu::high_performance_adapter();
-        let ep = match &gpu {
-            Some(a) => ort::ep::DirectML::default().with_device_id(a.index as i32),
-            None => ort::ep::DirectML::default(),
-        };
+        // The adapter is named by its DXGI plain-order index (see `p2c_d3d`).
+        let ep = ort::ep::DirectML::default().with_device_id(index as i32);
         let dml = Session::builder(env()?)
             .map_err(anyhow::Error::from)
             .and_then(|b| {
@@ -117,16 +113,19 @@ pub fn session(
             .and_then(|mut b| b.commit_from_file(model).map_err(anyhow::Error::from));
         match dml {
             Ok(s) => {
-                let gpu = gpu.map_or("DirectML default adapter".to_string(), |a| {
-                    format!("{} (adapter {})", a.name, a.index)
-                });
+                let name = p2c_d3d::enumerate()
+                    .into_iter()
+                    .find(|a| a.index == index)
+                    .map_or_else(|| "unknown".to_string(), |a| a.name);
+                let gpu = format!("{name} (adapter {index})");
                 tracing::info!(model = %model.display(), %gpu, "running on the GPU (DirectML)");
                 return Ok((s, Device::DirectMl));
             }
             Err(e) => tracing::warn!("DirectML unavailable, using CPU: {e:#}"),
         }
     }
-    let _ = prefer_gpu;
+    #[cfg(not(windows))]
+    let _ = gpu;
     let available = std::thread::available_parallelism().map_or(1, |n| n.get());
     let threads = cpu_threads(size, available);
     // CPU on purpose: stop ONNX Runtime's automatic device policy from
