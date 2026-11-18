@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -129,20 +129,23 @@ impl StreamController {
         let t0 = Instant::now();
 
         let mut threads = Vec::new();
+        // Audio time to leave out after video drops a backlog (in samples).
+        let audio_skip = Arc::new(AtomicU64::new(0));
         {
+            let skip = audio_skip.clone();
             let (slot, stop, spec) = (
                 self.slot.clone(),
                 stop.clone(),
                 (cfg.width, cfg.height, cfg.fps),
             );
             threads.push(thread("p2c-stream-video", move || {
-                write_video(stdin, slot, stop, spec, t0)
+                write_video(stdin, slot, stop, spec, t0, skip)
             }));
         }
         {
-            let (mixer, stop) = (self.mixer.clone(), stop.clone());
+            let (mixer, stop, skip) = (self.mixer.clone(), stop.clone(), audio_skip.clone());
             threads.push(thread("p2c-stream-audio", move || {
-                write_audio(listener, mixer, stop, t0)
+                write_audio(listener, mixer, stop, t0, skip)
             }));
         }
         {
@@ -200,31 +203,44 @@ fn write_video(
     stop: Arc<AtomicBool>,
     (w, h, fps): (u32, u32, u32),
     t0: Instant,
+    audio_skip: Arc<AtomicU64>,
 ) {
-    let period = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+    let fps = fps.max(1);
+    let period = Duration::from_secs_f64(1.0 / fps as f64);
     let black = Frame::new_black(w, h);
     let mut n: u64 = 0;
+    let mut last_warn: Option<Instant> = None;
     while !stop.load(Ordering::Relaxed) {
-        let latest = slot.latest();
-        let f = latest
-            .as_deref()
-            .filter(|f| f.width == w && f.height == h)
-            .unwrap_or(&black);
         // Frames that should exist by now (one at t0, then one per period).
         let due = (t0.elapsed().as_secs_f64() / period.as_secs_f64()) as u64 + 1;
-        let mut failed = false;
-        loop {
-            if stdin.write_all(&f.data).is_err() {
-                failed = true;
-                break;
-            }
-            n += 1;
-            if n >= due || stop.load(Ordering::Relaxed) {
-                break;
+        if due > n + MAX_LAG_SECS * fps as u64 {
+            // The encoder can't keep up: drop the backlog instead of bursting
+            // it, and make audio drop the same time so both stay in sync.
+            let dropped = due - n - 1;
+            n += dropped;
+            audio_skip.fetch_add(
+                dropped * p2c_core::SAMPLE_RATE as u64 / fps as u64,
+                Ordering::Relaxed,
+            );
+            if last_warn.is_none_or(|t| t.elapsed() > Duration::from_secs(30)) {
+                tracing::warn!(
+                    dropped_frames = dropped,
+                    "the video encoder can't keep up; lower the bitrate or resolution"
+                );
+                last_warn = Some(Instant::now());
             }
         }
-        if failed {
-            break;
+        // Catch up one frame at a time, always with the newest picture.
+        while n < due && !stop.load(Ordering::Relaxed) {
+            let latest = slot.latest();
+            let f = latest
+                .as_deref()
+                .filter(|f| f.width == w && f.height == h)
+                .unwrap_or(&black);
+            if stdin.write_all(&f.data).is_err() {
+                return;
+            }
+            n += 1;
         }
         let deadline = t0 + period.mul_f64(n as f64);
         let now = Instant::now();
@@ -234,6 +250,9 @@ fn write_video(
     }
 }
 
+/// How far video may fall behind the wall clock before the backlog is dropped.
+const MAX_LAG_SECS: u64 = 2;
+
 /// Stereo frames of silence that put audio on the video's timeline when
 /// ffmpeg connects `lead` after video started.
 fn lead_in_frames(lead: Duration) -> usize {
@@ -241,7 +260,13 @@ fn lead_in_frames(lead: Duration) -> usize {
 }
 
 /// Accept ffmpeg's audio connection, then send 10 ms of mixed audio per tick.
-fn write_audio(listener: TcpListener, mixer: Mixer, stop: Arc<AtomicBool>, t0: Instant) {
+fn write_audio(
+    listener: TcpListener,
+    mixer: Mixer,
+    stop: Arc<AtomicBool>,
+    t0: Instant,
+    skip: Arc<AtomicU64>,
+) {
     let accept_deadline = Instant::now() + Duration::from_secs(20);
     let mut sock = loop {
         if stop.load(Ordering::Relaxed) || Instant::now() > accept_deadline {
@@ -266,7 +291,19 @@ fn write_audio(listener: TcpListener, mixer: Mixer, stop: Arc<AtomicBool>, t0: I
     let start = t0 + Duration::from_secs_f64(lead as f64 / p2c_core::SAMPLE_RATE as f64);
     let mut n: u32 = 0;
     let mut bytes = Vec::with_capacity(FRAMES * 8);
+    let mut skip_rest: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
+        // Video dropped a backlog: leave out the same stretch of audio (its
+        // 10 ms chunks are simply not sent, and the mixed audio is discarded).
+        skip_rest += skip.swap(0, Ordering::Relaxed);
+        if skip_rest >= FRAMES as u64 {
+            let chunks = skip_rest / FRAMES as u64;
+            skip_rest %= FRAMES as u64;
+            for _ in 0..chunks {
+                let _ = mixer.pull(FRAMES);
+            }
+            n += chunks as u32;
+        }
         bytes.clear();
         for s in mixer.pull(FRAMES) {
             bytes.extend_from_slice(&s.to_le_bytes());
@@ -388,14 +425,86 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let t0 = Instant::now();
-        let h =
-            std::thread::spawn(move || write_video(sink, FrameSlot::new(), stop2, (4, 4, 30), t0));
+        let h = std::thread::spawn(move || {
+            let skip = Arc::new(AtomicU64::new(0));
+            write_video(sink, FrameSlot::new(), stop2, (4, 4, 30), t0, skip)
+        });
         std::thread::sleep(Duration::from_millis(3000));
         stop.store(true, Ordering::SeqCst);
         h.join().unwrap();
         let n = frames.load(Ordering::SeqCst) as i64;
         // 3 s at 30 fps = 90 frames (+1 for the frame at t=0).
         assert!((n - 91).abs() <= 3, "wrote {n} frames in 3 s");
+    }
+
+    /// Records the first byte of every frame written; each write takes `per_frame`.
+    struct SlowSink {
+        seen: Arc<parking_lot::Mutex<Vec<u8>>>,
+        frame_len: usize,
+        buf: Vec<u8>,
+        per_frame: Duration,
+    }
+
+    impl Write for SlowSink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.buf.extend_from_slice(b);
+            while self.buf.len() >= self.frame_len {
+                let first = self.buf[0];
+                self.buf.drain(..self.frame_len);
+                self.seen.lock().push(first);
+                std::thread::sleep(self.per_frame);
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn slow_encoder_never_freezes_the_picture() {
+        // Encoder manages 20 fps of a 30 fps stream. The picture must keep
+        // changing (no long runs of one repeated frame), and once video is
+        // more than 2 s behind both writers drop the backlog together.
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = SlowSink {
+            seen: seen.clone(),
+            frame_len: 4 * 4 * 4,
+            buf: Vec::new(),
+            per_frame: Duration::from_millis(50),
+        };
+        let slot = FrameSlot::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let feeder = {
+            let (slot, stop) = (slot.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut v = 0u8;
+                while !stop.load(Ordering::SeqCst) {
+                    v = v.wrapping_add(1);
+                    slot.put(Frame::from_bgra(4, 4, vec![v; 64]).unwrap());
+                    std::thread::sleep(Duration::from_millis(33));
+                }
+            })
+        };
+        let skip = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (stop2, skip2) = (stop.clone(), skip.clone());
+        let t0 = Instant::now();
+        let h = std::thread::spawn(move || write_video(sink, slot, stop2, (4, 4, 30), t0, skip2));
+        std::thread::sleep(Duration::from_millis(9000));
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        feeder.join().unwrap();
+        let seen = seen.lock();
+        let longest = seen
+            .chunk_by(|a, b| a == b)
+            .map(|run| run.len())
+            .max()
+            .unwrap_or(0);
+        assert!(longest <= 3, "picture froze for {longest} frames");
+        assert!(
+            skip.load(Ordering::SeqCst) > 0,
+            "audio was never told to drop the backlog"
+        );
     }
 
     #[test]
