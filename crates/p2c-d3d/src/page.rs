@@ -2,7 +2,7 @@
 //! NT handle on our device and copy it into a texture we own.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -41,7 +41,10 @@ struct PageInner {
     gpu: Gpu,
     state: Mutex<PageState>,
     seq: AtomicU64,
-    mismatch: Mutex<Option<u64>>,
+    /// Result of probing the other adapters after a failed open: `None` =
+    /// not probed since the last successful open.
+    probe: Mutex<Option<Option<u64>>>,
+    probes: AtomicU32,
 }
 
 struct PageState {
@@ -66,7 +69,8 @@ impl PageInput {
                     cache: HashMap::new(),
                 }),
                 seq: AtomicU64::new(0),
-                mismatch: Mutex::new(None),
+                probe: Mutex::new(None),
+                probes: AtomicU32::new(0),
             }),
         })
     }
@@ -79,62 +83,83 @@ impl PageInput {
     pub fn on_shared_texture(&self, handle: isize) -> Result<()> {
         let inner = &*self.inner;
         let gpu = &inner.gpu;
-        let mut st = inner.state.lock().unwrap_or_else(|p| p.into_inner());
-        let shared = match st.cache.get(&handle) {
-            Some(t) => t.clone(),
-            None => {
-                // SAFETY: CEF's handle is valid for the duration of the callback.
-                let opened = unsafe {
-                    gpu.device1()
-                        .OpenSharedResource1::<ID3D11Texture2D>(HANDLE(handle as _))
-                };
-                let t = match opened {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let e = anyhow::Error::from(e);
-                        if is_device_lost(&e) {
-                            return Err(e.context("OpenSharedResource1: device lost"));
+        // The state lock is never held across context calls (lock order:
+        // a ticker may hold `gpu.lock()` and then call `texture()`).
+        let (dst, shared) = {
+            let mut st = inner.state.lock().unwrap_or_else(|p| p.into_inner());
+            let cached = st.cache.get(&handle).cloned();
+            let shared = match cached {
+                Some(t) => t,
+                None => {
+                    // SAFETY: CEF's handle is valid for the duration of the callback.
+                    let opened = unsafe {
+                        gpu.device1()
+                            .OpenSharedResource1::<ID3D11Texture2D>(HANDLE(handle as _))
+                    };
+                    let t = match opened {
+                        Ok(t) => t,
+                        Err(e) => {
+                            drop(st);
+                            return Err(self.open_failed(handle, e.into()));
                         }
-                        let mut mm = inner.mismatch.lock().unwrap_or_else(|p| p.into_inner());
-                        if mm.is_none() {
-                            *mm = open_on_matching_adapter(handle, &crate::enumerate())
-                                .filter(|l| *l != gpu.luid());
-                        }
-                        return Err(match *mm {
-                            Some(l) => e.context(format!(
-                                "page texture is on adapter LUID {l:#x}, our device is on {:#x}",
-                                gpu.luid()
-                            )),
-                            None => e.context("OpenSharedResource1 failed on every adapter"),
-                        });
+                    };
+                    *inner.probe.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                    let d = tex_desc(&t);
+                    if d.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+                        bail!(
+                            "page texture format {:?}, expected B8G8R8A8_UNORM",
+                            d.Format
+                        );
                     }
-                };
-                let d = tex_desc(&t);
-                if d.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
-                    bail!(
-                        "page texture format {:?}, expected B8G8R8A8_UNORM",
-                        d.Format
-                    );
+                    if (d.Width, d.Height) != (st.tex.width(), st.tex.height()) {
+                        st.tex = page_texture(gpu, d.Width, d.Height)
+                            .context("page texture for new size")?;
+                        st.cache.clear();
+                    }
+                    st.cache.insert(handle, t.clone());
+                    t
                 }
-                if (d.Width, d.Height) != (st.tex.width(), st.tex.height()) {
-                    st.tex = page_texture(gpu, d.Width, d.Height)
-                        .context("page texture for new size")?;
-                    st.cache.clear();
-                }
-                st.cache.insert(handle, t.clone());
-                t
-            }
+            };
+            (st.tex.clone(), shared)
         };
         let ctx = gpu.context();
         // SAFETY: same size/format textures on our device; single context
         // calls are serialized by multithread protection.
         unsafe {
-            ctx.CopyResource(st.tex.raw(), &shared);
+            ctx.CopyResource(dst.raw(), &shared);
             // Start the copy now: Chromium reuses the texture for later frames.
             ctx.Flush();
         }
         inner.seq.fetch_add(1, Ordering::Release);
         Ok(())
+    }
+
+    /// Our device couldn't open `handle`: find out (once, until the next
+    /// successful open) which adapter can, and build the error.
+    fn open_failed(&self, handle: isize, e: anyhow::Error) -> anyhow::Error {
+        let inner = &*self.inner;
+        let gpu = &inner.gpu;
+        if is_device_lost(&e) {
+            return e.context("OpenSharedResource1: device lost");
+        }
+        let mut probe = inner.probe.lock().unwrap_or_else(|p| p.into_inner());
+        let found = *probe.get_or_insert_with(|| {
+            inner.probes.fetch_add(1, Ordering::Relaxed);
+            open_on_matching_adapter(handle, &crate::enumerate()).filter(|l| *l != gpu.luid())
+        });
+        match found {
+            Some(l) => e.context(format!(
+                "page texture is on adapter LUID {l:#x}, our device is on {:#x}",
+                gpu.luid()
+            )),
+            None => e.context("OpenSharedResource1 failed on every adapter"),
+        }
+    }
+
+    /// How many times other adapters were probed for a handle (diagnostics/tests).
+    #[doc(hidden)]
+    pub fn probe_count(&self) -> u32 {
+        self.inner.probes.load(Ordering::Relaxed)
     }
 
     /// Count of page frames copied so far.
@@ -145,11 +170,11 @@ impl PageInput {
     /// The LUID of the adapter that does open Chromium's textures, when it is
     /// not ours (the device must be recreated there).
     pub fn adapter_mismatch(&self) -> Option<u64> {
-        *self
-            .inner
-            .mismatch
+        self.inner
+            .probe
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .flatten()
     }
 
     /// Our copy of the latest page (BGRA, shader resource).

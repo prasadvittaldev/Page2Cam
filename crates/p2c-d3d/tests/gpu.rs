@@ -160,3 +160,50 @@ fn page_input_copies_shared_texture() {
         println!("page input ok on {}", a.name);
     }
 }
+
+#[test]
+#[ignore]
+fn readback_ring_rebuilt_for_recreated_device_on_same_adapter() {
+    for a in hardware() {
+        let f = gradient(64, 36, 3);
+        let old = Gpu::new(a.luid).unwrap();
+        let mut rb = Readback::new();
+        for _ in 0..3 {
+            let tex = old.upload_bgra(&f).unwrap();
+            let (y, uv) = bgra_to_nv12_gpu(&old, &tex, 64, 36).unwrap();
+            rb.submit(&old, &y, &uv).unwrap();
+        }
+        // "Recreated after a device loss": same adapter, new device.
+        let new = Gpu::new(a.luid).unwrap();
+        assert!(!new.same(&old) && new.same(&new.clone()));
+        let tex = new.upload_bgra(&f).unwrap();
+        let (y, uv) = bgra_to_nv12_gpu(&new, &tex, 64, 36).unwrap();
+        rb.submit(&new, &y, &uv).unwrap();
+        // A fresh ring: nothing from the old device's staging textures.
+        assert!(rb.take().unwrap().is_none(), "{}: old ring kept", a.name);
+        for _ in 0..2 {
+            rb.submit(&new, &y, &uv).unwrap();
+        }
+        let got = rb.take().unwrap().expect("ring filled on the new device");
+        assert_eq!(got, bgra_to_nv12(&f, 64, 36));
+        println!("readback ring rebuilt on {}", a.name);
+    }
+}
+
+#[test]
+#[ignore]
+fn unopenable_handle_is_probed_once() {
+    for a in hardware() {
+        let gpu = Gpu::new(a.luid).unwrap();
+        // A handle value that no adapter opens: a shared handle already closed.
+        let h = gpu.create_shared_bgra(&gradient(8, 8, 1)).unwrap().handle();
+        let page = PageInput::new(&gpu, 8, 8).unwrap();
+        for _ in 0..5 {
+            assert!(page.on_shared_texture(h).is_err());
+        }
+        assert_eq!(page.probe_count(), 1, "{}", a.name);
+        assert_eq!(page.adapter_mismatch(), None);
+        assert_eq!(page.seq(), 0);
+        println!("probed once on {}", a.name);
+    }
+}

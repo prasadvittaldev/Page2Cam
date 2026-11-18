@@ -227,6 +227,12 @@ impl Gpu {
         self.inner.luid
     }
 
+    /// True if both handles share the same device (not merely the same
+    /// adapter: a device recreated after a loss is a different one).
+    pub fn same(&self, other: &Gpu) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn device(&self) -> &ID3D11Device {
         &self.inner.device
     }
@@ -507,4 +513,20 @@ pub(crate) fn check_nv12_pair(y: &Texture, uv: &Texture) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::E_INVALIDARG;
+
+    #[test]
+    fn device_lost_detected_through_context() {
+        let e: Result<()> = Err(windows::core::Error::from(DXGI_ERROR_DEVICE_REMOVED).into());
+        let e = e.context("Map staging texture").unwrap_err();
+        assert!(is_device_lost(&e));
+        let e: Result<()> = Err(windows::core::Error::from(E_INVALIDARG).into());
+        assert!(!is_device_lost(&e.context("open").unwrap_err()));
+        assert!(!is_device_lost(&anyhow::anyhow!("plain error")));
+    }
 }

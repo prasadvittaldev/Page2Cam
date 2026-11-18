@@ -19,7 +19,7 @@ struct Slot {
 }
 
 /// Ring of 3 NV12 staging pairs. After submits 1..=N, [`Readback::take`]
-/// returns frame N−2 (once), `None` until the ring has filled.
+/// returns frame N???2 (once), `None` until the ring has filled.
 #[derive(Default)]
 pub struct Readback {
     gpu: Option<Gpu>,
@@ -37,10 +37,11 @@ impl Readback {
     }
 
     /// Queue a copy of the Y (R8) and UV (R8G8, half size) planes. A
-    /// different `gpu` or size resets the ring.
+    /// different `gpu` (another device, even on the same adapter) resets the
+    /// ring; a different size rebuilds the slot.
     pub fn submit(&mut self, gpu: &Gpu, y: &Texture, uv: &Texture) -> Result<()> {
         check_nv12_pair(y, uv)?;
-        if self.gpu.as_ref().map(Gpu::luid) != Some(gpu.luid()) {
+        if !self.gpu.as_ref().is_some_and(|g| g.same(gpu)) {
             *self = Readback::default();
             self.gpu = Some(gpu.clone());
         }
