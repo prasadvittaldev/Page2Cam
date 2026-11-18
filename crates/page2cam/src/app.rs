@@ -352,7 +352,7 @@ impl Controls for App {
             cutout_engine: self.cutout_engine(),
             update: self.updater.info(),
             video: display_video(&self.video.lock()),
-            encoder: self.encoder.lock().clone(),
+            encoder: encoder_text(&self.encoder.lock(), self.stream.encoder_fallback()),
             restart_needed: restart_needed(&gpu_saved, &self.gpu_running),
             gpu_choice: gpu_saved,
             gpu_running: self.gpu_running.clone(),
@@ -481,6 +481,15 @@ pub fn check_gpu_choice(choice: &str, list: &[GpuInfo]) -> anyhow::Result<String
         "unknown GPU choice {choice:?} (not \"auto\", \"cpu\" or a GPU on this PC)"
     );
     Ok(c)
+}
+
+/// The encoder line: the probed encoder, or x264 with the reason when a
+/// hardware encoder failed at stream start (x264 is kept for the session).
+pub fn encoder_text(probed: &str, fallback: Option<String>) -> String {
+    match fallback {
+        Some(why) => format!("x264 ({why})"),
+        None => probed.to_string(),
+    }
 }
 
 /// Longest fallback reason shown in the admin page, in characters.
@@ -636,6 +645,15 @@ mod tests {
         // Non-ASCII stays on character boundaries.
         let d = display_video(&format!("CPU (fallback: {})", "é".repeat(200)));
         assert!(d.ends_with("é…)"), "{d}");
+    }
+
+    #[test]
+    fn encoder_status_shows_the_x264_fallback() {
+        assert_eq!(encoder_text("NVENC", None), "NVENC");
+        assert_eq!(
+            encoder_text("NVENC", Some("NVENC failed at stream start".into())),
+            "x264 (NVENC failed at stream start)"
+        );
     }
 
     #[test]

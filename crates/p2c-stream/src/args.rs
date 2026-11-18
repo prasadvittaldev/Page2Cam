@@ -67,27 +67,78 @@ pub fn candidates(vendor_id: Option<u32>) -> Vec<Encoder> {
     v
 }
 
-/// Whether `e` really encodes here: runs ffmpeg on one black frame to a null
-/// output (an `-encoders` listing says nothing about the driver or the GPU).
-/// Gives up after 10 s.
-pub fn probe(ffmpeg: &Path, e: Encoder) -> bool {
-    let mut cmd = Command::new(ffmpeg);
-    cmd.args([
+/// The encoder's own options (everything after `-c:v <name>`), shared by the
+/// stream and the probe so a probe that passes means the stream's encoder
+/// opens too.
+pub fn encoder_options(e: Encoder, fps: u32, video_kbps: u32) -> Vec<String> {
+    let gop = (fps * 2).to_string();
+    let kbps = format!("{video_kbps}k");
+    let buf = format!("{}k", video_kbps * 2);
+    let mut a: Vec<String> = Vec::new();
+    let rate = |a: &mut Vec<String>, with_buf: bool| {
+        a.extend(["-b:v", &kbps, "-maxrate", &kbps].map(String::from));
+        if with_buf {
+            a.extend(["-bufsize", &buf].map(String::from));
+        }
+    };
+    match e {
+        Encoder::X264 => {
+            a.extend(["-preset", "veryfast", "-bf", "2", "-pix_fmt", "yuv420p"].map(String::from));
+            rate(&mut a, true);
+            a.extend(["-g", &gop, "-keyint_min", &gop, "-sc_threshold", "0"].map(String::from));
+        }
+        Encoder::Nvenc => {
+            a.extend(
+                [
+                    "-preset", "p5", "-tune", "hq", "-rc", "cbr", "-pix_fmt", "nv12",
+                ]
+                .map(String::from),
+            );
+            rate(&mut a, true);
+            a.extend(["-g", &gop, "-bf", "2"].map(String::from));
+        }
+        Encoder::Qsv => {
+            a.extend(["-preset", "medium", "-pix_fmt", "nv12"].map(String::from));
+            rate(&mut a, false);
+            a.extend(["-g", &gop, "-bf", "2"].map(String::from));
+        }
+        Encoder::Amf => {
+            a.extend(["-quality", "balanced", "-rc", "cbr", "-pix_fmt", "nv12"].map(String::from));
+            rate(&mut a, true);
+            a.extend(["-g", &gop, "-bf", "2"].map(String::from));
+        }
+    }
+    a
+}
+
+/// The probe's ffmpeg arguments: a few black 640x360 frames through `e` with
+/// the stream's options, to a null output. (Smaller frames gave false
+/// negatives on Quick Sync and AMF.)
+pub fn probe_args(e: Encoder, fps: u32, video_kbps: u32) -> Vec<String> {
+    let mut a: Vec<String> = [
         "-hide_banner",
         "-loglevel",
         "error",
         "-f",
         "lavfi",
         "-i",
-        "color=c=black:s=256x144:r=30",
-        "-frames:v",
-        "1",
-        "-c:v",
-        e.ffmpeg_name(),
-        "-f",
-        "null",
-        "-",
-    ])
+    ]
+    .map(String::from)
+    .to_vec();
+    a.push(format!("color=c=black:s=640x360:r={}", fps.max(1)));
+    a.extend(["-frames:v", "5", "-c:v", e.ffmpeg_name()].map(String::from));
+    a.extend(encoder_options(e, fps, video_kbps));
+    a.extend(["-f", "null", "-"].map(String::from));
+    a
+}
+
+/// Whether `e` really encodes here, with the stream's options at `fps` and
+/// `video_kbps`: runs ffmpeg on a few black frames to a null output (an
+/// `-encoders` listing says nothing about the driver or the GPU). Gives up
+/// after 10 s.
+pub fn probe(ffmpeg: &Path, e: Encoder, fps: u32, video_kbps: u32) -> bool {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(probe_args(e, fps, video_kbps))
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::null());
@@ -125,9 +176,6 @@ pub fn target_url(cfg: &StreamConfig) -> String {
 /// ffmpeg command line: raw BGRA or NV12 video on stdin, f32le stereo audio from a TCP
 /// socket we listen on, H.264 + AAC in FLV to the RTMP target.
 pub fn ffmpeg_args(cfg: &StreamConfig, audio_port: u16) -> Vec<String> {
-    let gop = (cfg.fps * 2).to_string();
-    let kbps = format!("{}k", cfg.video_kbps);
-    let buf = format!("{}k", cfg.video_kbps * 2);
     let mut a: Vec<String> = [
         "-hide_banner",
         "-loglevel",
@@ -192,39 +240,7 @@ pub fn ffmpeg_args(cfg: &StreamConfig, audio_port: u16) -> Vec<String> {
         ]
         .map(String::from),
     );
-    let rate = |a: &mut Vec<String>, with_buf: bool| {
-        a.extend(["-b:v", &kbps, "-maxrate", &kbps].map(String::from));
-        if with_buf {
-            a.extend(["-bufsize", &buf].map(String::from));
-        }
-    };
-    match cfg.encoder {
-        Encoder::X264 => {
-            a.extend(["-preset", "veryfast", "-bf", "2", "-pix_fmt", "yuv420p"].map(String::from));
-            rate(&mut a, true);
-            a.extend(["-g", &gop, "-keyint_min", &gop, "-sc_threshold", "0"].map(String::from));
-        }
-        Encoder::Nvenc => {
-            a.extend(
-                [
-                    "-preset", "p5", "-tune", "hq", "-rc", "cbr", "-pix_fmt", "nv12",
-                ]
-                .map(String::from),
-            );
-            rate(&mut a, true);
-            a.extend(["-g", &gop, "-bf", "2"].map(String::from));
-        }
-        Encoder::Qsv => {
-            a.extend(["-preset", "medium", "-pix_fmt", "nv12"].map(String::from));
-            rate(&mut a, false);
-            a.extend(["-g", &gop, "-bf", "2"].map(String::from));
-        }
-        Encoder::Amf => {
-            a.extend(["-quality", "balanced", "-rc", "cbr", "-pix_fmt", "nv12"].map(String::from));
-            rate(&mut a, true);
-            a.extend(["-g", &gop, "-bf", "2"].map(String::from));
-        }
-    }
+    a.extend(encoder_options(cfg.encoder, cfg.fps, cfg.video_kbps));
     if cfg.pix_fmt == "nv12" {
         // Say BT.709 limited in the H.264 VUI whatever the encoder does.
         a.extend(
@@ -246,6 +262,32 @@ pub fn ffmpeg_args(cfg: &StreamConfig, audio_port: u16) -> Vec<String> {
     }
     a.push(target_url(cfg));
     a
+}
+
+/// ffmpeg stderr text that means the video encoder could not be opened
+/// (driver, GPU or option trouble), as opposed to network/server errors.
+const ENCODER_ERRORS: &[&str] = &[
+    "error while opening encoder",
+    "no capable devices found",
+    "initializeencoder failed",
+    "openencodesessionex failed",
+    "error initializing an internal mfx session",
+    "createcomponent",
+    "cannot load",
+    "not supported",
+];
+
+/// Whether a stream that just ended should be started again with x264:
+/// `encoder` is a hardware encoder, ffmpeg exited before going live
+/// (`exited_while_connecting`), and its last stderr lines show the encoder
+/// failing to open.
+pub fn retry_with_x264(encoder: Encoder, exited_while_connecting: bool, stderr: &[String]) -> bool {
+    encoder != Encoder::X264
+        && exited_while_connecting
+        && stderr.iter().any(|l| {
+            let l = l.to_ascii_lowercase();
+            ENCODER_ERRORS.iter().any(|e| l.contains(e))
+        })
 }
 
 /// Replace every occurrence of the stream key with `****`.
@@ -418,14 +460,80 @@ mod tests {
         assert!(!with(Encoder::Nvenc).contains("-color_trc"));
     }
 
+    const ALL: [Encoder; 4] = [Encoder::Nvenc, Encoder::Qsv, Encoder::Amf, Encoder::X264];
+
+    /// The `-c:v <name>` option and the `n` arguments after it.
+    fn after_cv(args: &[String], n: usize) -> Vec<String> {
+        let i = args.iter().position(|a| a == "-c:v").expect("-c:v");
+        args[i + 1..i + 2 + n].to_vec()
+    }
+
+    #[test]
+    fn probe_uses_the_streams_encoder_options() {
+        for e in ALL {
+            let opts = encoder_options(e, 30, 6000);
+            let mut want = vec![e.ffmpeg_name().to_string()];
+            want.extend(opts.iter().cloned());
+            let stream = ffmpeg_args(
+                &StreamConfig {
+                    encoder: e,
+                    video_kbps: 6000,
+                    ..cfg()
+                },
+                1,
+            );
+            assert_eq!(after_cv(&stream, opts.len()), want, "{e}: stream");
+            // Nothing encoder-specific outside that block.
+            let i = stream.iter().position(|a| a == "-c:v").unwrap() + 2 + opts.len();
+            assert_eq!(stream[i], "-c:a", "{e}");
+            let probe = probe_args(e, 30, 6000);
+            assert_eq!(after_cv(&probe, opts.len()), want, "{e}: probe");
+            let p = probe.join(" ");
+            assert!(p.contains("s=640x360"), "{p}");
+            assert!(p.ends_with("-f null -"), "{p}");
+        }
+    }
+
+    #[test]
+    fn x264_retry_only_for_a_hardware_encoder_failing_to_open() {
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let nvenc_fail = lines(&[
+            "[h264_nvenc @ 000001] OpenEncodeSessionEx failed: unsupported device (2)",
+            "[h264_nvenc @ 000001] No capable devices found",
+            "Error while opening encoder for output stream #0:0 - maybe incorrect parameters",
+        ]);
+        let qsv_fail = lines(&["[h264_qsv @ 0001] Error initializing an internal MFX session: unsupported (-3)"]);
+        let amf_fail = lines(&["[h264_amf @ 0001] CreateComponent(AMFVideoEncoderVCE_AVC) failed with error 30"]);
+        let amf_load = lines(&["[h264_amf @ 0001] Cannot load amfrt64.dll"]);
+        let nv_init = lines(&["[h264_nvenc @ 0001] InitializeEncoder failed: invalid param (8)"]);
+        let bframes = lines(&["[h264_nvenc @ 0001] B frames as references are not supported"]);
+        let network = lines(&[
+            "[rtmp @ 0001] Cannot open connection tcp://a.rtmp.youtube.com:1935",
+            "Error opening output rtmp://a.rtmp.youtube.com/live2/****: I/O error",
+        ]);
+        assert!(retry_with_x264(Encoder::Nvenc, true, &nvenc_fail));
+        assert!(retry_with_x264(Encoder::Qsv, true, &qsv_fail));
+        assert!(retry_with_x264(Encoder::Amf, true, &amf_fail));
+        assert!(retry_with_x264(Encoder::Amf, true, &amf_load));
+        assert!(retry_with_x264(Encoder::Nvenc, true, &nv_init));
+        assert!(retry_with_x264(Encoder::Nvenc, true, &bframes));
+        // x264 itself failing: nothing to fall back to.
+        assert!(!retry_with_x264(Encoder::X264, true, &nvenc_fail));
+        // Was live already: an encoder that opened is not the problem.
+        assert!(!retry_with_x264(Encoder::Nvenc, false, &nvenc_fail));
+        // Network / server errors are not encoder errors.
+        assert!(!retry_with_x264(Encoder::Nvenc, true, &network));
+        assert!(!retry_with_x264(Encoder::Nvenc, true, &[]));
+    }
+
     #[test]
     #[ignore]
     fn probe_finds_working_encoder() {
         let ff = find_ffmpeg().expect("ffmpeg on PATH");
-        assert!(probe(&ff, Encoder::X264));
-        assert!(probe(&ff, Encoder::Nvenc), "NVENC on the NVIDIA laptop");
-        assert!(!probe(&ff, Encoder::Amf), "no AMD GPU here");
-        eprintln!("qsv: {}", probe(&ff, Encoder::Qsv));
+        assert!(probe(&ff, Encoder::X264, 30, 4500));
+        assert!(probe(&ff, Encoder::Nvenc, 30, 4500), "NVENC on the NVIDIA laptop");
+        assert!(!probe(&ff, Encoder::Amf, 30, 4500), "no AMD GPU here");
+        eprintln!("qsv: {}", probe(&ff, Encoder::Qsv, 30, 4500));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -93,10 +93,19 @@ struct Running {
     child: Arc<Mutex<Child>>,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    /// What it was started with, for a retry with x264.
+    cfg: StreamConfig,
+    ffmpeg: PathBuf,
+    /// Which start this is (a retry only replaces the run that failed).
+    generation: u64,
 }
 
 /// Starts/stops one ffmpeg RTMP publish at a time.
 pub struct StreamController {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     mixer: Mixer,
     slot: VideoSlot,
     active: Arc<AtomicBool>,
@@ -104,51 +113,90 @@ pub struct StreamController {
     running: Mutex<Option<Running>>,
     /// Used by the next `start` (a live stream keeps the one it began with).
     encoder: Mutex<Encoder>,
+    /// Set when a hardware encoder failed at stream start: x264 from then on
+    /// (for this session), and why.
+    x264_pinned: Mutex<Option<String>>,
+    generation: AtomicU64,
 }
 
 impl StreamController {
     pub fn new(mixer: Mixer) -> Self {
         StreamController {
-            mixer,
-            slot: VideoSlot::new(),
-            active: Arc::new(AtomicBool::new(false)),
-            state: Arc::new(Mutex::new(StreamState::Idle)),
-            running: Mutex::new(None),
-            encoder: Mutex::new(Encoder::X264),
+            inner: Arc::new(Inner {
+                mixer,
+                slot: VideoSlot::new(),
+                active: Arc::new(AtomicBool::new(false)),
+                state: Arc::new(Mutex::new(StreamState::Idle)),
+                running: Mutex::new(None),
+                encoder: Mutex::new(Encoder::X264),
+                x264_pinned: Mutex::new(None),
+                generation: AtomicU64::new(0),
+            }),
         }
     }
 
     pub fn sink(&self) -> StreamSink {
         StreamSink {
-            slot: self.slot.clone(),
-            active: self.active.clone(),
+            slot: self.inner.slot.clone(),
+            active: self.inner.active.clone(),
         }
     }
 
-    /// Encoder for the next stream start; a stream already live is not restarted.
+    /// Encoder for the next stream start; a stream already live is not
+    /// restarted. Ignored once a hardware encoder failed at stream start
+    /// (x264 is kept for the session).
     pub fn set_encoder(&self, e: Encoder) {
-        *self.encoder.lock() = e;
+        if self.inner.x264_pinned.lock().is_none() {
+            *self.inner.encoder.lock() = e;
+        }
+    }
+
+    /// Why the stream switched to x264 for this session (a hardware encoder
+    /// failed to open at stream start), if it did.
+    pub fn encoder_fallback(&self) -> Option<String> {
+        self.inner.x264_pinned.lock().clone()
     }
 
     pub fn state(&self) -> StreamState {
-        self.state.lock().clone()
+        self.inner.state.lock().clone()
     }
 
     pub fn start(&self, cfg: StreamConfig, ffmpeg: &Path) -> anyhow::Result<()> {
         self.stop();
-        let result = self.spawn(cfg, ffmpeg);
-        if let Err(e) = &result {
-            *self.state.lock() = StreamState::Error(format!("{e:#}"));
+        let mut running = self.inner.running.lock();
+        match Inner::launch(&self.inner, cfg, ffmpeg) {
+            Ok(r) => {
+                *running = Some(r);
+                Ok(())
+            }
+            Err(e) => {
+                *self.inner.state.lock() = StreamState::Error(format!("{e:#}"));
+                Err(e)
+            }
         }
-        result
     }
 
-    fn spawn(&self, mut cfg: StreamConfig, ffmpeg: &Path) -> anyhow::Result<()> {
+    pub fn stop(&self) {
+        let Some(r) = self.inner.running.lock().take() else {
+            return;
+        };
+        self.inner.halt(r);
+        *self.inner.state.lock() = StreamState::Idle;
+    }
+}
+
+impl Inner {
+    /// Start ffmpeg and its writer threads (the caller stores the result).
+    fn launch(
+        inner: &Arc<Inner>,
+        mut cfg: StreamConfig,
+        ffmpeg: &Path,
+    ) -> anyhow::Result<Running> {
         anyhow::ensure!(!cfg.url.trim().is_empty(), "enter the stream server URL");
         let listener = TcpListener::bind("127.0.0.1:0").context("opening the audio socket")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
-        cfg.encoder = *self.encoder.lock();
+        cfg.encoder = *inner.encoder.lock();
         let args = ffmpeg_args(&cfg, port);
         tracing::info!("starting ffmpeg: {}", redact(&args.join(" "), &cfg.key));
         let mut cmd = Command::new(ffmpeg);
@@ -171,9 +219,10 @@ impl StreamController {
         let stderr = child.stderr.take().context("ffmpeg stderr")?;
         let child = Arc::new(Mutex::new(child));
         let stop = Arc::new(AtomicBool::new(false));
-        *self.state.lock() = StreamState::Connecting;
-        self.mixer.reset();
-        self.active.store(true, Ordering::Relaxed);
+        let generation = inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        *inner.state.lock() = StreamState::Connecting;
+        inner.mixer.reset();
+        inner.active.store(true, Ordering::Relaxed);
         // One timeline for both writers: video frame 0 and audio sample 0 = t0.
         let t0 = Instant::now();
 
@@ -183,7 +232,7 @@ impl StreamController {
         {
             let skip = audio_skip.clone();
             let (slot, stop, spec) = (
-                self.slot.clone(),
+                inner.slot.clone(),
                 stop.clone(),
                 (cfg.width, cfg.height, cfg.fps, cfg.pix_fmt),
             );
@@ -192,29 +241,31 @@ impl StreamController {
             }));
         }
         {
-            let (mixer, stop, skip) = (self.mixer.clone(), stop.clone(), audio_skip.clone());
+            let (mixer, stop, skip) = (inner.mixer.clone(), stop.clone(), audio_skip.clone());
             threads.push(thread("p2c-stream-audio", move || {
                 write_audio(listener, mixer, stop, t0, skip)
             }));
         }
         {
-            let (state, stop, key) = (self.state.clone(), stop.clone(), cfg.key.clone());
+            let (state, stop, key) = (inner.state.clone(), stop.clone(), cfg.key.clone());
+            let (weak, encoder) = (Arc::downgrade(inner), cfg.encoder);
             threads.push(thread("p2c-stream-log", move || {
-                watch_stderr(stderr, state, stop, key)
+                let lines = watch_stderr(stderr, &state, &key);
+                ended(&lines, &state, &stop, encoder, weak, generation);
             }));
         }
-        *self.running.lock() = Some(Running {
+        Ok(Running {
             child,
             stop,
             threads,
-        });
-        Ok(())
+            cfg,
+            ffmpeg: ffmpeg.to_path_buf(),
+            generation,
+        })
     }
 
-    pub fn stop(&self) {
-        let Some(r) = self.running.lock().take() else {
-            return;
-        };
+    /// Stop a run: its threads end and ffmpeg is killed.
+    fn halt(&self, r: Running) {
         r.stop.store(true, Ordering::SeqCst);
         self.active.store(false, Ordering::Relaxed);
         {
@@ -225,7 +276,25 @@ impl StreamController {
         for t in r.threads {
             let _ = t.join();
         }
-        *self.state.lock() = StreamState::Idle;
+    }
+
+    /// The hardware encoder of run `generation` failed to open: start the
+    /// same stream again with x264 and keep x264 for the session. Nothing
+    /// happens if the stream was stopped or restarted meanwhile.
+    fn retry_with_x264(self: Arc<Inner>, generation: u64, reason: String) {
+        let mut running = self.running.lock();
+        let Some(old) = running.take_if(|r| r.generation == generation) else {
+            return;
+        };
+        let (cfg, ffmpeg) = (old.cfg.clone(), old.ffmpeg.clone());
+        self.halt(old);
+        tracing::warn!("{reason}; streaming with x264 from now on");
+        *self.x264_pinned.lock() = Some(reason);
+        *self.encoder.lock() = Encoder::X264;
+        match Inner::launch(&self, cfg, &ffmpeg) {
+            Ok(r) => *running = Some(r),
+            Err(e) => *self.state.lock() = StreamState::Error(format!("{e:#}")),
+        }
     }
 }
 
@@ -370,14 +439,15 @@ fn write_audio(
 }
 
 /// Track ffmpeg's progress: "frame=" stats mean we're live; exit means error.
+/// Returns ffmpeg's last log lines (redacted) once it has exited.
 fn watch_stderr(
     stderr: std::process::ChildStderr,
-    state: Arc<Mutex<StreamState>>,
-    stop: Arc<AtomicBool>,
-    key: String,
-) {
+    state: &Mutex<StreamState>,
+    key: &str,
+) -> Vec<String> {
+    const KEEP: usize = 20;
     let mut reader = BufReader::new(stderr);
-    let mut last = String::new();
+    let mut lines = std::collections::VecDeque::with_capacity(KEEP + 1);
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -386,7 +456,7 @@ fn watch_stderr(
         if n == 0 {
             break;
         }
-        let line = redact(String::from_utf8_lossy(&buf).trim(), &key);
+        let line = redact(String::from_utf8_lossy(&buf).trim(), key);
         if line.is_empty() {
             continue;
         }
@@ -398,18 +468,50 @@ fn watch_stderr(
             }
         } else {
             tracing::debug!(target: "ffmpeg", "{line}");
-            last = line;
+            lines.push_back(line);
+            if lines.len() > KEEP {
+                lines.pop_front();
+            }
         }
     }
-    if !stop.load(Ordering::SeqCst) {
-        let why = if last.is_empty() {
-            "ffmpeg exited".to_string()
-        } else {
-            last
-        };
-        tracing::warn!("stream ended: {why}");
-        *state.lock() = StreamState::Error(why);
+    lines.into()
+}
+
+/// ffmpeg exited (stderr closed). Unless we stopped it: a hardware encoder
+/// that failed to open before the stream went live is retried once with
+/// x264 (on another thread: the retry joins this one); anything else is
+/// shown as the stream's error.
+fn ended(
+    lines: &[String],
+    state: &Mutex<StreamState>,
+    stop: &AtomicBool,
+    encoder: Encoder,
+    inner: std::sync::Weak<Inner>,
+    generation: u64,
+) {
+    if stop.load(Ordering::SeqCst) {
+        return;
     }
+    let connecting = *state.lock() == StreamState::Connecting;
+    if crate::retry_with_x264(encoder, connecting, lines) {
+        if let Some(inner) = inner.upgrade() {
+            let detail = lines.last().map(String::as_str).unwrap_or_default();
+            tracing::warn!(%encoder, "the {encoder} encoder failed to open: {detail}");
+            let reason = format!("{encoder} failed at stream start");
+            let spawned = std::thread::Builder::new()
+                .name("p2c-stream-retry".into())
+                .spawn(move || inner.retry_with_x264(generation, reason));
+            if spawned.is_ok() {
+                return;
+            }
+        }
+    }
+    let why = lines
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "ffmpeg exited".to_string());
+    tracing::warn!("stream ended: {why}");
+    *state.lock() = StreamState::Error(why);
 }
 
 fn read_until_any(r: &mut impl BufRead, out: &mut Vec<u8>) -> usize {
@@ -661,6 +763,110 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("ffmpeg"), "{err:#}");
         assert!(matches!(c.state(), StreamState::Error(_)));
+    }
+
+    /// A fake ffmpeg that appends its arguments to `log`, then fails: with
+    /// "No capable devices found" for h264_nvenc, else with a network error.
+    fn fake_ffmpeg(dir: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let p = dir.join("ffmpeg.cmd");
+            let script = format!(
+                "@echo off\r\n\
+                 echo %* >> \"{}\"\r\n\
+                 echo %* | findstr /c:\"h264_nvenc\" >nul\r\n\
+                 if not errorlevel 1 (\r\n\
+                 echo [h264_nvenc @ 0001] No capable devices found 1>&2\r\n\
+                 echo Error while opening encoder for output stream #0:0 1>&2\r\n\
+                 exit /b 1\r\n\
+                 )\r\n\
+                 echo [tcp @ 0001] Connection to tcp://127.0.0.1:1 failed: Connection refused 1>&2\r\n\
+                 exit /b 1\r\n",
+                log.display()
+            );
+            std::fs::write(&p, script).unwrap();
+            p
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("ffmpeg");
+            let script = format!(
+                "#!/bin/sh\n\
+                 echo \"$*\" >> '{}'\n\
+                 case \"$*\" in *h264_nvenc*)\n\
+                 echo '[h264_nvenc @ 0x1] No capable devices found' >&2\n\
+                 echo 'Error while opening encoder for output stream #0:0' >&2\n\
+                 exit 1;;\n\
+                 esac\n\
+                 echo '[tcp @ 0x1] Connection to tcp://127.0.0.1:1 failed: Connection refused' >&2\n\
+                 exit 1\n",
+                log.display()
+            );
+            std::fs::write(&p, script).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        }
+    }
+
+    fn wait_for_error(c: &StreamController) -> String {
+        let start = Instant::now();
+        loop {
+            if let StreamState::Error(e) = c.state() {
+                return e;
+            }
+            assert!(start.elapsed() < Duration::from_secs(15), "{}", c.state());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn hardware_encoder_failing_at_start_is_retried_once_with_x264() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("args.log");
+        let ffmpeg = fake_ffmpeg(dir.path(), &log);
+        let c = StreamController::new(p2c_audio::Mixer::new(
+            p2c_core::AudioRing::new(100),
+            p2c_core::AudioRing::new(100),
+            p2c_audio::MixSettings::default(),
+        ));
+        let cfg = crate::StreamConfig {
+            url: "rtmp://127.0.0.1:1/live".into(),
+            key: "k".into(),
+            width: 64,
+            height: 36,
+            fps: 30,
+            video_kbps: 500,
+            pix_fmt: "bgra",
+            encoder: Encoder::X264,
+        };
+        let runs = || -> Vec<String> {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(String::from)
+                .collect()
+        };
+        c.set_encoder(Encoder::Nvenc);
+        assert_eq!(c.encoder_fallback(), None);
+        c.start(cfg.clone(), &ffmpeg).unwrap();
+        // NVENC fails to open -> x264 -> fails on the network: shown as is.
+        let err = wait_for_error(&c);
+        assert!(err.contains("Connection refused"), "{err}");
+        let r = runs();
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r[0].contains("h264_nvenc"), "{}", r[0]);
+        assert!(r[1].contains("libx264"), "{}", r[1]);
+        let why = c.encoder_fallback().expect("x264 pinned");
+        assert!(why.contains("NVENC"), "{why}");
+        // Pinned for the session: the probe's late answer doesn't undo it.
+        c.set_encoder(Encoder::Nvenc);
+        c.start(cfg, &ffmpeg).unwrap();
+        wait_for_error(&c);
+        let r = runs();
+        assert_eq!(r.len(), 3, "{r:?}");
+        assert!(r[2].contains("libx264"), "{}", r[2]);
+        c.stop();
     }
 
     #[test]

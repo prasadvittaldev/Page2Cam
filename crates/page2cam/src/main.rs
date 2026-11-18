@@ -340,8 +340,14 @@ fn run() -> anyhow::Result<()> {
     });
 
     // Applies to the next stream start; a live stream is not restarted.
+    // Hardware encoding only in GPU mode: CPU (compatibility) is x264 as in
+    // 0.3.0. The probe uses the stream's own encoder options.
     {
-        let vendor = cutout_adapter.as_ref().map(|a| a.vendor_id);
+        let vendor = match &gpu_choice {
+            p2c_d3d::GpuChoice::Gpu(a) => Some(a.vendor_id),
+            p2c_d3d::GpuChoice::Cpu { .. } => None,
+        };
+        let (fps, kbps) = (cfg.fps, cfg.video_kbps);
         let (app, status) = (app.clone(), encoder_status.clone());
         let spawned = std::thread::Builder::new()
             .name("p2c-encoder-probe".into())
@@ -349,7 +355,7 @@ fn run() -> anyhow::Result<()> {
                 let found = p2c_stream::find_ffmpeg().and_then(|ff| {
                     p2c_stream::candidates(vendor)
                         .into_iter()
-                        .find(|&e| p2c_stream::probe(&ff, e))
+                        .find(|&e| p2c_stream::probe(&ff, e, fps, kbps))
                 });
                 let e = found.unwrap_or(p2c_stream::Encoder::X264);
                 tracing::info!("stream encoder: {e}");
