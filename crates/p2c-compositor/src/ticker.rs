@@ -3,15 +3,17 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use p2c_core::{Frame, FrameSlot};
+use p2c_core::{DurationStats, Frame, FrameSlot, MaskSlot, Slot};
 
 use parking_lot::RwLock;
 
-use crate::{compose, PipLayout};
+use crate::{Compositor, Pip, PipLayout};
 
 const WEBCAM_STALE_AFTER: Duration = Duration::from_secs(1);
+/// How often the ticker's timing is written to the log.
+const LOG_EVERY: Duration = Duration::from_secs(30);
 
-/// Tracks when a slot last changed; frames older than 1 s count as absent.
+/// Tracks when a slot last changed; values older than 1 s count as absent.
 #[derive(Default)]
 struct Freshness {
     seq: u64,
@@ -19,7 +21,7 @@ struct Freshness {
 }
 
 impl Freshness {
-    fn latest(&mut self, slot: &FrameSlot) -> Option<Arc<Frame>> {
+    fn latest<T>(&mut self, slot: &Slot<T>) -> Option<Arc<T>> {
         let seq = slot.seq();
         if seq != self.seq {
             self.seq = seq;
@@ -52,13 +54,14 @@ pub struct Ticker {
 
 impl Ticker {
     /// `webcam`: optional PIP source; a webcam frame not updated for 1 s is treated
-    /// as absent. `matte`: the webcam with the cut-out mask in its alpha byte,
-    /// used by cut-out styles (same 1 s staleness). `layout` may be changed live.
+    /// as absent. `mask`: the latest cut-out mask, used by cut-out styles (same
+    /// 1 s staleness; without a fresh one the webcam is drawn as a box, never a
+    /// frozen cut-out). `layout` may be changed live.
     pub fn spawn(
         spec: OutputSpec,
         page: FrameSlot,
         webcam: Option<FrameSlot>,
-        matte: Option<FrameSlot>,
+        mask: Option<MaskSlot>,
         layout: Arc<RwLock<PipLayout>>,
         mut sinks: Vec<Box<dyn FrameSink>>,
     ) -> Ticker {
@@ -69,34 +72,32 @@ impl Ticker {
             .spawn(move || {
                 let period = Duration::from_secs_f64(1.0 / spec.fps.max(1) as f64);
                 let mut out = Frame::new_black(spec.width, spec.height);
+                let mut compositor = Compositor::new();
                 let mut last_warn: Vec<Option<Instant>> = vec![None; sinks.len()];
                 let start = Instant::now();
                 let mut n: u32 = 0;
                 let mut cam_fresh = Freshness::default();
-                let mut matte_fresh = Freshness::default();
+                let mut mask_fresh = Freshness::default();
+                let (mut compose_t, mut sinks_t) =
+                    (DurationStats::default(), DurationStats::default());
+                let (mut ticks, mut redrawn, mut skipped) = (0u32, 0u32, 0u32);
+                let mut last_log = Instant::now();
                 while !stop2.load(Ordering::Relaxed) {
+                    let t0 = Instant::now();
                     let latest = page.latest();
-                    let mut layout = *layout.read();
+                    let layout = *layout.read();
                     let cam = webcam.as_ref().and_then(|s| cam_fresh.latest(s));
-                    let matted = matte.as_ref().and_then(|s| matte_fresh.latest(s));
-                    // Cut-out styles need a fresh matte; without one, show the raw
-                    // webcam as a box (never a frozen cut-out).
-                    let cam = if layout.style.is_cutout() {
-                        match matted {
-                            Some(m) => Some(m),
-                            None => {
-                                layout.style = crate::OverlayStyle::Box;
-                                cam
-                            }
-                        }
-                    } else {
-                        cam
-                    };
-                    compose(
-                        latest.as_deref(),
-                        cam.as_deref().map(|c| (c, &layout)),
-                        &mut out,
-                    );
+                    let m = mask.as_ref().and_then(|s| mask_fresh.latest(s));
+                    let pip = cam.as_ref().map(|cam| Pip {
+                        cam,
+                        mask: m.as_ref(),
+                        layout: &layout,
+                    });
+                    if compositor.compose(latest.as_ref(), pip, &mut out) {
+                        redrawn += 1;
+                    }
+                    let t1 = Instant::now();
+                    compose_t.record(t1 - t0);
                     for (i, sink) in sinks.iter_mut().enumerate() {
                         if let Err(e) = sink.push(&out) {
                             let due =
@@ -109,12 +110,31 @@ impl Ticker {
                     }
                     // Absolute deadlines avoid drift; if we fell behind, skip missed ticks.
                     n += 1;
+                    ticks += 1;
                     let now = Instant::now();
+                    sinks_t.record(now - t1);
                     let mut deadline = start + period * n;
                     if deadline < now {
-                        n = (now.duration_since(start).as_secs_f64() / period.as_secs_f64()) as u32
+                        let next = (now.duration_since(start).as_secs_f64() / period.as_secs_f64())
+                            as u32
                             + 1;
+                        skipped += next - n;
+                        n = next;
                         deadline = start + period * n;
+                    }
+                    if last_log.elapsed() >= LOG_EVERY {
+                        if let (Some(c), Some(s)) =
+                            (compose_t.take_summary(), sinks_t.take_summary())
+                        {
+                            tracing::info!(
+                                ticks,
+                                redrawn,
+                                skipped,
+                                "output: compose {c}; sinks {s}"
+                            );
+                        }
+                        (ticks, redrawn, skipped) = (0, 0, 0);
+                        last_log = Instant::now();
                     }
                     std::thread::sleep(deadline - now);
                 }
@@ -132,7 +152,7 @@ impl Ticker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p2c_core::{Frame, FrameSlot};
+    use p2c_core::{Frame, FrameSlot, Mask, MaskSlot};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -243,7 +263,7 @@ mod tests {
     /// the colours seen at (55, 30) after `after_ms`.
     fn run_sampled(
         webcam: Option<FrameSlot>,
-        matte: Option<FrameSlot>,
+        matte: Option<MaskSlot>,
         fill: impl Fn() + Send + 'static,
         ms: u64,
         after_ms: u64,
@@ -278,34 +298,35 @@ mod tests {
     }
 
     #[test]
-    fn ticker_cutout_uses_matte() {
+    fn ticker_cutout_uses_mask() {
+        // An all-room mask: the person is cut away and the page shows through.
         let cam = FrameSlot::new();
-        let matte = FrameSlot::new();
+        let matte = MaskSlot::new();
         let (c, m) = (cam.clone(), matte.clone());
         let seen = run_sampled(
             Some(cam),
             Some(matte),
             move || {
                 c.put(Frame::from_bgra(16, 9, GREEN.repeat(16 * 9)).unwrap());
-                m.put(Frame::from_bgra(16, 9, BLUE.repeat(16 * 9)).unwrap());
+                m.put(Mask::new(4, 2, vec![0; 8]).unwrap());
             },
             400,
             200,
         );
         assert!(
-            !seen.is_empty() && seen.iter().all(|p| *p == BLUE),
+            !seen.is_empty() && seen.iter().all(|p| *p == RED),
             "{seen:?}"
         );
     }
 
     #[test]
-    fn ticker_cutout_falls_back_to_box_when_matte_stale() {
+    fn ticker_cutout_falls_back_to_box_when_mask_stale() {
         // Raw webcam has alpha 0: only an opaque Box draw makes it visible.
         let cam = FrameSlot::new();
         let c = cam.clone();
         let seen = run_sampled(
             Some(cam),
-            Some(FrameSlot::new()),
+            Some(MaskSlot::new()),
             move || c.put(Frame::from_bgra(16, 9, BLUE_CLEAR.repeat(16 * 9)).unwrap()),
             400,
             200,
@@ -319,9 +340,9 @@ mod tests {
     #[test]
     fn ticker_cutout_hides_when_both_stale() {
         let cam = FrameSlot::new();
-        let matte = FrameSlot::new();
+        let matte = MaskSlot::new();
         cam.put(Frame::from_bgra(16, 9, GREEN.repeat(16 * 9)).unwrap());
-        matte.put(Frame::from_bgra(16, 9, BLUE.repeat(16 * 9)).unwrap());
+        matte.put(Mask::new(4, 2, vec![255; 8]).unwrap());
         let seen = run_sampled(Some(cam), Some(matte), || {}, 1600, 1400);
         assert!(
             !seen.is_empty() && seen.iter().all(|p| *p == RED),

@@ -1,9 +1,12 @@
 //! Webcam cut-out: runs a person-segmentation model on webcam frames and
-//! writes the mask into each frame's alpha byte (see `tensor::write_alpha`).
+//! publishes a cleaned-up person mask (see `post`).
 use std::path::{Path, PathBuf};
 
 pub mod engine;
+#[cfg(windows)]
+pub mod gpu;
 pub mod policy;
+pub mod post;
 pub mod runtime;
 pub mod segmenter;
 pub mod tensor;

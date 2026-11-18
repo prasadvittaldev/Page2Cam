@@ -77,7 +77,8 @@ const FAST_H: u32 = 144;
 impl FastEngine {
     pub fn open(dir: &Path) -> anyhow::Result<FastEngine> {
         // Tiny model: the CPU is fast enough and avoids GPU upload overhead.
-        let (session, device) = runtime::session(&dir.join(SELFIE_MODEL), false)?;
+        let (session, device) =
+            runtime::session(&dir.join(SELFIE_MODEL), false, runtime::ModelSize::Small)?;
         Ok(FastEngine { session, device })
     }
 }
@@ -120,7 +121,8 @@ fn empty_rec() -> [(Vec<i64>, Vec<f32>); 4] {
 
 impl RvmEngine {
     pub fn open(dir: &Path) -> anyhow::Result<RvmEngine> {
-        let (session, device) = runtime::session(&dir.join(RVM_MODEL), true)?;
+        let (session, device) =
+            runtime::session(&dir.join(RVM_MODEL), true, runtime::ModelSize::Large)?;
         Ok(RvmEngine {
             session,
             device,

@@ -1,16 +1,18 @@
-//! The cut-out thread: latest webcam frame -> engine -> same frame with the
-//! mask in its alpha byte, published to the `out` slot.
+//! The cut-out thread: latest webcam frame -> engine -> cleaned-up person
+//! mask, published to the `out` slot. The compositor combines the newest mask
+//! with the newest webcam frame, so the person moves at camera speed even
+//! when masks come more slowly.
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use p2c_core::FrameSlot;
+use p2c_core::{DurationStats, FrameSlot, MaskSlot};
 use parking_lot::Mutex;
 
 use crate::engine::{Engine, EngineChoice};
 use crate::policy::FallbackPolicy;
-use crate::tensor::write_alpha;
+use crate::post::{profile, to_mask, Smoother};
 use crate::Device;
 
 /// Opens an engine; the real one is [`crate::open_engine`].
@@ -54,7 +56,7 @@ impl Segmenter {
     pub fn spawn(
         opener: Opener,
         webcam: FrameSlot,
-        out: FrameSlot,
+        out: MaskSlot,
         choice: EngineChoice,
     ) -> Segmenter {
         let shared = Arc::new(Shared {
@@ -127,8 +129,15 @@ const LOG_EVERY: Duration = Duration::from_secs(30);
 struct Worker {
     opener: Opener,
     webcam: FrameSlot,
-    out: FrameSlot,
+    out: MaskSlot,
     engine: Option<Box<dyn Engine>>,
+    smoother: Option<Smoother>,
+    /// Engine time (resize + model), mask clean-up time, and time between
+    /// published masks, for the periodic log line.
+    infer_t: DurationStats,
+    post_t: DurationStats,
+    cycle_t: DurationStats,
+    last_mask_at: Option<Instant>,
     /// Engine we want running: the operator's choice, or Fast after a fallback.
     target: EngineChoice,
     active: Option<EngineChoice>,
@@ -153,12 +162,17 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(opener: Opener, webcam: FrameSlot, out: FrameSlot, choice: EngineChoice) -> Worker {
+    fn new(opener: Opener, webcam: FrameSlot, out: MaskSlot, choice: EngineChoice) -> Worker {
         Worker {
             opener,
             webcam,
             out,
             engine: None,
+            smoother: None,
+            infer_t: DurationStats::default(),
+            post_t: DurationStats::default(),
+            cycle_t: DurationStats::default(),
+            last_mask_at: None,
             target: choice,
             active: None,
             device: None,
@@ -236,6 +250,7 @@ impl Worker {
                     tracing::info!(engine = %self.target, device = %e.device(), "cut-out engine ready");
                     self.device = Some(e.device());
                     self.engine = Some(e);
+                    self.smoother = profile(self.target).smoothing.map(Smoother::new);
                     self.active = Some(self.target);
                     self.open_failed_at = None;
                     if self.note.starts_with("cut-out unavailable") {
@@ -274,6 +289,9 @@ impl Worker {
         let size = (frame.width, frame.height);
         if self.last_size.is_some_and(|s| s != size) || self.pending_reset {
             engine.reset();
+            if let Some(s) = &mut self.smoother {
+                s.reset();
+            }
             self.pending_reset = false;
         }
         self.last_size = Some(size);
@@ -281,11 +299,26 @@ impl Worker {
         let t = Instant::now();
         let result = engine.infer(&frame);
         let took = t.elapsed();
+        self.infer_t.record(took);
+        let edge = profile(self.active.unwrap_or(self.target)).edge;
+        let smoother = &mut self.smoother;
+        let result = result.and_then(|(values, mw, mh)| {
+            let t = Instant::now();
+            let values = match smoother {
+                Some(s) => s.apply(&values, mw, mh),
+                None => values,
+            };
+            let m = to_mask(&values, mw, mh, edge);
+            self.post_t.record(t.elapsed());
+            m
+        });
         match result {
-            Ok((mask, mw, mh)) => {
-                let mut f = (*frame).clone();
-                write_alpha(&mut f, &mask, mw, mh);
-                self.out.put(f);
+            Ok(mask) => {
+                self.out.put(mask);
+                let now = Instant::now();
+                if let Some(prev) = self.last_mask_at.replace(now) {
+                    self.cycle_t.record(now - prev);
+                }
                 self.latency = took;
                 self.window_count += 1;
                 self.errors_in_row = 0;
@@ -337,13 +370,20 @@ impl Worker {
         }
         if self.last_rate_log.elapsed() >= LOG_EVERY {
             self.last_rate_log = Instant::now();
+            let fmt = |s: Option<p2c_core::Summary>| s.map_or("-".to_string(), |s| s.to_string());
+            let (infer, post, cycle) = (
+                fmt(self.infer_t.take_summary()),
+                fmt(self.post_t.take_summary()),
+                fmt(self.cycle_t.take_summary()),
+            );
             if let (Some(a), Some(d)) = (self.active, self.device) {
                 tracing::info!(
                     engine = %a,
                     device = %d,
                     masks_per_sec = format!("{:.1}", self.masks_per_sec),
                     latency_ms = self.latency.as_millis() as u64,
-                    "cut-out running"
+                    cam_ms = self.cam_interval.as_millis() as u64,
+                    "cut-out running: model {infer}; clean-up {post}; between masks {cycle}"
                 );
             }
         }
@@ -364,7 +404,7 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p2c_core::Frame;
+    use p2c_core::{Frame, MaskSlot};
     use std::sync::atomic::AtomicUsize;
 
     #[derive(Clone, Default)]
@@ -443,8 +483,8 @@ mod tests {
     }
 
     #[test]
-    fn segmenter_writes_alpha_into_out_slot() {
-        let (cam, out) = (FrameSlot::new(), FrameSlot::new());
+    fn segmenter_publishes_mask() {
+        let (cam, out) = (FrameSlot::new(), MaskSlot::new());
         let _f = Feeder::start(cam.clone(), 64, 36);
         let s = Segmenter::spawn(
             opener(1, 1, Counts::default()),
@@ -454,14 +494,11 @@ mod tests {
         );
         s.set_enabled(true);
         ms(400);
-        let f = out.latest().expect("no matte published");
+        let m = out.latest().expect("no mask published");
         assert!(out.seq() > 0);
-        assert!(f
-            .data
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .all(|p| p[3] == 255 && p[0] == 9));
+        assert_eq!((m.width, m.height), (2, 2));
+        assert!(m.data.iter().all(|a| *a == 255));
+        assert_eq!(m.edge, crate::post::profile(EngineChoice::Quality).edge);
         let st = s.status();
         assert_eq!(st.active, Some(EngineChoice::Quality));
         assert!(st.masks_per_sec >= 0.0);
@@ -470,7 +507,7 @@ mod tests {
 
     #[test]
     fn segmenter_auto_falls_back_and_notes_it() {
-        let (cam, out) = (FrameSlot::new(), FrameSlot::new());
+        let (cam, out) = (FrameSlot::new(), MaskSlot::new());
         let _f = Feeder::start(cam.clone(), 64, 36);
         let s = Segmenter::spawn(
             opener(120, 1, Counts::default()),
@@ -494,7 +531,7 @@ mod tests {
     #[test]
     fn segmenter_disabled_runs_no_inference() {
         let counts = Counts::default();
-        let (cam, out) = (FrameSlot::new(), FrameSlot::new());
+        let (cam, out) = (FrameSlot::new(), MaskSlot::new());
         let _f = Feeder::start(cam.clone(), 64, 36);
         let s = Segmenter::spawn(opener(1, 1, counts.clone()), cam, out, EngineChoice::Fast);
         ms(300);
@@ -514,7 +551,7 @@ mod tests {
     #[test]
     fn segmenter_resets_on_switch_and_size_change() {
         let counts = Counts::default();
-        let (cam, out) = (FrameSlot::new(), FrameSlot::new());
+        let (cam, out) = (FrameSlot::new(), MaskSlot::new());
         let s = Segmenter::spawn(
             opener(1, 1, counts.clone()),
             cam.clone(),
@@ -549,7 +586,7 @@ mod tests {
     #[test]
     fn segmenter_resets_when_reenabled_or_after_stall() {
         let counts = Counts::default();
-        let (cam, out) = (FrameSlot::new(), FrameSlot::new());
+        let (cam, out) = (FrameSlot::new(), MaskSlot::new());
         let s = Segmenter::spawn(
             opener(1, 1, counts.clone()),
             cam.clone(),
@@ -593,7 +630,7 @@ mod tests {
                 fail: true,
             }) as Box<dyn Engine>)
         });
-        let (cam, out) = (FrameSlot::new(), FrameSlot::new());
+        let (cam, out) = (FrameSlot::new(), MaskSlot::new());
         let _f = Feeder::start(cam.clone(), 64, 36);
         let s = Segmenter::spawn(opener, cam, out, EngineChoice::Quality);
         s.set_enabled(true);
@@ -612,7 +649,7 @@ mod tests {
 
     #[test]
     fn segmenter_open_error_reported() {
-        let (cam, out) = (FrameSlot::new(), FrameSlot::new());
+        let (cam, out) = (FrameSlot::new(), MaskSlot::new());
         let _f = Feeder::start(cam.clone(), 64, 36);
         let s = Segmenter::spawn(
             Box::new(|_| anyhow::bail!("model missing: x.onnx")),
@@ -631,7 +668,7 @@ mod tests {
 
     #[test]
     fn segmenter_handles_640x480() {
-        let (cam, out) = (FrameSlot::new(), FrameSlot::new());
+        let (cam, out) = (FrameSlot::new(), MaskSlot::new());
         let _f = Feeder::start(cam.clone(), 640, 480);
         let s = Segmenter::spawn(
             opener(1, 1, Counts::default()),
@@ -641,9 +678,9 @@ mod tests {
         );
         s.set_enabled(true);
         ms(400);
-        let f = out.latest().expect("no matte");
-        assert_eq!((f.width, f.height), (640, 480));
-        assert_eq!(f.data[640 * 480 * 4 - 1], 255);
+        let m = out.latest().expect("no mask");
+        assert_eq!(m.data, vec![255; 4]);
+        assert_eq!(m.edge, crate::post::profile(EngineChoice::Fast).edge);
         s.stop();
     }
 }

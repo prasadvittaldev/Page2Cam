@@ -14,6 +14,7 @@ ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dy
 
 [target.'cfg(windows)'.dependencies]
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "std", "ndarray", "tracing", "api-24", "directml"] }
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

@@ -9,7 +9,8 @@ use ort::session::Session;
 
 static ENV: std::sync::OnceLock<Environment> = std::sync::OnceLock::new();
 
-fn env() -> anyhow::Result<&'static Environment> {
+/// The environment created by [`init`].
+pub fn env() -> anyhow::Result<&'static Environment> {
     ENV.get()
         .ok_or_else(|| anyhow::anyhow!("ONNX Runtime was not loaded"))
 }
@@ -60,14 +61,45 @@ pub fn init(lib_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Open `model`. With `prefer_gpu` on Windows, DirectML is tried first and
-/// the CPU is used if that fails. Returns the device actually in use.
-pub fn session(model: &Path, prefer_gpu: bool) -> anyhow::Result<(Session, Device)> {
+/// How much work one inference is, for sizing the CPU thread pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelSize {
+    /// About a millisecond (MediaPipe selfie): threads cost more than they save.
+    Small,
+    /// Tens of milliseconds on the CPU (RVM).
+    Large,
+}
+
+/// Threads for one CPU inference. ONNX Runtime's default is one per core,
+/// spinning while idle: on a 20-core laptop that burnt ~6 cores for a 1 ms
+/// model and slowed it down (threads waiting on each other and on E-cores),
+/// while competing with the browser and the compositor.
+pub fn cpu_threads(size: ModelSize, available: usize) -> usize {
+    match size {
+        ModelSize::Small => available.clamp(1, 2),
+        ModelSize::Large => (available / 2).clamp(1, 4),
+    }
+}
+
+/// Open `model`. With `prefer_gpu` on Windows, DirectML is tried first (on
+/// the high-performance GPU) and the CPU is used if that fails. Returns the
+/// device actually in use.
+pub fn session(
+    model: &Path,
+    prefer_gpu: bool,
+    size: ModelSize,
+) -> anyhow::Result<(Session, Device)> {
     anyhow::ensure!(model.is_file(), "model missing: {}", model.display());
     #[cfg(windows)]
     if prefer_gpu {
         // DirectML requires memory pattern and parallel execution off
         // ("or an error is returned"), and must be the EP we asked for.
+        // Run on the high-performance GPU, named by index (see `gpu`).
+        let gpu = crate::gpu::high_performance_adapter();
+        let ep = match &gpu {
+            Some(a) => ort::ep::DirectML::default().with_device_id(a.index as i32),
+            None => ort::ep::DirectML::default(),
+        };
         let dml = Session::builder(env()?)
             .map_err(anyhow::Error::from)
             .and_then(|b| {
@@ -79,27 +111,58 @@ pub fn session(model: &Path, prefer_gpu: bool) -> anyhow::Result<(Session, Devic
                     .map_err(|e| anyhow::anyhow!("{e}"))
             })
             .and_then(|b| {
-                b.with_execution_providers([ort::ep::DirectML::default()
-                    .build()
-                    .error_on_failure()])
+                b.with_execution_providers([ep.build().error_on_failure()])
                     .map_err(|e| anyhow::anyhow!("{e}"))
             })
             .and_then(|mut b| b.commit_from_file(model).map_err(anyhow::Error::from));
         match dml {
             Ok(s) => {
-                tracing::info!(model = %model.display(), "running on the GPU (DirectML)");
+                let gpu = gpu.map_or("DirectML default adapter".to_string(), |a| {
+                    format!("{} (adapter {})", a.name, a.index)
+                });
+                tracing::info!(model = %model.display(), %gpu, "running on the GPU (DirectML)");
                 return Ok((s, Device::DirectMl));
             }
             Err(e) => tracing::warn!("DirectML unavailable, using CPU: {e:#}"),
         }
     }
     let _ = prefer_gpu;
+    let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = cpu_threads(size, available);
     // CPU on purpose: stop ONNX Runtime's automatic device policy from
     // picking another device behind our back (so the status stays truthful).
     let s = Session::builder(env()?)?
         .with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU)
         .map_err(|e| anyhow::anyhow!("{e}"))?
+        .with_intra_threads(threads)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .with_inter_threads(1)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        // Idle threads sleep instead of spinning on a core between frames.
+        .with_intra_op_spinning(false)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .with_inter_op_spinning(false)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
         .commit_from_file(model)
         .with_context(|| format!("opening {}", model.display()))?;
+    tracing::info!(model = %model.display(), threads, "running on the CPU");
     Ok((s, Device::Cpu))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_models_use_few_threads() {
+        assert_eq!(cpu_threads(ModelSize::Small, 28), 2);
+        assert_eq!(cpu_threads(ModelSize::Small, 1), 1);
+    }
+
+    #[test]
+    fn large_models_use_some_cores_but_not_all() {
+        assert_eq!(cpu_threads(ModelSize::Large, 28), 4);
+        assert_eq!(cpu_threads(ModelSize::Large, 6), 3);
+        assert_eq!(cpu_threads(ModelSize::Large, 1), 1);
+    }
 }

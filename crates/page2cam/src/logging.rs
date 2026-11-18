@@ -21,7 +21,8 @@ pub fn init() -> Option<PathBuf> {
 }
 
 fn init_inner() -> Option<PathBuf> {
-    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    // ONNX Runtime logs ~300 info lines per model load; keep its warnings only.
+    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,ort=warn".into());
     let path = log_path();
     let file = path.as_ref().and_then(|p| {
         std::fs::OpenOptions::new()

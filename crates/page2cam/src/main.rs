@@ -180,9 +180,9 @@ fn run() -> anyhow::Result<()> {
     };
     let webcam_slot = webcam.as_ref().map(|(slot, _, _)| slot.clone());
 
-    // Cut-out: segmentation runs on its own thread and publishes the webcam
-    // frame with the person mask in its alpha byte.
-    let matte = FrameSlot::new();
+    // Cut-out: segmentation runs on its own thread and publishes the person
+    // mask; the ticker combines it with the newest webcam frame.
+    let matte = p2c_core::MaskSlot::new();
     let segmenter = webcam_slot
         .as_ref()
         .map(|cam| start_segmenter(&cfg, cam.clone(), matte.clone()));
@@ -393,7 +393,11 @@ fn start_fake_webcam(img: &Path) -> Option<(FrameSlot, WebcamSource, String)> {
 
 /// Load ONNX Runtime and start the cut-out thread (disabled until a cut-out
 /// style is chosen). If the runtime can't load, the thread reports why.
-fn start_segmenter(cfg: &Config, webcam: FrameSlot, matte: FrameSlot) -> p2c_segment::Segmenter {
+fn start_segmenter(
+    cfg: &Config,
+    webcam: FrameSlot,
+    matte: p2c_core::MaskSlot,
+) -> p2c_segment::Segmenter {
     let runtime_dir = p2c_segment::runtime_dir();
     let models = p2c_segment::models_dir();
     let loaded = p2c_segment::runtime::init(&runtime_dir).map_err(|e| format!("{e:#}"));
