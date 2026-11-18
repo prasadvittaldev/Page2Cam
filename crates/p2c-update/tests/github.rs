@@ -25,3 +25,22 @@ fn packaged_checksums_verify() {
     let want = p2c_update::expected_hash(&sums, &setup).unwrap();
     assert_eq!(p2c_update::file_sha256(&dist.join(&setup)).unwrap(), want);
 }
+
+/// The live latest release is found, its URLs pass the checks, and its signed
+/// checksums verify with the key built into the app.
+#[test]
+#[ignore = "network"]
+fn live_release_verifies() {
+    let r = p2c_update::fetch_latest().unwrap().expect("latest release has an installer");
+    let get = |u: &str| {
+        let out = std::process::Command::new("curl")
+            .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--url", u])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let sums = get(&r.sums_url);
+    p2c_update::verify_sums(&sums, &get(&r.sig_url), p2c_update::RELEASE_PUBLIC_KEY).unwrap();
+    assert!(p2c_update::expected_hash(&sums, &r.setup_name).is_some());
+    println!("{} verified: {}", r.version, r.setup_url);
+}
