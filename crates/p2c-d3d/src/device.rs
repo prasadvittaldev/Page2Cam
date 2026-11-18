@@ -382,6 +382,36 @@ impl Gpu {
         Ok(())
     }
 
+    /// Upload one byte per pixel (e.g. a cut-out mask) to a new shader-readable
+    /// R8 texture.
+    pub fn upload_r8(&self, w: u32, h: u32, data: &[u8]) -> Result<Texture> {
+        if w == 0 || h == 0 || data.len() != w as usize * h as usize {
+            bail!("R8 buffer of {} bytes does not match {w}x{h}", data.len());
+        }
+        self.texture_with(
+            w,
+            h,
+            DXGI_FORMAT_R8_UNORM,
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            0,
+            Some(data),
+        )
+    }
+
+    /// Overwrite an R8 texture with `width * height` bytes.
+    pub fn update_r8(&self, t: &Texture, data: &[u8]) -> Result<()> {
+        if t.format != DXGI_FORMAT_R8_UNORM || data.len() != t.w as usize * t.h as usize {
+            bail!("update_r8: texture/buffer mismatch");
+        }
+        // SAFETY: the buffer holds height rows of width bytes.
+        unsafe {
+            self.inner
+                .ctx
+                .UpdateSubresource(&t.tex, 0, None, data.as_ptr() as _, t.w, 0);
+        }
+        Ok(())
+    }
+
     /// A texture shaped like the one CEF's `on_accelerated_paint` hands out
     /// (BGRA, render target + shader resource, `SHARED | SHARED_NTHANDLE`),
     /// filled with `f`, plus an NT handle to it. For tests and diagnostics.

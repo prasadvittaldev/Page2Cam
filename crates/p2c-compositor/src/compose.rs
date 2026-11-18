@@ -224,8 +224,9 @@ impl Compositor {
     }
 }
 
-/// Largest rect with the source aspect ratio that fits in the output, centered.
-fn fit_rect(sw: u32, sh: u32, ow: u32, oh: u32) -> (u32, u32, u32, u32) {
+/// Largest rect `(x, y, w, h)` with the source aspect ratio that fits in the
+/// output, centered (the page letterbox; the GPU compositor uses it too).
+pub fn fit_rect(sw: u32, sh: u32, ow: u32, oh: u32) -> (u32, u32, u32, u32) {
     let scale = (ow as f64 / sw as f64).min(oh as f64 / sh as f64);
     let dw = ((sw as f64 * scale).round() as u32).min(ow);
     let dh = ((sh as f64 * scale).round() as u32).min(oh);

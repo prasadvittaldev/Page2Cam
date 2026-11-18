@@ -19,7 +19,7 @@ struct Slot {
 }
 
 /// Ring of 3 NV12 staging pairs. After submits 1..=N, [`Readback::take`]
-/// returns frame N???2 (once), `None` until the ring has filled.
+/// returns frame N−2 (once), `None` until the ring has filled.
 #[derive(Default)]
 pub struct Readback {
     gpu: Option<Gpu>,

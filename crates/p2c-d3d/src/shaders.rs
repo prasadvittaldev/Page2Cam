@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM};
 
-use crate::device::{Gpu, Texture};
+use crate::device::{check_nv12_pair, Gpu, Texture};
 
 const NV12_HLSL: &str = include_str!("hlsl/nv12.hlsl");
 
@@ -66,7 +66,7 @@ pub(crate) fn compile(src: &str, name: &str, entry: &str, target: &str) -> Resul
 
 /// Compiled shaders and fixed state, created once per [`Gpu`].
 pub(crate) struct Shaders {
-    vs_fullscreen: ID3D11VertexShader,
+    pub(crate) vs_fullscreen: ID3D11VertexShader,
     ps_y: ID3D11PixelShader,
     ps_uv: ID3D11PixelShader,
     linear_clamp: ID3D11SamplerState,
@@ -83,7 +83,12 @@ fn vs(device: &ID3D11Device, src: &str, name: &str, entry: &str) -> Result<ID3D1
     s.context("CreateVertexShader returned nothing")
 }
 
-fn ps(device: &ID3D11Device, src: &str, name: &str, entry: &str) -> Result<ID3D11PixelShader> {
+pub(crate) fn ps(
+    device: &ID3D11Device,
+    src: &str,
+    name: &str,
+    entry: &str,
+) -> Result<ID3D11PixelShader> {
     let code = compile(src, name, entry, "ps_5_0")?;
     let mut s = None;
     // SAFETY: valid bytecode slice and out-pointer.
@@ -159,10 +164,6 @@ pub fn bgra_to_nv12_gpu(gpu: &Gpu, src: &Texture, dw: u32, dh: u32) -> Result<(T
     if dw == 0 || dh == 0 || !dw.is_multiple_of(2) || !dh.is_multiple_of(2) {
         bail!("NV12 size must be even and non-zero, got {dw}x{dh}");
     }
-    let srv = src
-        .srv()
-        .context("bgra_to_nv12_gpu: source has no shader resource view")?
-        .clone();
     let (y, uv) = {
         let mut cache = gpu.nv12_targets().lock().unwrap_or_else(|p| p.into_inner());
         match &*cache {
@@ -175,6 +176,26 @@ pub fn bgra_to_nv12_gpu(gpu: &Gpu, src: &Texture, dw: u32, dh: u32) -> Result<(T
                 (y, uv)
             }
         }
+    };
+    bgra_to_nv12_into(gpu, src, &y, &uv)?;
+    Ok((y, uv))
+}
+
+/// Like [`bgra_to_nv12_gpu`], into caller-owned planes: `y` (R8, render
+/// target, even non-zero size) and `uv` (R8G8, render target, half size).
+/// For callers that keep their own targets (e.g. two sizes per frame).
+pub fn bgra_to_nv12_into(gpu: &Gpu, src: &Texture, y: &Texture, uv: &Texture) -> Result<()> {
+    check_nv12_pair(y, uv)?;
+    let (dw, dh) = (y.width(), y.height());
+    if dw == 0 || dh == 0 || !dw.is_multiple_of(2) || !dh.is_multiple_of(2) {
+        bail!("NV12 size must be even and non-zero, got {dw}x{dh}");
+    }
+    let srv = src
+        .srv()
+        .context("bgra_to_nv12: source has no shader resource view")?
+        .clone();
+    let (Some(y_rtv), Some(uv_rtv)) = (y.rtv().cloned(), uv.rtv().cloned()) else {
+        bail!("bgra_to_nv12: NV12 planes need render target views");
     };
     let s = gpu.shaders();
     let consts: [f32; 4] = [1.0 / dw as f32, 1.0 / dh as f32, 0.0, 0.0];
@@ -193,12 +214,12 @@ pub fn bgra_to_nv12_gpu(gpu: &Gpu, src: &Texture, dw: u32, dh: u32) -> Result<(T
         ctx.OMSetBlendState(None, None, 0xffff_ffff);
         ctx.RSSetState(None);
 
-        ctx.OMSetRenderTargets(Some(&[y.rtv().cloned()]), None);
+        ctx.OMSetRenderTargets(Some(&[Some(y_rtv)]), None);
         ctx.RSSetViewports(Some(&[viewport(dw, dh)]));
         ctx.PSSetShader(&s.ps_y, None);
         ctx.Draw(3, 0);
 
-        ctx.OMSetRenderTargets(Some(&[uv.rtv().cloned()]), None);
+        ctx.OMSetRenderTargets(Some(&[Some(uv_rtv)]), None);
         ctx.RSSetViewports(Some(&[viewport(dw / 2, dh / 2)]));
         ctx.PSSetShader(&s.ps_uv, None);
         ctx.Draw(3, 0);
@@ -207,7 +228,7 @@ pub fn bgra_to_nv12_gpu(gpu: &Gpu, src: &Texture, dw: u32, dh: u32) -> Result<(T
         ctx.OMSetRenderTargets(None, None);
         ctx.PSSetShaderResources(0, Some(&[None]));
     }
-    Ok((y, uv))
+    Ok(())
 }
 
 #[cfg(test)]
