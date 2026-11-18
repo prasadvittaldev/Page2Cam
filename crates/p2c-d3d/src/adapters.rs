@@ -13,6 +13,7 @@ pub struct AdapterInfo {
     pub luid: u64,
     /// Position in `EnumAdapterByGpuPreference(HIGH_PERFORMANCE)` order.
     pub perf_rank: u32,
+    /// Not a hardware GPU (see [`counts_as_software`]).
     pub software: bool,
 }
 
@@ -25,10 +26,11 @@ pub enum GpuSetting {
 }
 
 impl GpuSetting {
+    /// "auto"/"cpu" in any case; adapter names are matched exactly.
     pub fn parse(s: &str) -> GpuSetting {
         match s.trim() {
-            "auto" => GpuSetting::Auto,
-            "cpu" => GpuSetting::Cpu,
+            t if t.eq_ignore_ascii_case("auto") => GpuSetting::Auto,
+            t if t.eq_ignore_ascii_case("cpu") => GpuSetting::Cpu,
             other => GpuSetting::Named(other.to_string()),
         }
     }
@@ -80,6 +82,16 @@ pub fn choose(list: &[AdapterInfo], s: &GpuSetting) -> (GpuChoice, Option<String
             ),
         },
     }
+}
+
+/// Microsoft's PCI vendor id: Basic Render Driver (WARP) and the Remote
+/// Display Adapter. Neither is a real GPU.
+pub const MICROSOFT_VENDOR: u32 = 0x1414;
+
+/// An adapter that is not a hardware GPU: DXGI flags it as software, or it
+/// is one of Microsoft's (Remote Desktop's display adapter is not flagged).
+pub fn counts_as_software(flagged_software: bool, vendor_id: u32) -> bool {
+    flagged_software || vendor_id == MICROSOFT_VENDOR
 }
 
 /// All DXGI adapters, software ones included (flagged). Empty off Windows.
@@ -138,7 +150,10 @@ pub fn enumerate() -> Vec<AdapterInfo> {
                     .iter()
                     .position(|r| *r == l)
                     .unwrap_or(ranked.len() + index as usize) as u32,
-                software: d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+                software: counts_as_software(
+                    d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+                    d.VendorId,
+                ),
             });
         }
         out
@@ -200,6 +215,24 @@ mod tests {
             choose(&two(), &GpuSetting::Cpu).0,
             GpuChoice::Cpu { .. }
         ));
+    }
+
+    #[test]
+    fn auto_and_cpu_are_case_insensitive_names_exact() {
+        assert_eq!(GpuSetting::parse("Auto"), GpuSetting::Auto);
+        assert_eq!(GpuSetting::parse(" CPU "), GpuSetting::Cpu);
+        assert_eq!(
+            GpuSetting::parse("nvidia rtx"),
+            GpuSetting::Named("nvidia rtx".into())
+        );
+    }
+
+    #[test]
+    fn microsoft_adapters_are_never_hardware() {
+        // Basic Render Driver (flagged) and Remote Display Adapter (not flagged).
+        assert!(counts_as_software(true, 0x8086));
+        assert!(counts_as_software(false, MICROSOFT_VENDOR));
+        assert!(!counts_as_software(false, 0x10DE));
     }
 
     #[test]
