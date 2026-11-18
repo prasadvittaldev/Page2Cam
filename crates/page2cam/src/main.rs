@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod logging;
 mod pattern;
+mod update;
 
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, OnceLock};
@@ -198,6 +199,15 @@ fn run() -> anyhow::Result<()> {
         sinks,
     );
 
+    let updater = Arc::new(update::Updater::new(
+        env!("CARGO_PKG_VERSION"),
+        update::is_installed(),
+        Box::new(p2c_update::fetch_latest),
+    ));
+    if cfg.check_updates {
+        updater.spawn_checks();
+    }
+
     let app = Arc::new(App {
         browser: OnceLock::new(),
         layout,
@@ -222,6 +232,7 @@ fn run() -> anyhow::Result<()> {
         settings_path: config::save_path(cli.config.as_deref()),
         mic_delay_ms: Mutex::new(0),
         latencies: Mutex::new(Default::default()),
+        updater: updater.clone(),
     });
 
     // Keep the mic in step with the cut-out's processing delay.

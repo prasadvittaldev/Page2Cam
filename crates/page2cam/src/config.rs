@@ -31,6 +31,8 @@ pub struct Config {
     pub overlay_style: String,
     /// Cut-out engine: quality | fast
     pub cutout_engine: String,
+    /// Look for new versions on GitHub (a small request every few hours).
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -50,6 +52,7 @@ impl Default for Config {
             video_kbps: 6000,
             overlay_style: "box".into(),
             cutout_engine: "quality".into(),
+            check_updates: true,
         }
     }
 }

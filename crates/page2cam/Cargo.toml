@@ -14,6 +14,7 @@ p2c-audio.workspace = true
 p2c-stream.workspace = true
 p2c-admin.workspace = true
 p2c-segment.workspace = true
+p2c-update.workspace = true
 parking_lot.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

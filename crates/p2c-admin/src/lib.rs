@@ -9,6 +9,7 @@ mod server;
 
 pub use api::{
     AudioSettings, Controls, InputEvent, KeyAction, MouseBtn, NavAction, Status, StreamRequest,
+    UpdateInfo,
 };
 pub use input::{map_preview, normalize_url};
 pub use preview::PreviewSink;

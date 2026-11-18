@@ -154,6 +154,20 @@ pub struct Status {
     pub cutout: String,
     /// "quality" | "fast"
     pub cutout_engine: String,
+    pub update: UpdateInfo,
+}
+
+/// Software update state for the banner.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct UpdateInfo {
+    /// "" (up to date / not checked) | "available" | "installing" | "error: <why>"
+    pub state: String,
+    /// Newer version on offer, e.g. "0.2.0".
+    pub version: String,
+    /// Release page (for portable copies, which update by hand).
+    pub page_url: String,
+    /// True when this copy was installed with the installer and can update itself.
+    pub can_install: bool,
 }
 
 /// The app side of the admin UI. Implementations must be cheap and non-blocking.
@@ -172,4 +186,6 @@ pub trait Controls: Send + Sync + 'static {
     fn cutout_engine(&self) -> String;
     /// Errors on an unknown engine name.
     fn set_cutout_engine(&self, engine: &str) -> anyhow::Result<()>;
+    /// Download, verify and run the newer installer (the app then closes).
+    fn install_update(&self) -> anyhow::Result<()>;
 }

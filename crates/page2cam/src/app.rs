@@ -40,6 +40,7 @@ pub struct App {
     /// Mic delay currently applied, in ms, and recent cut-out latencies.
     pub mic_delay_ms: Mutex<u32>,
     pub latencies: Mutex<std::collections::VecDeque<u32>>,
+    pub updater: Arc<crate::update::Updater>,
 }
 
 /// Longest mic delay applied for the cut-out (ms).
@@ -314,7 +315,19 @@ impl Controls for App {
             log_file: self.log_file.clone(),
             cutout: self.cutout_status(),
             cutout_engine: self.cutout_engine(),
+            update: self.updater.info(),
         }
+    }
+
+    fn install_update(&self) -> anyhow::Result<()> {
+        self.updater.install()?;
+        // The installer waits for us to exit, then restarts Page2Cam.
+        tracing::info!("closing for the update");
+        match self.browser.get() {
+            Some(b) => b.shutdown(),
+            None => std::process::exit(0),
+        }
+        Ok(())
     }
 
     fn cutout_engine(&self) -> String {
