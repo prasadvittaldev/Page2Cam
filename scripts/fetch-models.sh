@@ -55,6 +55,11 @@ cp "$CACHE/rvm_mobilenetv3_fp32.onnx" "$CACHE/selfie_landscape.onnx" "$CACHE/tes
 unzip -p "$CACHE/ort-$ORT_VER.nupkg" runtimes/linux-x64/native/libonnxruntime.so > "$ORT/linux/libonnxruntime.so"
 unzip -p "$CACHE/ort-directml-$ORT_VER.nupkg" runtimes/win-x64/native/onnxruntime.dll > "$ORT/windows/onnxruntime.dll"
 unzip -p "$CACHE/directml-1.15.4.nupkg" bin/x64-win/DirectML.dll > "$ORT/windows/DirectML.dll"
+mkdir -p "$ORT/windows/licenses"
+unzip -p "$CACHE/directml-1.15.4.nupkg" LICENSE.txt > "$ORT/windows/licenses/DirectML-LICENSE.txt"
+unzip -p "$CACHE/directml-1.15.4.nupkg" ThirdPartyNotices.txt > "$ORT/windows/licenses/DirectML-ThirdPartyNotices.txt"
+unzip -p "$CACHE/ort-directml-$ORT_VER.nupkg" LICENSE > "$ORT/windows/licenses/onnxruntime-LICENSE.txt"
+unzip -p "$CACHE/ort-directml-$ORT_VER.nupkg" ThirdPartyNotices.txt > "$ORT/windows/licenses/onnxruntime-ThirdPartyNotices.txt"
 for f in "$ORT/linux/libonnxruntime.so" "$ORT/windows/onnxruntime.dll" "$ORT/windows/DirectML.dll"; do
   [ -s "$f" ] || { echo "extracting $f failed" >&2; exit 1; }
 done

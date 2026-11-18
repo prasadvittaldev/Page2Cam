@@ -26,10 +26,30 @@ EVERY TIME
    - Type a website address at the top and press Go.
    - Click, scroll and type directly in the big picture to use the page.
    - Drag the dashed box to move your webcam; drag its corner to resize.
+   - Pick how you appear: Box, Cut-out small or Cut-out full (see below).
 3. In Teams/Zoom: open camera settings and pick "Page2Cam".
 4. For YouTube Live: in YouTube Studio > Go live > Stream, copy the
    "Stream key", paste it in the YouTube Live panel, then click "Go live".
    Sound: page sound is on by default; tick Microphone to add your voice.
+
+
+CUT-OUT (REMOVE YOUR ROOM)
+--------------------------
+Under "Webcam overlay" choose a style:
+  Box            - your webcam in a rectangle, room and all.
+  Cut-out small  - just you, room removed, standing on the bottom edge of
+                   the page. Drag sideways to move, drag the corner to resize.
+  Cut-out full   - like a Teams background: the page replaces your room.
+                   Drag the "Move" handle sideways to move yourself.
+Then choose the cut-out quality:
+  Quality - cleaner edges around hair; needs a faster PC (uses your graphics
+            chip if it can).
+  Fast    - smooth on any PC; rougher edges.
+The line under the buttons shows what is running, e.g.
+"Quality · GPU (DirectML) · 28 masks/s". If it says "Quality was too slow on
+this PC, switched to Fast", Page2Cam switched by itself to keep the video
+smooth; you can click Quality again to retry. Your choices are saved in
+page2cam.toml.
 
 
 THINGS TO TRY AND REPORT BACK
@@ -42,6 +62,11 @@ THINGS TO TRY AND REPORT BACK
     (Known risk: some virtual cameras only show in your own preview.
      If so, try: start Teams first, then Page2Cam.)
 [ ] YouTube Live: does the stream show the page with sound?
+[ ] Cut-out small and Cut-out full: is your room gone? Are the edges around
+    your hair and shoulders clean? Tell me what the status line under the
+    Quality/Fast buttons says (masks/s, GPU or CPU).
+[ ] Does your voice line up with your lips on the YouTube stream?
+[ ] In page2cam.log, what does the "webcam measured ... fps" line say?
 
 
 IF SOMETHING GOES WRONG
@@ -58,6 +83,8 @@ Common messages:
                                           -> the driver works but page2cam.exe is
                                              not running (start it).
   "ffmpeg was not found"                  -> ffmpeg.exe must stay in this folder.
+  "cut-out unavailable: ..."              -> onnxruntime.dll, DirectML.dll and the
+                                             models folder must stay in this folder.
 
 
 SETTINGS
@@ -70,6 +97,7 @@ UNINSTALL
 Right-click uninstall-camera.cmd > Run as administrator, then delete this folder.
 
 
-Included third-party software: Chromium Embedded Framework (see CREDITS.html),
-FFmpeg (GPL; https://ffmpeg.org). The camera driver is based on
-smourier/VCamSample (MIT).
+Page2Cam is free software under the GNU GPL v3 or later (LICENSE.txt).
+Included third-party software is listed in THIRD_PARTY.txt (Robust Video
+Matting, MediaPipe, ONNX Runtime, DirectML, Chromium Embedded Framework,
+FFmpeg, VCamSample).

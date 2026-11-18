@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build the Windows 11 test package from Linux: dist/Page2Cam-windows-x64.zip
-# Needs: cargo-xwin, clang-cl + lld-link on PATH, Windows CEF in $CEF_WIN
-# (export-cef-dir --target x86_64-pc-windows-msvc), llvm-rc, curl, zip.
+# Needs: cargo-xwin, clang-cl + lld-link on PATH, Windows CEF in $CEF_WIN,
+# (export-cef-dir --target x86_64-pc-windows-msvc), llvm-rc, curl, zip, unzip.
+# Cut-out models and ONNX Runtime come from scripts/fetch-models.sh.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,8 +36,19 @@ for f in libcef.dll chrome_elf.dll d3dcompiler_47.dll dxcompiler.dll vk_swiftsha
 done
 cp -r "$CEF_WIN/locales" "$OUT/"
 cp "$ROOT"/packaging/windows/* "$OUT/"
+
+echo "==> Cut-out models and ONNX Runtime"
+"$ROOT/scripts/fetch-models.sh"
+# The app looks for the runtime next to the exe and the models in models\.
+cp "$ROOT/third_party/onnxruntime/windows/onnxruntime.dll" "$ROOT/third_party/onnxruntime/windows/DirectML.dll" "$OUT/"
+mkdir -p "$OUT/models" "$OUT/licenses"
+cp "$ROOT/third_party/models/rvm_mobilenetv3_fp32.onnx" "$ROOT/third_party/models/selfie_landscape.onnx" "$OUT/models/"
+cp "$ROOT"/third_party/onnxruntime/windows/licenses/* "$OUT/licenses/"
+cp "$ROOT/LICENSE" "$OUT/LICENSE.txt"
+cp "$ROOT/packaging/THIRD_PARTY.txt" "$OUT/"
+
 # Windows line endings for the scripts and text files.
-for f in "$OUT"/*.cmd "$OUT"/*.txt "$OUT"/*.toml; do sed -i 's/\r\?$/\r/' "$f"; done
+for f in "$OUT"/*.cmd "$OUT"/*.txt "$OUT"/*.toml "$OUT"/licenses/*.txt; do sed -i 's/\r\?$/\r/' "$f"; done
 
 echo "==> FFmpeg"
 if [ ! -f "$FFMPEG_CACHE/ffmpeg.exe" ]; then

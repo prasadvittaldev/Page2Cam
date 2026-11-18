@@ -15,6 +15,13 @@ pip_size = 25
 # Use the webcam whose name contains this text (default: the first one found).
 # webcam = "C920"
 
+# How you appear on the page: box (webcam rectangle), cutout-small (just you,
+# room removed, on the bottom edge) or cutout-full (like a call background).
+# Changing it in the control page saves it here.
+overlay_style = "box"
+# Cut-out engine: quality (cleaner edges) or fast (smooth on any PC).
+cutout_engine = "quality"
+
 # YouTube Live server and video quality (kbit/s).
 rtmp_url = "rtmp://a.rtmp.youtube.com/live2"
 video_kbps = 4500
