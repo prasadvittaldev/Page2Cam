@@ -393,22 +393,17 @@ impl Controls for App {
 
     fn restart(&self) -> anyhow::Result<()> {
         tracing::info!("restart requested from the admin page");
-        self.exit
-            .restart
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Close shortly, after this request has been answered; `main`
-        // starts the new process once everything is shut down.
+        // What ends the main loop: the browser, or (test pattern) the wait.
         let browser = self.browser.get().cloned();
         let quit_main = self.quit_main.lock().clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if let Some(b) = browser {
-                b.shutdown();
-            } else if let Some(q) = quit_main {
+        let close: Option<Box<dyn FnOnce() + Send>> = match (browser, quit_main) {
+            (Some(b), _) => Some(Box::new(move || b.shutdown())),
+            (None, Some(q)) => Some(Box::new(move || {
                 let _ = q.send(());
-            }
-        });
-        Ok(())
+            })),
+            (None, None) => None,
+        };
+        begin_restart(&self.exit, close)
     }
 
     fn cutout_engine(&self) -> String {
@@ -432,6 +427,26 @@ impl Controls for App {
         self.save_choice("cutout_engine", engine);
         Ok(())
     }
+}
+
+/// "Restart now": set the restart flag and, shortly after (once the request
+/// has been answered), call `close` to end the main loop; `main` then starts
+/// the new process. Without a way to close yet (still starting up), refuse
+/// without setting the flag, so a later Ctrl-C doesn't relaunch.
+pub fn begin_restart(
+    exit: &crate::restart::ExitFlags,
+    close: Option<Box<dyn FnOnce() + Send>>,
+) -> anyhow::Result<()> {
+    let Some(close) = close else {
+        anyhow::bail!("Page2Cam is still starting; try again in a moment");
+    };
+    exit.restart
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        close();
+    });
+    Ok(())
 }
 
 /// The `gpu` setting in its normal form: "auto" | "cpu" | an adapter name.
@@ -645,6 +660,25 @@ mod tests {
         // Non-ASCII stays on character boundaries.
         let d = display_video(&format!("CPU (fallback: {})", "é".repeat(200)));
         assert!(d.ends_with("é…)"), "{d}");
+    }
+
+    #[test]
+    fn restart_before_startup_is_refused_and_leaves_no_flag() {
+        let exit = crate::restart::ExitFlags::default();
+        let e = begin_restart(&exit, None).unwrap_err();
+        assert!(format!("{e}").contains("still starting"), "{e}");
+        // A later Ctrl-C must not relaunch.
+        assert!(!exit.restart.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn restart_sets_flag_and_closes() {
+        let exit = crate::restart::ExitFlags::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        begin_restart(&exit, Some(Box::new(move || tx.send(()).unwrap()))).unwrap();
+        assert!(exit.restart.load(std::sync::atomic::Ordering::SeqCst));
+        rx.recv_timeout(std::time::Duration::from_secs(3))
+            .expect("closer not called");
     }
 
     #[test]
