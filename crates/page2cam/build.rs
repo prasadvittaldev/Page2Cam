@@ -22,6 +22,10 @@ fn main() {
             "cargo:rerun-if-changed={}",
             dir.join("page2cam.rc").display()
         );
+        println!(
+            "cargo:rerun-if-changed={}",
+            dir.join("page2cam.ico").display()
+        );
         let res = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("page2cam.res");
         // llvm-rc (cross builds) or rc.exe (native MSVC builds).
         let compiled = ["llvm-rc", "rc"].iter().any(|rc| {

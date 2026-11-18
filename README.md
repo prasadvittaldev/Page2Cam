@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" alt="Page2Cam" width="560"></p>
+
 # Page2Cam
 
 **Page2Cam is a project by Prasad Vittaldev.**
@@ -42,30 +44,37 @@ You control everything from a simple control page on your own computer. You can 
 
 ## How to install (step by step)
 
-You only need to do steps 1 to 6 once.
+### The easy way: the installer (recommended)
 
-1. **Download Page2Cam.**
-   Go to the [Releases page](https://github.com/prasadvittaldev/Page2Cam/releases/latest) and download the file called **`Page2Cam-windows-x64.zip`**. It is about 300 MB.
+1. **Download the installer.**
+   Go to the [Releases page](https://github.com/prasadvittaldev/Page2Cam/releases/latest) and download **`Page2Cam-Setup-<version>.exe`**.
 
-2. **Unblock the download.**
-   Find the downloaded zip file (usually in your *Downloads* folder). Right-click it and choose **Properties**. At the bottom of the window, tick **Unblock**, then click **OK**.
-   *Windows marks files from the internet as blocked, and a blocked camera driver will not work.*
+2. **Run it.**
+   Double-click the downloaded file.
+   If Windows shows **"Windows protected your PC"**, click **More info**, then **Run anyway**. This appears because this early version is not signed with a paid certificate.
+   Click **Yes** when Windows asks for permission.
 
-3. **Unzip it.**
-   Right-click the zip file, choose **Extract All…**, and extract it to a simple folder such as `C:\Page2Cam`.
+3. **Follow the steps.**
+   Click **Next** through the pages. The installer sets up everything, including the Page2Cam camera.
+   At the end, leave **Start Page2Cam now** ticked and click **Finish**.
 
-4. **Install the Page2Cam camera.**
-   Open the folder. Right-click **`install-camera.cmd`** and choose **Run as administrator**. Click **Yes** when Windows asks for permission.
-   A black window appears and finishes with **"Done. The Page2Cam camera is installed."** Press any key to close it.
-   *This adds "Page2Cam" to your computer's list of cameras. It also installs a free Microsoft component that the cut-out feature needs.*
+4. **Start Page2Cam any time** from the **Start menu** or the **desktop shortcut**.
+   A black window opens. Leave it open, because closing it closes Page2Cam. Your web browser then opens the **Page2Cam control page**.
 
-5. **Start Page2Cam.**
-   Double-click **`page2cam.exe`**.
-   If Windows shows **"Windows protected your PC"**, click **More info** and then **Run anyway**. This message appears because this early version is not signed with a paid certificate.
-   A black window opens. Leave it open, because closing it closes Page2Cam. A moment later, your web browser opens the **Page2Cam control page**.
+**Updates are automatic.**
+When a new version is out, the control page shows a blue bar saying **"Page2Cam x.y.z is available"**. Click **Install update**: Page2Cam downloads it, checks that it really comes from Page2Cam, closes, installs it and starts again. Windows asks for permission once.
 
-6. **Check that it works.**
-   On the control page you should see a live picture of the website.
+### The portable way: the zip file
+
+Use this if you can't run installers on your computer.
+
+1. From the [Releases page](https://github.com/prasadvittaldev/Page2Cam/releases/latest), download **`Page2Cam-windows-x64.zip`**.
+2. Right-click the zip and choose **Properties**. Tick **Unblock** at the bottom, then click **OK**.
+3. Right-click the zip, choose **Extract All…**, and extract it to a folder such as `C:\Page2Cam`.
+4. In that folder, right-click **`install-camera.cmd`**, choose **Run as administrator**, and click **Yes**. Wait for **"Done. The Page2Cam camera is installed."**
+5. Double-click **`page2cam.exe`** to start Page2Cam.
+
+The portable copy doesn't update itself. When a new version is out, the control page shows a link to download it.
 
 ---
 
@@ -111,14 +120,14 @@ The coloured dots at the bottom of the control page show the state of each part:
 
 | What you see | What to do |
 |---|---|
-| "The Page2Cam camera is not installed" | Close Page2Cam, run `install-camera.cmd` **as administrator**, then start Page2Cam again. |
+| "The Page2Cam camera is not installed" | Run the installer again. With the zip, run `install-camera.cmd` **as administrator**. Then start Page2Cam again. |
 | Page2Cam doesn't appear as a camera in Teams or Meet | Start Page2Cam first, then fully close and reopen the call app, or reload the Meet page. |
 | The camera shows a dark picture with a moving light band | The camera is installed but Page2Cam isn't running. Start `page2cam.exe`. |
-| "cut-out unavailable" | Run `install-camera.cmd` as administrator again. Keep all the files that came in the zip in the same folder. |
+| "cut-out unavailable" | Run the installer again (with the zip: run `install-camera.cmd` as administrator again). |
 | "Quality was too slow on this PC, switched to Fast" | This is normal on slower computers. Page2Cam switched to keep your video smooth. You can click **Quality** to try again. |
 | "ffmpeg was not found" | Keep `ffmpeg.exe` in the Page2Cam folder. |
 
-If you need help, the file **`page2cam.log`** in the Page2Cam folder records what happened. The camera's own record is in `C:\ProgramData\Page2Cam\vcam.log`.
+If you need help, the file **`page2cam.log`** records what happened. Its location is shown at the bottom of the control page. The camera's own record is in `C:\ProgramData\Page2Cam\vcam.log`.
 
 ---
 
@@ -127,15 +136,16 @@ If you need help, the file **`page2cam.log`** in the Page2Cam folder records wha
 - Page2Cam runs entirely on your own computer.
 - The control page only works from your own computer. Other computers and other websites cannot control it.
 - Your YouTube stream key is never written to the log. If you tick *Remember key*, it is kept in Windows' own secure password store.
+- Every few hours Page2Cam asks GitHub for the latest version number, and nothing else. It doesn't send your settings, your pictures or anything you do. To turn this off, add `check_updates = false` to the settings file.
 - The cut-out (background removal) happens on your computer. Your video is not sent anywhere to be processed.
 
 ---
 
 ## How to remove Page2Cam
 
-1. Close Page2Cam.
-2. Right-click **`uninstall-camera.cmd`** and choose **Run as administrator**.
-3. Delete the Page2Cam folder.
+**If you used the installer:** open **Settings → Apps → Installed apps**, find **Page2Cam**, click **⋯** and choose **Uninstall**. This also removes the Page2Cam camera. Your settings are kept in case you install it again.
+
+**If you used the zip:** close Page2Cam, right-click **`uninstall-camera.cmd`**, choose **Run as administrator**, then delete the folder.
 
 ---
 
