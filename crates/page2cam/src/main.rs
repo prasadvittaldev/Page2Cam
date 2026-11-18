@@ -147,6 +147,17 @@ fn run() -> anyhow::Result<()> {
         }
     }
     let started = std::time::Instant::now();
+    // CEF can kill the whole process (e.g. "GPU process isn't usable.
+    // Goodbye."), and then the relaunch at the end of `run` never happens:
+    // let Windows restart us after a crash instead (R38). Undone in `finish`.
+    let wer_args = restart::wer_restart_args(&current_args(), cli.unexpected_exit_count);
+    match restart::register_crash_restart(&wer_args) {
+        Ok(()) if cfg!(windows) => {
+            tracing::info!(args = ?wer_args, "Windows restarts Page2Cam if it crashes after 60 s or more")
+        }
+        Ok(()) => {}
+        Err(e) => tracing::warn!("no automatic restart after a crash: {e:#}"),
+    }
     let cfg = cli.apply(Config::load(cli.config.as_deref())?);
     cfg.validate()?;
     tracing::info!(
@@ -253,7 +264,9 @@ fn run() -> anyhow::Result<()> {
     // Video: the GPU compositor on the chosen adapter (Chromium hands it
     // shared textures), else the CPU compositor. Decided before CEF starts.
     let video = Arc::new(Mutex::new(String::new()));
-    let video_start = start_video(&gpu_choice, spec, cli.test_pattern, &video);
+    // The browser, for the video producer to ask for a repaint (set once it exists).
+    let browser_cell: Arc<OnceLock<p2c_browser::BrowserHandle>> = Arc::default();
+    let video_start = start_video(&gpu_choice, spec, cli.test_pattern, &video, &browser_cell);
     // R28 forced the CPU for this run: say why (the admin offers to try the
     // GPU again).
     let gpu_override = cli.gpu_override.is_some();
@@ -477,6 +490,7 @@ fn run() -> anyhow::Result<()> {
                 // `fell_back`).
                 let f = fell_back2.lock();
                 let _ = app2.browser.set(handle.clone());
+                let _ = browser_cell.set(handle.clone());
                 if *f {
                     handle.recreate_cpu();
                 }
@@ -517,6 +531,8 @@ fn finish(
     uptime: std::time::Duration,
     result: anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    // An orderly exit: no crash restart by Windows (a relaunch below is ours).
+    restart::unregister_crash_restart();
     match action {
         restart::ExitAction::Exit if user_shutdown => {
             tracing::info!("closed by the operator (or for an update); not restarting");
@@ -559,15 +575,19 @@ fn finish(
             }
         }
     }
-    let current: Vec<String> = std::env::args_os()
-        .skip(1)
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let args = restart::args_for(action, &current, std::process::id());
+    let args = restart::args_for(action, &current_args(), std::process::id());
     let exe = std::env::current_exe().context("finding page2cam's own path")?;
     tracing::info!(exe = %exe.display(), ?args, "starting the new Page2Cam process");
     restart::spawn(&exe, &args).context("could not restart Page2Cam; start it again by hand")?;
     Ok(())
+}
+
+/// This process's arguments (without the program name).
+fn current_args() -> Vec<String> {
+    std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// The video producer chosen at start, its status text, and (GPU) the parts
@@ -598,13 +618,15 @@ struct GpuVideo {
 /// Any failure here starts in CPU mode for this run (CEF has not started, so
 /// Chromium simply gets no adapter switch).
 /// `video` is the status text; it is updated if the producer later moves to
-/// the adapter Chromium really renders on.
+/// the adapter Chromium really renders on, and then `browser` is asked to
+/// repaint (a static page would not send another frame by itself).
 #[cfg(windows)]
 fn start_video(
     choice: &p2c_d3d::GpuChoice,
     spec: OutputSpec,
     test_pattern: bool,
     video: &Arc<Mutex<String>>,
+    browser: &Arc<OnceLock<p2c_browser::BrowserHandle>>,
 ) -> VideoStart {
     let cpu = |status: String| VideoStart {
         producer: Box::new(CpuProducer::new(spec)),
@@ -625,11 +647,14 @@ fn start_video(
         Ok(mut p) => {
             // Chromium ignored the adapter switch: the producer moved to its
             // adapter (Chromium is left as it is; DirectML stays).
-            let status = video.clone();
+            let (status, browser) = (video.clone(), browser.clone());
             p.on_adapter_change(Box::new(move |chosen: &p2c_d3d::AdapterInfo| {
                 let s = video::status_gpu_chromium_chose(&chosen.name);
                 tracing::warn!("video: {s}");
                 *status.lock() = s;
+                if let Some(b) = browser.get() {
+                    b.repaint();
+                }
             }));
             VideoStart {
                 producer: Box::new(p),
@@ -655,6 +680,7 @@ fn start_video(
     spec: OutputSpec,
     _test_pattern: bool,
     _video: &Arc<Mutex<String>>,
+    _browser: &Arc<OnceLock<p2c_browser::BrowserHandle>>,
 ) -> VideoStart {
     VideoStart {
         producer: Box::new(CpuProducer::new(spec)),
@@ -680,8 +706,20 @@ fn gpu_page(
         return None;
     }
     let (holder, stats) = (g.holder.clone(), g.stats.clone());
+    #[allow(unused_mut)]
+    let mut adapter_luid = g.adapter.luid;
+    // Debug builds: `P2C_FAKE_BAD_LUID=1` hands Chromium a LUID no adapter
+    // has, to see what CEF does with one (R38).
+    #[cfg(debug_assertions)]
+    if std::env::var_os("P2C_FAKE_BAD_LUID").is_some_and(|v| v == "1") {
+        adapter_luid = 0x7ffe_0000_0000_beef;
+        tracing::warn!(
+            luid = format_args!("{adapter_luid:#x}"),
+            "P2C_FAKE_BAD_LUID: giving Chromium a LUID no adapter has"
+        );
+    }
     Some(p2c_browser::GpuPage {
-        adapter_luid: g.adapter.luid,
+        adapter_luid,
         on_texture: Arc::new(
             move |handle, _w, _h| match holder.on_shared_texture(handle) {
                 Ok(()) => {

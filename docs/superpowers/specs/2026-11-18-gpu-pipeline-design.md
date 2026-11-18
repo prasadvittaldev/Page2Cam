@@ -74,6 +74,8 @@ If the adapter switch does not work, or only partly (e.g. only with the Windows 
 
 Branch taken: **plan as written.** Working switch syntax: `--use-adapter-luid=<HighPart>,<LowPart>` with both parts in **decimal** (Chromium `ui/gl/gl_display.cc`: `StringToInt(high)`, `StringToUint(low)`; only used for ANGLE D3D11). No extra switches were needed for accelerated paint. A LUID that parses but matches no adapter (or doesn't parse) kills the browser process, so the app must only pass a LUID it has just enumerated via DXGI. Default Chromium (no switch) renders on the Intel, so without the switch our D3D11 device must be on the Intel to open the texture.
 
+**Correction (2026-11-19, final fix wave, debug build with `P2C_FAKE_BAD_LUID=1`):** a LUID that *parses* but matches no adapter (`2147352576,48879`) does **not** kill anything: Chromium silently renders on its default adapter (the Intel), `p2c_browser::run` keeps running, and the app moves its video to the Intel ("GPU: Intel(R) UHD Graphics (Chromium chose it)", then a forced repaint). The FATAL above came from the unparseable hex form only, which the app never produces.
+
 ### Decisions settled after review (marked "builder-check call": made by the designer, not the user — check while reading)
 
 - **Output size** (builder-check call): the GPU path renders at the configured output size (any size `Config` accepts, 320×240 … 3840×2160). The stream gets that size. The camera gets NV12 at the configured size if ≤1920×1080, otherwise a GPU-downscaled copy that fits 1920×1080 (aspect kept) — an extra small pass, only when the output is larger than 1080p.

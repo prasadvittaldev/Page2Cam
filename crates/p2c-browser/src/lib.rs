@@ -113,6 +113,7 @@ enum Cmd {
         mods: u32,
     },
     Key(KeyInput),
+    Repaint,
     RecreateCpu,
     Shutdown,
 }
@@ -189,6 +190,13 @@ impl BrowserHandle {
     /// CPU fallback without re-initialising CEF: replace the browser with one
     /// that paints into the `FrameSlot` (`shared_texture_enabled = 0`), on the
     /// current URL. Does nothing if the browser already paints on the CPU.
+    /// Make Chromium paint the whole page again, even if nothing changed
+    /// (e.g. a static page whose frames went to a device that couldn't
+    /// open them).
+    pub fn repaint(&self) {
+        self.send(Cmd::Repaint);
+    }
+
     pub fn recreate_cpu(&self) {
         self.send(Cmd::RecreateCpu);
     }
@@ -351,6 +359,11 @@ pub fn run(
                 Cmd::Key(k) => {
                     if let Some(host) = browser.host() {
                         host.send_key_event(Some(&key_event(k)));
+                    }
+                }
+                Cmd::Repaint => {
+                    if let Some(host) = browser.host() {
+                        host.invalidate(cef::PaintElementType::default()); // the view
                     }
                 }
                 Cmd::RecreateCpu if on_gpu && closing_since.is_none() => {

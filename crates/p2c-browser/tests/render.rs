@@ -143,6 +143,56 @@ mod gpu {
         println!("test shared_textures_arrive ... ok");
         Ok(())
     }
+
+    /// A static page stops painting; `repaint` makes it paint again (the
+    /// app needs that after moving to the adapter Chromium renders on).
+    pub fn repaint_paints_a_static_page(
+        s: &Session,
+        h: &p2c_browser::BrowserHandle,
+    ) -> Result<(), String> {
+        h.navigate("data:text/html,<body style='margin:0;background:%2300f'></body>");
+        // Quiet: no texture for 700 ms.
+        let start = Instant::now();
+        let mut last = (s.ok.load(Ordering::SeqCst), Instant::now());
+        loop {
+            std::thread::sleep(Duration::from_millis(20));
+            let n = s.ok.load(Ordering::SeqCst);
+            if n != last.0 {
+                last = (n, Instant::now());
+            } else if last.1.elapsed() >= Duration::from_millis(700) {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                return Err("the static page never stopped painting".into());
+            }
+        }
+        let before = s.ok.load(Ordering::SeqCst);
+        h.repaint();
+        let start = Instant::now();
+        while s.ok.load(Ordering::SeqCst) == before {
+            if start.elapsed() > Duration::from_secs(2) {
+                return Err("no texture within 2 s of repaint()".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        println!("  (painted {:?} after repaint)", start.elapsed());
+        // Back to the test page (later steps recreate the browser at its URL).
+        let url = format!("data:text/html,{}", super::PAGE);
+        h.navigate(&url);
+        let start = Instant::now();
+        loop {
+            let f = s.gpu.read_bgra(&s.page.texture()).map_err(|e| format!("{e:#}"))?;
+            if close(f.pixel(100, 180), GREEN) && h.current_url() == url {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                return Err("test page did not come back after the static page".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        println!("test repaint_paints_a_static_page ... ok");
+        Ok(())
+    }
 }
 
 fn scenario(h: &BrowserHandle, slot: &FrameSlot, audio: &AudioRing) -> Result<(), String> {
@@ -238,6 +288,7 @@ fn main() {
                 #[cfg(windows)]
                 if let Some(s) = &session {
                     gpu::shared_textures_arrive(s)?;
+                    gpu::repaint_paints_a_static_page(s, &h)?;
                     // CPU fallback without re-initialising CEF: the other
                     // steps run on the recreated browser's CPU paints.
                     h.recreate_cpu();

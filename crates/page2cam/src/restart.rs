@@ -119,6 +119,98 @@ pub fn args_for(action: ExitAction, current: &[String], pid: u32) -> Vec<String>
     relaunch_args(&v, pid)
 }
 
+/// Arguments for Windows to restart us with after a crash (R38): CEF can
+/// kill the whole process ("GPU process isn't usable. Goodbye."), so R28's
+/// relaunch in `main` never runs. The crash counts as one more unexpected
+/// exit (`--unexpected-exit-count <n+1>`), so a restarted run that fails
+/// again quickly is moved to the CPU as R28 does. No `--wait-for-pid`: the
+/// old process is gone.
+pub fn wer_restart_args(current: &[String], unexpected_count: u32) -> Vec<String> {
+    let mut v = without_flag(&without_flag(current, WAIT_FOR_PID), UNEXPECTED_EXIT_COUNT);
+    v.extend([
+        UNEXPECTED_EXIT_COUNT.to_string(),
+        (unexpected_count + 1).to_string(),
+    ]);
+    v
+}
+
+/// `args` as one Windows command line, quoted so `CommandLineToArgvW` (and
+/// Rust's `std::env::args`) gives back exactly `args`.
+pub fn command_line(args: &[String]) -> String {
+    let mut out = String::new();
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if !a.is_empty() && !a.contains([' ', '\t', '\n', '\u{b}', '"']) {
+            out.push_str(a);
+            continue;
+        }
+        out.push('"');
+        let mut backslashes = 0;
+        for c in a.chars() {
+            match c {
+                '\\' => backslashes += 1,
+                '"' => {
+                    out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                    out.push('"');
+                    backslashes = 0;
+                }
+                c => {
+                    out.extend(std::iter::repeat_n('\\', backslashes));
+                    out.push(c);
+                    backslashes = 0;
+                }
+            }
+        }
+        out.extend(std::iter::repeat_n('\\', backslashes * 2));
+        out.push('"');
+    }
+    out
+}
+
+/// Ask Windows Error Reporting to start us again with `args` if this
+/// process crashes (Windows only does so after at least 60 s of uptime).
+#[cfg(windows)]
+pub fn register_crash_restart(args: &[String]) -> anyhow::Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Recovery::{
+        RegisterApplicationRestart, RESTART_NO_PATCH, RESTART_NO_REBOOT,
+    };
+    /// `RESTART_MAX_CMD_LINE`, in UTF-16 units including the terminator.
+    const MAX: usize = 1024;
+    let line: Vec<u16> = command_line(args).encode_utf16().chain([0]).collect();
+    anyhow::ensure!(
+        line.len() <= MAX,
+        "command line too long for a crash restart ({} > {MAX} characters)",
+        line.len()
+    );
+    // SAFETY: `line` is NUL-terminated and outlives the call (Windows copies it).
+    unsafe {
+        RegisterApplicationRestart(PCWSTR(line.as_ptr()), RESTART_NO_PATCH | RESTART_NO_REBOOT)
+    }?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn register_crash_restart(_args: &[String]) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Undo [`register_crash_restart`]: an orderly exit (the operator closed
+/// Page2Cam, "Restart now", or `main` relaunches by itself).
+#[cfg(windows)]
+pub fn unregister_crash_restart() {
+    // SAFETY: no arguments.
+    let r = unsafe { windows::Win32::System::Recovery::UnregisterApplicationRestart() };
+    if let Err(e) = r {
+        tracing::debug!(error = %e, "UnregisterApplicationRestart failed");
+    }
+}
+
+#[cfg(not(windows))]
+pub fn unregister_crash_restart() {}
+
 /// Wait until process `pid` has exited, at most `timeout`. True if it has
 /// (or can't be found).
 #[cfg(windows)]
@@ -338,6 +430,47 @@ mod tests {
             ),
             s(&["--no-open", "--wait-for-pid", "9"])
         );
+    }
+
+    #[test]
+    fn wer_restart_counts_the_crash_and_drops_wait_pid() {
+        // A crash Windows restarts us after counts as an unexpected exit, so
+        // R28's escalation to the CPU still applies on the restarted run.
+        assert_eq!(
+            wer_restart_args(&s(&["--url", "x", "--wait-for-pid", "3"]), 0),
+            s(&["--url", "x", "--unexpected-exit-count", "1"])
+        );
+        assert_eq!(
+            wer_restart_args(
+                &s(&[
+                    "--unexpected-exit-count",
+                    "1",
+                    "--gpu-override=cpu",
+                    "--no-open"
+                ]),
+                1
+            ),
+            s(&[
+                "--gpu-override=cpu",
+                "--no-open",
+                "--unexpected-exit-count",
+                "2"
+            ])
+        );
+    }
+
+    #[test]
+    fn windows_command_line_quotes_like_the_crt() {
+        assert_eq!(command_line(&s(&["--fps", "30"])), "--fps 30");
+        assert_eq!(command_line(&s(&[""])), "\"\"");
+        assert_eq!(
+            command_line(&s(&["--config", r"C:\My Settings\p2c.toml"])),
+            r#"--config "C:\My Settings\p2c.toml""#
+        );
+        // Backslashes before a quote are doubled; a trailing one too when quoted.
+        assert_eq!(command_line(&s(&[r#"a\"b"#])), r#""a\\\"b""#);
+        assert_eq!(command_line(&s(&[r"C:\dir with space\"])), r#""C:\dir with space\\""#);
+        assert_eq!(command_line(&s(&[r"C:\plain\"])), r"C:\plain\");
     }
 
     #[test]
