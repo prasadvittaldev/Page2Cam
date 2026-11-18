@@ -2,10 +2,15 @@
 //! writes the mask into each frame's alpha byte (see `tensor::write_alpha`).
 use std::path::PathBuf;
 
+pub mod engine;
+pub mod policy;
 pub mod runtime;
+pub mod segmenter;
 pub mod tensor;
 
+pub use engine::{open_engine, Engine, EngineChoice};
 pub use runtime::Device;
+pub use segmenter::{Opener, SegStatus, Segmenter};
 
 /// Folder holding `models/` and `onnxruntime/`: next to the exe when shipped,
 /// else the repo's `third_party/` (dev builds and tests).

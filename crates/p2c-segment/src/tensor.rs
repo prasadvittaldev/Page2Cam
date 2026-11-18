@@ -8,7 +8,7 @@ pub fn to_rgb_f32_nchw(frame: &Frame, w: u32, h: u32) -> Vec<f32> {
     let src = if frame.width == w && frame.height == h {
         frame
     } else {
-        scaled = p2c_compositor::scale_frame(frame, w, h);
+        scaled = p2c_compositor::scale_frame_straight(frame, w, h);
         &scaled
     };
     let plane = (w * h) as usize;
@@ -81,6 +81,14 @@ mod tests {
         let f = frame(2, 1, &[[0, 0, 255, 255], [255, 0, 0, 255]]);
         let t = to_rgb_f32_nchw(&f, 2, 1);
         assert_eq!(t, vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn nchw_ignores_alpha_when_scaling() {
+        // Webcam alpha is unrelated to colour; a 0 alpha must not darken the input.
+        let f = frame(4, 2, &[[0, 0, 255, 0]; 8]);
+        let t = to_rgb_f32_nchw(&f, 2, 1);
+        assert_eq!(&t[0..2], &[1.0, 1.0]);
     }
 
     #[test]

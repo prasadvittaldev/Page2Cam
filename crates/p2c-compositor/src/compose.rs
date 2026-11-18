@@ -70,6 +70,17 @@ pub(crate) fn scale(src: &Frame, dw: u32, dh: u32) -> Image<'static> {
     dst
 }
 
+/// Scale a frame to exactly `dw` x `dh` (bilinear), treating the alpha byte
+/// as plain data rather than transparency (colours never darken where A < 255).
+pub fn scale_frame_straight(src: &Frame, dw: u32, dh: u32) -> Frame {
+    let img = scale_straight(src, dw, dh);
+    Frame {
+        width: dw,
+        height: dh,
+        data: img.into_vec(),
+    }
+}
+
 /// Scale without treating alpha as premultiplication (the alpha byte is a
 /// cut-out mask and is scaled like any other channel).
 fn scale_straight(src: &Frame, dw: u32, dh: u32) -> Image<'static> {
