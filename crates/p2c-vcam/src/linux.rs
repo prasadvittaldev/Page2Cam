@@ -6,8 +6,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use p2c_compositor::{FrameSink, OutputSpec};
-use p2c_core::Frame;
+use p2c_compositor::{FrameSink, Output, OutputSpec};
 
 use crate::bgra_to_yuyv;
 
@@ -79,7 +78,11 @@ impl V4l2Sink {
 }
 
 impl FrameSink for V4l2Sink {
-    fn push(&mut self, frame: &Frame) -> anyhow::Result<()> {
+    /// Writes `out.bgra` (the BGRA output format); other outputs are ignored.
+    fn push(&mut self, out: &Output) -> anyhow::Result<()> {
+        let Some(frame) = out.bgra.as_deref() else {
+            return Ok(());
+        };
         anyhow::ensure!(
             frame.width == self.spec.width && frame.height == self.spec.height,
             "frame {}x{} does not match device format {}x{}",

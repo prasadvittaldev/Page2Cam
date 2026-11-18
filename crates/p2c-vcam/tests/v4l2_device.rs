@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 use std::path::Path;
 
-use p2c_compositor::{FrameSink, OutputSpec};
+use p2c_compositor::{FrameSink, Output, OutputFormat, OutputSpec};
 use p2c_core::Frame;
 use p2c_vcam::{find_loopback_device, V4l2Sink};
 
@@ -14,10 +14,14 @@ fn writes_frames() {
         width: 1280,
         height: 720,
         fps: 30,
+        format: OutputFormat::Bgra,
     };
     let mut sink = V4l2Sink::open(&dev, &spec).unwrap();
-    let frame = Frame::new_black(1280, 720);
+    let out = Output {
+        bgra: Some(std::sync::Arc::new(Frame::new_black(1280, 720))),
+        ..Output::default()
+    };
     for _ in 0..30 {
-        sink.push(&frame).unwrap();
+        sink.push(&out).unwrap();
     }
 }

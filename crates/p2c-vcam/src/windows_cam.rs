@@ -4,8 +4,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use p2c_compositor::{scale_frame, FrameSink, OutputSpec};
-use p2c_core::Frame;
+use p2c_compositor::{FrameSink, Output, OutputSpec};
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::MediaFoundation::{
@@ -20,6 +19,8 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
 };
+
+use crate::{camera_driver_status, CameraStatus};
 
 const NOT_INSTALLED: &str =
     "the Page2Cam camera is not installed. Close Page2Cam, right-click install-camera.cmd \
@@ -119,19 +120,24 @@ pub struct WinVcamSink {
     _owner: Owner,
     view: Option<View>,
     last_try: Option<Instant>,
+    status: CameraStatus,
+    /// Driver version last seen in the mapping (to log a change once).
+    dll_version: Option<u32>,
 }
 
 // The mapping pointer is only used from the ticker thread that owns the sink.
 unsafe impl Send for WinVcamSink {}
 
 impl WinVcamSink {
-    pub fn open(_spec: &OutputSpec) -> anyhow::Result<WinVcamSink> {
+    pub fn open(_spec: &OutputSpec, status: CameraStatus) -> anyhow::Result<WinVcamSink> {
         anyhow::ensure!(is_registered(), NOT_INSTALLED);
         let owner = Owner::start()?;
         Ok(WinVcamSink {
             _owner: owner,
             view: None,
             last_try: None,
+            status,
+            dll_version: None,
         })
     }
 
@@ -159,33 +165,61 @@ impl WinVcamSink {
     }
 }
 
+impl WinVcamSink {
+    /// Compare the driver's version in the mapping with ours; update the
+    /// shared status and log once when it changes.
+    fn check_driver(&mut self, base: *const u8) {
+        // SAFETY: `base` is the mapped view of MAPPING_SIZE bytes.
+        let v = unsafe { p2c_shm::dll_version(base) };
+        if self.dll_version == Some(v) {
+            return;
+        }
+        self.dll_version = Some(v);
+        let status = camera_driver_status(v);
+        match &status {
+            Some(s) => tracing::warn!(
+                dll_version = v,
+                app_version = p2c_shm::VERSION,
+                "virtual camera: {s}"
+            ),
+            None => tracing::info!(dll_version = v, "camera driver version ok"),
+        }
+        self.status.set(status);
+    }
+}
+
 impl FrameSink for WinVcamSink {
-    fn push(&mut self, frame: &Frame) -> anyhow::Result<()> {
+    /// Writes `out.camera` (NV12, fitted into 1920x1080) into the shared memory.
+    fn push(&mut self, out: &Output) -> anyhow::Result<()> {
         self.try_map();
-        let Some(v) = &self.view else { return Ok(()) };
-        let fits = frame.width <= p2c_shm::MAX_WIDTH && frame.height <= p2c_shm::MAX_HEIGHT;
-        let scaled;
-        let f = if fits {
-            frame
-        } else {
-            scaled = scale_frame(frame, p2c_shm::MAX_WIDTH, p2c_shm::MAX_HEIGHT);
-            &scaled
+        let Some(base) = self.view.as_ref().map(|v| v.view.Value as *mut u8) else {
+            return Ok(());
+        };
+        self.check_driver(base);
+        let Some(f) = out.camera.as_deref() else {
+            return Ok(());
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         // SAFETY: the view is MAPPING_SIZE bytes, page-aligned, and stays mapped while self lives.
-        unsafe {
+        let ok = unsafe {
             p2c_shm::write_frame(
-                v.view.Value as *mut u8,
-                p2c_shm::PixelFormat::Bgra,
+                base,
+                p2c_shm::PixelFormat::Nv12,
                 f.width,
                 f.height,
                 &f.data,
                 now,
             )
         };
+        anyhow::ensure!(
+            ok,
+            "camera frame {}x{} does not fit the shared memory",
+            f.width,
+            f.height
+        );
         Ok(())
     }
 }

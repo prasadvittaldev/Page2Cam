@@ -12,6 +12,9 @@ pub struct StreamConfig {
     pub height: u32,
     pub fps: u32,
     pub video_kbps: u32,
+    /// Raw video input format: `"bgra"` (`Output::bgra`) or `"nv12"`
+    /// (`Output::nv12`, BT.709 limited range).
+    pub pix_fmt: &'static str,
 }
 
 /// Full publish URL. Contains the key: never log it unredacted.
@@ -23,7 +26,7 @@ pub fn target_url(cfg: &StreamConfig) -> String {
     }
 }
 
-/// ffmpeg command line: raw BGRA video on stdin, f32le stereo audio from a TCP
+/// ffmpeg command line: raw BGRA or NV12 video on stdin, f32le stereo audio from a TCP
 /// socket we listen on, H.264 + AAC in FLV to the RTMP target.
 pub fn ffmpeg_args(cfg: &StreamConfig, audio_port: u16) -> Vec<String> {
     let gop = (cfg.fps * 2).to_string();
@@ -46,12 +49,16 @@ pub fn ffmpeg_args(cfg: &StreamConfig, audio_port: u16) -> Vec<String> {
         "-f",
         "rawvideo",
         "-pix_fmt",
-        "bgra",
-        "-s",
+        cfg.pix_fmt,
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
+    if cfg.pix_fmt == "nv12" {
+        // Our NV12 is BT.709 limited range (p2c_core::bgra_to_nv12).
+        a.extend(["-colorspace", "bt709", "-color_range", "tv"].map(String::from));
+    }
+    a.push("-s".into());
     a.push(format!("{}x{}", cfg.width, cfg.height));
     a.extend([
         "-framerate".to_string(),
@@ -157,7 +164,34 @@ mod tests {
             height: 1080,
             fps: 30,
             video_kbps: 4500,
+            pix_fmt: "bgra",
         }
+    }
+
+    #[test]
+    fn nv12_input_args() {
+        let c = StreamConfig {
+            pix_fmt: "nv12",
+            ..cfg()
+        };
+        let s = ffmpeg_args(&c, 50123).join(" ");
+        assert!(
+            s.contains(
+                "-f rawvideo -pix_fmt nv12 -colorspace bt709 -color_range tv \
+                 -s 1920x1080 -framerate 30 -i pipe:0"
+            ),
+            "{s}"
+        );
+        // BGRA input is not tagged (it is RGB) and otherwise identical.
+        let b = ffmpeg_args(&cfg(), 50123).join(" ");
+        assert!(
+            !b.contains("-colorspace") && !b.contains("-color_range"),
+            "{b}"
+        );
+        assert_eq!(
+            b.replace("-pix_fmt bgra", ""),
+            s.replace("-pix_fmt nv12 -colorspace bt709 -color_range tv", "")
+        );
     }
 
     #[test]

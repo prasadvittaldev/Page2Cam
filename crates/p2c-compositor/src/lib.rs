@@ -5,4 +5,6 @@ mod ticker;
 
 pub use compose::{scale_frame, scale_frame_straight, Compositor, Pip};
 pub use pip::{pip_rect, Corner, OverlayStyle, PipLayout};
-pub use ticker::{FrameSink, OutputSpec, Ticker};
+pub use ticker::{
+    CpuProducer, FrameSink, Output, OutputFormat, OutputProducer, OutputSpec, TickInputs, Ticker,
+};

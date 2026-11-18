@@ -26,6 +26,10 @@ pub struct App {
     pub webcam_slot: Option<FrameSlot>,
     pub webcam_status: String,
     pub vcam_status: String,
+    /// Problems the camera sink found while running (e.g. an old driver); wins over `vcam_status`.
+    pub vcam_live: p2c_vcam::CameraStatus,
+    /// ffmpeg raw input format matching the ticker's output (`"nv12"` or `"bgra"`).
+    pub stream_pix_fmt: &'static str,
     pub stream_url: Mutex<String>,
     pub width: u32,
     pub height: u32,
@@ -255,6 +259,7 @@ impl Controls for App {
             height: self.height,
             fps: self.fps,
             video_kbps: self.video_kbps,
+            pix_fmt: self.stream_pix_fmt,
         };
         self.stream.start(cfg, &ffmpeg)
     }
@@ -305,7 +310,10 @@ impl Controls for App {
             width: self.width,
             height: self.height,
             fps: self.fps,
-            vcam: self.vcam_status.clone(),
+            vcam: self
+                .vcam_live
+                .status()
+                .unwrap_or_else(|| self.vcam_status.clone()),
             webcam: self.webcam_status.clone(),
             webcam_aspect,
             stream,

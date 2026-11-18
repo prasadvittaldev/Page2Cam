@@ -42,6 +42,13 @@ impl<T> Slot<T> {
         g.1 += 1;
     }
 
+    /// Like `put`, for a value that is already shared (no copy).
+    pub fn put_arc(&self, v: Arc<T>) {
+        let mut g = self.inner.lock();
+        g.0 = Some(v);
+        g.1 += 1;
+    }
+
     pub fn latest(&self) -> Option<Arc<T>> {
         self.inner.lock().0.clone()
     }

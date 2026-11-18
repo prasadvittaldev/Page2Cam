@@ -2,11 +2,11 @@
 //! that only works while an admin page is watching.
 use std::time::Duration;
 
-use p2c_compositor::{scale_frame, FrameSink};
+use p2c_compositor::{scale_frame, FrameSink, Output};
 use p2c_core::{Frame, FrameSlot};
 use tokio::sync::watch;
 
-/// Puts every `every`-th composited frame into a slot (cheap; no encoding here).
+/// Puts preview frames into a slot (cheap: shares the frame; no encoding here).
 pub struct PreviewSink {
     slot: FrameSlot,
     every: u32,
@@ -24,10 +24,19 @@ impl PreviewSink {
 }
 
 impl FrameSink for PreviewSink {
-    fn push(&mut self, frame: &Frame) -> anyhow::Result<()> {
+    /// `out.preview` (NV12 output: the ticker already chose the cadence) is
+    /// forwarded as is; otherwise every `every`-th `out.bgra` is sampled.
+    fn push(&mut self, out: &Output) -> anyhow::Result<()> {
+        if let Some(p) = &out.preview {
+            self.slot.put_arc(p.clone());
+            return Ok(());
+        }
+        let Some(frame) = &out.bgra else {
+            return Ok(());
+        };
         self.n = self.n.wrapping_add(1);
         if self.n.is_multiple_of(self.every) {
-            self.slot.put(frame.clone());
+            self.slot.put_arc(frame.clone());
         }
         Ok(())
     }
@@ -91,11 +100,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sink_samples_every_nth() {
+    fn preview_uses_preview_or_bgra() {
+        // NV12 path: the ticker decides the cadence; every `preview` is forwarded as is.
+        let slot = FrameSlot::new();
+        let mut s = PreviewSink::new(slot.clone(), 3);
+        let f = std::sync::Arc::new(Frame::new_black(4, 4));
+        s.push(&Output {
+            preview: Some(f.clone()),
+            ..Output::default()
+        })
+        .unwrap();
+        assert_eq!(slot.seq(), 1);
+        assert!(std::sync::Arc::ptr_eq(&slot.latest().unwrap(), &f));
+        s.push(&Output::default()).unwrap();
+        assert_eq!(slot.seq(), 1);
+
+        // BGRA path: every `every`-th frame is sampled, as before.
         let slot = FrameSlot::new();
         let mut s = PreviewSink::new(slot.clone(), 3);
         for _ in 0..9 {
-            s.push(&Frame::new_black(4, 4)).unwrap();
+            s.push(&Output {
+                bgra: Some(std::sync::Arc::new(Frame::new_black(4, 4))),
+                ..Output::default()
+            })
+            .unwrap();
         }
         assert_eq!(slot.seq(), 3);
     }

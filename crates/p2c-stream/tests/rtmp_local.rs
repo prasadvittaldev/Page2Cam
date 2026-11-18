@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use p2c_audio::{MixSettings, Mixer};
-use p2c_compositor::FrameSink;
+use p2c_compositor::{FrameSink, Output};
 use p2c_core::{AudioRing, Frame};
 use p2c_stream::{find_ffmpeg, StreamConfig, StreamController, StreamState};
 
@@ -45,12 +45,17 @@ fn streams_h264_and_aac_to_rtmp() {
         height: 180,
         fps: 30,
         video_kbps: 800,
+        pix_fmt: "bgra",
     };
     c.start(cfg, &find_ffmpeg().expect("ffmpeg on PATH"))
         .unwrap();
     let mut live = false;
     for i in 0..120 {
-        sink.push(&Frame::new_black(320, 180)).unwrap();
+        sink.push(&Output {
+            bgra: Some(std::sync::Arc::new(Frame::new_black(320, 180))),
+            ..Output::default()
+        })
+        .unwrap();
         let tone: Vec<f32> = (0..1600)
             .map(|j| (((i * 1600 + j) / 2) as f32 * 0.06).sin() * 0.3)
             .collect();

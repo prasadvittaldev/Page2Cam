@@ -12,7 +12,7 @@ use clap::Parser;
 use p2c_admin::{AdminConfig, PreviewSink};
 use p2c_audio::{MixSettings, Mixer};
 use p2c_browser::BrowserConfig;
-use p2c_compositor::{FrameSink, OutputSpec, Ticker};
+use p2c_compositor::{CpuProducer, FrameSink, OutputFormat, OutputSpec, Ticker};
 use p2c_core::AudioRing;
 use p2c_core::FrameSlot;
 use p2c_stream::StreamController;
@@ -133,15 +133,24 @@ fn run() -> anyhow::Result<()> {
         width: cfg.width,
         height: cfg.height,
         fps: cfg.fps,
+        // Windows feeds the camera and the stream NV12 (BT.709, converted here);
+        // Linux keeps BGRA (v4l2 YUYV sink, BGRA stream input).
+        format: if cfg!(windows) {
+            OutputFormat::Nv12
+        } else {
+            OutputFormat::Bgra
+        },
     };
 
     // Outputs. The virtual camera is optional: preview and streaming still work without it.
     let mut sinks: Vec<Box<dyn FrameSink>> = Vec::new();
     let mut own_device = None;
+    let mut vcam_live = p2c_vcam::CameraStatus::default();
     let vcam_status = match p2c_vcam::open_default(cfg.vcam_device.as_deref(), &spec) {
         Ok(cam) => {
             tracing::info!("virtual camera: {}", cam.description);
             own_device = cam.own_device;
+            vcam_live = cam.status;
             sinks.push(cam.sink);
             format!("ok: {}", cam.description)
         }
@@ -192,7 +201,8 @@ fn run() -> anyhow::Result<()> {
     }
     let ticker = Ticker::spawn(
         spec,
-        PAGE.clone(),
+        Box::new(CpuProducer::new(spec)),
+        Some(PAGE.clone()),
         webcam_slot.clone(),
         segmenter.as_ref().map(|_| matte.clone()),
         layout.clone(),
@@ -219,6 +229,11 @@ fn run() -> anyhow::Result<()> {
         webcam_slot,
         webcam_status,
         vcam_status,
+        vcam_live,
+        stream_pix_fmt: match spec.format {
+            OutputFormat::Nv12 => "nv12",
+            OutputFormat::Bgra => "bgra",
+        },
         stream_url: Mutex::new(cfg.rtmp_url.clone()),
         width: cfg.width,
         height: cfg.height,

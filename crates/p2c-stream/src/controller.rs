@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use p2c_audio::Mixer;
-use p2c_compositor::FrameSink;
-use p2c_core::{Frame, FrameSlot};
+use p2c_compositor::{FrameSink, Output};
+use p2c_core::{Frame, Nv12Frame, Slot};
 use parking_lot::Mutex;
 
 use crate::{ffmpeg_args, redact, StreamConfig};
@@ -34,16 +34,56 @@ impl std::fmt::Display for StreamState {
     }
 }
 
+/// A frame for the video writer, shared with the ticker (no copy).
+pub(crate) enum VideoFrame {
+    Bgra(Arc<Frame>),
+    Nv12(Arc<Nv12Frame>),
+}
+
+impl VideoFrame {
+    /// The raw bytes, if this frame is `pix_fmt` at `w`x`h`.
+    fn bytes(&self, pix_fmt: &str, w: u32, h: u32) -> Option<&[u8]> {
+        match self {
+            VideoFrame::Bgra(f) if pix_fmt == "bgra" && (f.width, f.height) == (w, h) => {
+                Some(&f.data)
+            }
+            VideoFrame::Nv12(f) if pix_fmt == "nv12" && (f.width, f.height) == (w, h) => {
+                Some(&f.data)
+            }
+            _ => None,
+        }
+    }
+}
+
+pub(crate) type VideoSlot = Slot<VideoFrame>;
+
+/// A black frame in `pix_fmt` (NV12: Y 16, UV 128; BGRA: opaque black).
+fn black_frame(pix_fmt: &str, w: u32, h: u32) -> Vec<u8> {
+    if pix_fmt == "nv12" {
+        let luma = w as usize * h as usize;
+        let mut v = vec![16u8; luma + luma / 2];
+        v[luma..].fill(128);
+        v
+    } else {
+        Frame::new_black(w, h).data
+    }
+}
+
 /// Ticker-side sink: hands frames to the stream writer without blocking.
+/// Takes `out.nv12` when present, else `out.bgra`.
 pub struct StreamSink {
-    slot: FrameSlot,
+    slot: VideoSlot,
     active: Arc<AtomicBool>,
 }
 
 impl FrameSink for StreamSink {
-    fn push(&mut self, frame: &Frame) -> anyhow::Result<()> {
+    fn push(&mut self, out: &Output) -> anyhow::Result<()> {
         if self.active.load(Ordering::Relaxed) {
-            self.slot.put(frame.clone());
+            if let Some(f) = &out.nv12 {
+                self.slot.put(VideoFrame::Nv12(f.clone()));
+            } else if let Some(f) = &out.bgra {
+                self.slot.put(VideoFrame::Bgra(f.clone()));
+            }
         }
         Ok(())
     }
@@ -58,7 +98,7 @@ struct Running {
 /// Starts/stops one ffmpeg RTMP publish at a time.
 pub struct StreamController {
     mixer: Mixer,
-    slot: FrameSlot,
+    slot: VideoSlot,
     active: Arc<AtomicBool>,
     state: Arc<Mutex<StreamState>>,
     running: Mutex<Option<Running>>,
@@ -68,7 +108,7 @@ impl StreamController {
     pub fn new(mixer: Mixer) -> Self {
         StreamController {
             mixer,
-            slot: FrameSlot::new(),
+            slot: VideoSlot::new(),
             active: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(StreamState::Idle)),
             running: Mutex::new(None),
@@ -136,7 +176,7 @@ impl StreamController {
             let (slot, stop, spec) = (
                 self.slot.clone(),
                 stop.clone(),
-                (cfg.width, cfg.height, cfg.fps),
+                (cfg.width, cfg.height, cfg.fps, cfg.pix_fmt),
             );
             threads.push(thread("p2c-stream-video", move || {
                 write_video(stdin, slot, stop, spec, t0, skip)
@@ -199,15 +239,15 @@ fn thread(name: &str, f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
 /// video and audio (paced from the same `t0`) stay on one timeline.
 fn write_video(
     mut stdin: impl Write,
-    slot: FrameSlot,
+    slot: VideoSlot,
     stop: Arc<AtomicBool>,
-    (w, h, fps): (u32, u32, u32),
+    (w, h, fps, pix_fmt): (u32, u32, u32, &str),
     t0: Instant,
     audio_skip: Arc<AtomicU64>,
 ) {
     let fps = fps.max(1);
     let period = Duration::from_secs_f64(1.0 / fps as f64);
-    let black = Frame::new_black(w, h);
+    let black = black_frame(pix_fmt, w, h);
     let mut n: u64 = 0;
     let mut last_warn: Option<Instant> = None;
     while !stop.load(Ordering::Relaxed) {
@@ -235,9 +275,9 @@ fn write_video(
             let latest = slot.latest();
             let f = latest
                 .as_deref()
-                .filter(|f| f.width == w && f.height == h)
+                .and_then(|f| f.bytes(pix_fmt, w, h))
                 .unwrap_or(&black);
-            if stdin.write_all(&f.data).is_err() {
+            if stdin.write_all(f).is_err() {
                 return;
             }
             n += 1;
@@ -427,7 +467,7 @@ mod tests {
         let t0 = Instant::now();
         let h = std::thread::spawn(move || {
             let skip = Arc::new(AtomicU64::new(0));
-            write_video(sink, FrameSlot::new(), stop2, (4, 4, 30), t0, skip)
+            write_video(sink, VideoSlot::new(), stop2, (4, 4, 30, "bgra"), t0, skip)
         });
         std::thread::sleep(Duration::from_millis(3000));
         stop.store(true, Ordering::SeqCst);
@@ -473,7 +513,7 @@ mod tests {
             buf: Vec::new(),
             per_frame: Duration::from_millis(50),
         };
-        let slot = FrameSlot::new();
+        let slot = VideoSlot::new();
         let stop = Arc::new(AtomicBool::new(false));
         let feeder = {
             let (slot, stop) = (slot.clone(), stop.clone());
@@ -481,7 +521,9 @@ mod tests {
                 let mut v = 0u8;
                 while !stop.load(Ordering::SeqCst) {
                     v = v.wrapping_add(1);
-                    slot.put(Frame::from_bgra(4, 4, vec![v; 64]).unwrap());
+                    slot.put(VideoFrame::Bgra(Arc::new(
+                        Frame::from_bgra(4, 4, vec![v; 64]).unwrap(),
+                    )));
                     std::thread::sleep(Duration::from_millis(33));
                 }
             })
@@ -489,7 +531,9 @@ mod tests {
         let skip = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (stop2, skip2) = (stop.clone(), skip.clone());
         let t0 = Instant::now();
-        let h = std::thread::spawn(move || write_video(sink, slot, stop2, (4, 4, 30), t0, skip2));
+        let h = std::thread::spawn(move || {
+            write_video(sink, slot, stop2, (4, 4, 30, "bgra"), t0, skip2)
+        });
         std::thread::sleep(Duration::from_millis(9000));
         stop.store(true, Ordering::SeqCst);
         h.join().unwrap();
@@ -505,6 +549,79 @@ mod tests {
             skip.load(Ordering::SeqCst) > 0,
             "audio was never told to drop the backlog"
         );
+    }
+
+    /// Collects everything written.
+    struct Bytes(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl Write for Bytes {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs the video writer for ~100 ms and returns what it wrote.
+    fn write_for_a_bit(slot: VideoSlot, pix_fmt: &'static str) -> Vec<u8> {
+        let got = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Bytes(got.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let h = std::thread::spawn(move || {
+            let skip = Arc::new(AtomicU64::new(0));
+            write_video(sink, slot, stop2, (4, 4, 30, pix_fmt), Instant::now(), skip)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+        let v = got.lock().clone();
+        v
+    }
+
+    #[test]
+    fn nv12_stream_writes_nv12_frames() {
+        let mut sink = StreamSink {
+            slot: VideoSlot::new(),
+            active: Arc::new(AtomicBool::new(true)),
+        };
+        let nv12 = Arc::new(p2c_core::Nv12Frame::new(4, 4, vec![77; 24]).unwrap());
+        sink.push(&Output {
+            nv12: Some(nv12),
+            ..Output::default()
+        })
+        .unwrap();
+        let got = write_for_a_bit(sink.slot.clone(), "nv12");
+        assert!(
+            got.len() >= 24 && got.len().is_multiple_of(24),
+            "{}",
+            got.len()
+        );
+        assert!(got.iter().all(|&b| b == 77));
+        // No frame yet: NV12 black (Y 16, UV 128), not BGRA zeros.
+        let got = write_for_a_bit(VideoSlot::new(), "nv12");
+        assert!(!got.is_empty() && got.len().is_multiple_of(24));
+        assert_eq!(
+            &got[..24],
+            &[[16u8; 16].as_slice(), &[128u8; 8]].concat()[..]
+        );
+    }
+
+    #[test]
+    fn bgra_stream_takes_bgra_from_output() {
+        let mut sink = StreamSink {
+            slot: VideoSlot::new(),
+            active: Arc::new(AtomicBool::new(true)),
+        };
+        sink.push(&Output {
+            bgra: Some(Arc::new(Frame::from_bgra(4, 4, vec![9; 64]).unwrap())),
+            ..Output::default()
+        })
+        .unwrap();
+        let got = write_for_a_bit(sink.slot.clone(), "bgra");
+        assert!(got.len() >= 64 && got.len().is_multiple_of(64));
+        assert!(got.iter().all(|&b| b == 9));
     }
 
     #[test]
@@ -527,6 +644,7 @@ mod tests {
             height: 36,
             fps: 30,
             video_kbps: 500,
+            pix_fmt: "bgra",
         };
         let err = c
             .start(cfg, std::path::Path::new("/nonexistent/ffmpeg"))
