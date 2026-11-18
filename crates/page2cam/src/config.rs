@@ -27,6 +27,10 @@ pub struct Config {
     pub rtmp_url: String,
     /// Stream video bitrate in kbit/s.
     pub video_kbps: u32,
+    /// Webcam overlay style: box | cutout-small | cutout-full
+    pub overlay_style: String,
+    /// Cut-out engine: quality | fast
+    pub cutout_engine: String,
 }
 
 impl Default for Config {
@@ -44,6 +48,8 @@ impl Default for Config {
             open_admin: true,
             rtmp_url: "rtmp://a.rtmp.youtube.com/live2".into(),
             video_kbps: 4500,
+            overlay_style: "box".into(),
+            cutout_engine: "quality".into(),
         }
     }
 }
@@ -99,6 +105,16 @@ impl Config {
         );
         self.pip_layout()?;
         anyhow::ensure!(
+            p2c_compositor::OverlayStyle::parse(&self.overlay_style).is_some(),
+            "unknown overlay_style {:?} (use box, cutout-small or cutout-full)",
+            self.overlay_style
+        );
+        anyhow::ensure!(
+            ["quality", "fast"].contains(&self.cutout_engine.as_str()),
+            "unknown cutout_engine {:?} (use quality or fast)",
+            self.cutout_engine
+        );
+        anyhow::ensure!(
             (500..=20_000).contains(&self.video_kbps),
             "video_kbps must be 500..=20000 (got {})",
             self.video_kbps
@@ -124,7 +140,12 @@ impl Config {
                 "unknown pip position {other:?} (use top-left, top-right, bottom-left, bottom-right or off)"
             ),
         };
-        Ok(PipLayout::preset(corner, width))
+        let mut l = PipLayout::preset(corner, width);
+        l.style = p2c_compositor::OverlayStyle::parse(&self.overlay_style).unwrap_or_default();
+        if l.style == p2c_compositor::OverlayStyle::CutoutFull {
+            l.x = 0.5;
+        }
+        Ok(l)
     }
 }
 
@@ -147,9 +168,74 @@ fn config_path(
     })
 }
 
+/// Set one top-level `key = "value"` in the TOML file at `path`, keeping its
+/// comments and other settings. Creates the file (and folder) if missing.
+pub fn save_choice(path: &Path, key: &str, value: &str) -> anyhow::Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    doc[key] = toml_edit::value(value);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Where operator choices are saved: the settings file in use, else the
+/// user's config file.
+pub fn save_path(explicit: Option<&Path>) -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let user_dir =
+        directories::ProjectDirs::from("", "", "page2cam").map(|d| d.config_dir().to_path_buf());
+    config_path(explicit, exe_dir.as_deref(), user_dir.as_deref())
+        .or_else(|| user_dir.map(|d| d.join("config.toml")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_choice_keeps_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("page2cam.toml");
+        std::fs::write(&p, "# my comment\nfps = 25\noverlay_style = \"box\"\n").unwrap();
+        save_choice(&p, "overlay_style", "cutout-full").unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# my comment"), "{text}");
+        let c: Config = toml::from_str(&text).unwrap();
+        assert_eq!((c.overlay_style.as_str(), c.fps), ("cutout-full", 25));
+    }
+
+    #[test]
+    fn save_choice_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sub").join("config.toml");
+        save_choice(&p, "cutout_engine", "fast").unwrap();
+        let c: Config = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(c.cutout_engine, "fast");
+    }
+
+    #[test]
+    fn rejects_bad_overlay_style() {
+        let c = Config {
+            overlay_style: "sparkles".into(),
+            ..Config::default()
+        };
+        assert!(c.validate().is_err());
+        let c = Config {
+            cutout_engine: "turbo".into(),
+            ..Config::default()
+        };
+        assert!(c.validate().is_err());
+    }
 
     #[test]
     fn defaults_are_1080p30() {

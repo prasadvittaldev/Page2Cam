@@ -8,6 +8,7 @@ use p2c_audio::{MicCapture, MixSettings, Mixer};
 use p2c_browser::{BrowserHandle, KeyInput, KeyKind, MouseButton};
 use p2c_compositor::PipLayout;
 use p2c_core::{AudioRing, FrameSlot};
+use p2c_segment::{EngineChoice, Segmenter};
 use p2c_stream::{StreamConfig, StreamController, StreamState};
 use parking_lot::{Mutex, RwLock};
 
@@ -32,6 +33,12 @@ pub struct App {
     pub video_kbps: u32,
     pub fallback_url: Mutex<String>,
     pub log_file: String,
+    /// Cut-out thread; None without a webcam.
+    pub segmenter: Option<Segmenter>,
+    /// Where operator choices (style, engine) are saved.
+    pub settings_path: Option<std::path::PathBuf>,
+    /// Mic delay currently applied, in ms.
+    pub mic_delay_ms: Mutex<u32>,
 }
 
 impl App {
@@ -75,6 +82,59 @@ impl App {
                 self.mic_ring.clear();
             }
             *self.mic_status.lock() = "off".into();
+        }
+    }
+}
+
+impl App {
+    fn save_choice(&self, key: &str, value: &str) {
+        let Some(p) = &self.settings_path else { return };
+        match crate::config::save_choice(p, key, value) {
+            Ok(()) => tracing::info!(key, value, file = %p.display(), "setting saved"),
+            Err(e) => tracing::warn!("could not save {key}: {e:#}"),
+        }
+    }
+
+    /// The cut-out line for the admin status bar.
+    fn cutout_status(&self) -> String {
+        let Some(seg) = &self.segmenter else {
+            return "no webcam".into();
+        };
+        if !self.layout.read().style.is_cutout() {
+            return "off (Box style)".into();
+        }
+        let st = seg.status();
+        let running = match (st.active, st.device) {
+            (Some(a), Some(d)) => format!("{a} · {d} · {:.0} masks/s", st.masks_per_sec),
+            _ => String::new(),
+        };
+        match (running.is_empty(), st.note.is_empty()) {
+            (true, true) => "starting…".into(),
+            (true, false) => format!("error: {}", st.note),
+            (false, true) => running,
+            (false, false) => format!("{running}. {}", st.note),
+        }
+    }
+
+    /// Delay the mic by the cut-out's processing time so lips match the
+    /// voice on the stream. Changes under 20 ms are ignored to avoid churn.
+    pub fn update_mic_delay(&self) {
+        let want = match &self.segmenter {
+            Some(seg) if self.layout.read().style.is_cutout() => {
+                let st = seg.status();
+                if st.active.is_some() {
+                    st.latency_ms
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+        let mut cur = self.mic_delay_ms.lock();
+        if want.abs_diff(*cur) > 20 || (want == 0 && *cur != 0) {
+            self.mixer.set_mic_delay_ms(want);
+            tracing::debug!(ms = want, "mic delay");
+            *cur = want;
         }
     }
 }
@@ -136,7 +196,14 @@ impl Controls for App {
     }
 
     fn set_pip(&self, l: PipLayout) {
-        *self.layout.write() = l;
+        let old = std::mem::replace(&mut *self.layout.write(), l);
+        if old.style != l.style {
+            tracing::info!(style = l.style.as_str(), "overlay style");
+            self.save_choice("overlay_style", l.style.as_str());
+        }
+        if let Some(seg) = &self.segmenter {
+            seg.set_enabled(l.visible && l.style.is_cutout());
+        }
     }
 
     fn start_stream(&self, req: StreamRequest) -> anyhow::Result<()> {
@@ -220,16 +287,30 @@ impl Controls for App {
             has_saved_key: Self::saved_key().is_some(),
             mic: self.mic_status.lock().clone(),
             log_file: self.log_file.clone(),
-            cutout: "not available yet".into(),
-            cutout_engine: "quality".into(),
+            cutout: self.cutout_status(),
+            cutout_engine: self.cutout_engine(),
         }
     }
 
     fn cutout_engine(&self) -> String {
-        "quality".into()
+        self.segmenter
+            .as_ref()
+            .map(|s| s.status().requested)
+            .unwrap_or_default()
+            .as_str()
+            .into()
     }
 
-    fn set_cutout_engine(&self, _engine: &str) -> anyhow::Result<()> {
-        anyhow::bail!("the cut-out is not available yet")
+    fn set_cutout_engine(&self, engine: &str) -> anyhow::Result<()> {
+        let choice = EngineChoice::parse(engine)
+            .ok_or_else(|| anyhow::anyhow!("unknown cut-out engine {engine:?}"))?;
+        let seg = self
+            .segmenter
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no webcam, so no cut-out"))?;
+        tracing::info!(engine, "cut-out engine chosen");
+        seg.set_choice(choice);
+        self.save_choice("cutout_engine", engine);
+        Ok(())
     }
 }

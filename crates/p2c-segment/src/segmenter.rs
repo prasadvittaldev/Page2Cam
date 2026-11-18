@@ -99,6 +99,11 @@ impl Segmenter {
         self.shared.status.lock().clone()
     }
 
+    /// Ask the thread to finish without waiting (for owners behind an `Arc`).
+    pub fn request_stop(&self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+    }
+
     pub fn stop(mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {

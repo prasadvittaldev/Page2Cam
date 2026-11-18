@@ -13,6 +13,7 @@ p2c-webcam.workspace = true
 p2c-audio.workspace = true
 p2c-stream.workspace = true
 p2c-admin.workspace = true
+p2c-segment.workspace = true
 parking_lot.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -20,6 +21,8 @@ tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+toml_edit = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 directories = "5"
 ctrlc = { version = "3", features = ["termination"] }
 keyring = { version = "3", features = ["windows-native", "sync-secret-service", "crypto-rust"] }

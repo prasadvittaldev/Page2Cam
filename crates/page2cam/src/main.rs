@@ -60,6 +60,9 @@ struct Cli {
     /// Admin page port (default 8765)
     #[arg(long)]
     admin_port: Option<u16>,
+    /// Use a still image (PNG/JPEG) as the webcam, for testing without a camera
+    #[arg(long, value_name = "IMAGE")]
+    fake_webcam: Option<PathBuf>,
 }
 
 impl Cli {
@@ -166,17 +169,31 @@ fn run() -> anyhow::Result<()> {
     sinks.push(Box::new(stream.sink()));
 
     let layout = Arc::new(RwLock::new(cfg.pip_layout()?));
-    let webcam = start_webcam(&cfg, own_device.as_deref());
+    let webcam = match &cli.fake_webcam {
+        Some(img) => start_fake_webcam(img),
+        None => start_webcam(&cfg, own_device.as_deref()),
+    };
     let webcam_status = match &webcam {
         Some((_, _, name)) => format!("ok: {name}"),
         None => "none".to_string(),
     };
     let webcam_slot = webcam.as_ref().map(|(slot, _, _)| slot.clone());
+
+    // Cut-out: segmentation runs on its own thread and publishes the webcam
+    // frame with the person mask in its alpha byte.
+    let matte = FrameSlot::new();
+    let segmenter = webcam_slot
+        .as_ref()
+        .map(|cam| start_segmenter(&cfg, cam.clone(), matte.clone()));
+    if let Some(seg) = &segmenter {
+        let l = *layout.read();
+        seg.set_enabled(l.visible && l.style.is_cutout());
+    }
     let ticker = Ticker::spawn(
         spec,
         PAGE.clone(),
         webcam_slot.clone(),
-        None,
+        segmenter.as_ref().map(|_| matte.clone()),
         layout.clone(),
         sinks,
     );
@@ -201,7 +218,24 @@ fn run() -> anyhow::Result<()> {
         log_file: log_file
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
+        segmenter,
+        settings_path: config::save_path(cli.config.as_deref()),
+        mic_delay_ms: Mutex::new(0),
     });
+
+    // Keep the mic in step with the cut-out's processing delay.
+    let quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let delay_thread = {
+        let (app, quit) = (app.clone(), quit.clone());
+        std::thread::Builder::new()
+            .name("p2c-mic-delay".into())
+            .spawn(move || {
+                while !quit.load(std::sync::atomic::Ordering::Relaxed) {
+                    app.update_mic_delay();
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            })?
+    };
 
     let admin = p2c_admin::serve(
         AdminConfig {
@@ -249,6 +283,11 @@ fn run() -> anyhow::Result<()> {
         })
     };
     tracing::info!("shutting down");
+    quit.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = delay_thread.join();
+    if let Some(seg) = &app.segmenter {
+        seg.request_stop();
+    }
     app.stream.stop();
     if let Some(m) = app.mic.lock().take() {
         m.stop();
@@ -266,7 +305,7 @@ static PAGE: std::sync::LazyLock<FrameSlot> = std::sync::LazyLock::new(FrameSlot
 fn start_webcam(
     cfg: &Config,
     own_device: Option<&Path>,
-) -> Option<(FrameSlot, WebcamCapture, String)> {
+) -> Option<(FrameSlot, WebcamSource, String)> {
     if !cfg.pip_layout().ok()?.visible {
         return None;
     }
@@ -281,7 +320,7 @@ fn start_webcam(
     match WebcamCapture::start(&cam, slot.clone()) {
         Ok(cap) => {
             tracing::info!(webcam = %cam.name, "webcam on");
-            Some((slot, cap, cam.name.clone()))
+            Some((slot, WebcamSource::Real(cap), cam.name.clone()))
         }
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "webcam failed; running without PIP");
@@ -290,8 +329,70 @@ fn start_webcam(
     }
 }
 
-fn stop_webcam(webcam: Option<(FrameSlot, WebcamCapture, String)>) {
-    if let Some((_, cap, _)) = webcam {
-        cap.stop();
+/// A running webcam source.
+enum WebcamSource {
+    Real(WebcamCapture),
+    /// `--fake-webcam`: a still image re-published at 30 fps.
+    Fake(
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ),
+}
+
+fn stop_webcam(webcam: Option<(FrameSlot, WebcamSource, String)>) {
+    match webcam.map(|(_, src, _)| src) {
+        Some(WebcamSource::Real(cap)) => cap.stop(),
+        Some(WebcamSource::Fake(stop, h)) => {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = h.join();
+        }
+        None => {}
     }
+}
+
+/// `--fake-webcam`: decode `img` once and publish it like a 30 fps camera.
+fn start_fake_webcam(img: &Path) -> Option<(FrameSlot, WebcamSource, String)> {
+    let rgba = match image::open(img) {
+        Ok(i) => i.to_rgba8(),
+        Err(e) => {
+            tracing::warn!(image = %img.display(), "fake webcam image unreadable: {e}");
+            return None;
+        }
+    };
+    let (w, h) = rgba.dimensions();
+    let mut data = rgba.into_raw();
+    for px in data.as_chunks_mut::<4>().0 {
+        px.swap(0, 2); // RGBA -> BGRA
+    }
+    let frame = p2c_core::Frame::from_bgra(w, h, data).ok()?;
+    let slot = FrameSlot::new();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (s2, stop2) = (slot.clone(), stop.clone());
+    let handle = std::thread::spawn(move || {
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            s2.put(frame.clone());
+            std::thread::sleep(std::time::Duration::from_millis(33));
+        }
+    });
+    let name = format!("fake: {}", img.display());
+    tracing::info!(webcam = %name, "webcam on");
+    Some((slot, WebcamSource::Fake(stop, handle), name))
+}
+
+/// Load ONNX Runtime and start the cut-out thread (disabled until a cut-out
+/// style is chosen). If the runtime can't load, the thread reports why.
+fn start_segmenter(cfg: &Config, webcam: FrameSlot, matte: FrameSlot) -> p2c_segment::Segmenter {
+    let runtime_dir = p2c_segment::runtime_dir();
+    let models = p2c_segment::models_dir();
+    let loaded = p2c_segment::runtime::init(&runtime_dir).map_err(|e| format!("{e:#}"));
+    match &loaded {
+        Ok(()) => tracing::info!(dir = %runtime_dir.display(), "ONNX Runtime loaded"),
+        Err(e) => tracing::warn!("cut-out unavailable: {e}"),
+    }
+    let choice = p2c_segment::EngineChoice::parse(&cfg.cutout_engine).unwrap_or_default();
+    let opener: p2c_segment::Opener = Box::new(move |c| match &loaded {
+        Ok(()) => p2c_segment::open_engine(&models, c),
+        Err(e) => anyhow::bail!("{e}"),
+    });
+    p2c_segment::Segmenter::spawn(opener, webcam, matte, choice)
 }
