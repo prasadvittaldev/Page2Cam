@@ -155,6 +155,26 @@ pub struct Status {
     /// "quality" | "fast"
     pub cutout_engine: String,
     pub update: UpdateInfo,
+    /// What makes the video, e.g. "GPU: NVIDIA RTX 2000 Ada" or
+    /// "CPU (fallback: <short reason>)".
+    pub video: String,
+    /// Stream encoder: "NVENC" | "Quick Sync" | "AMF" | "x264" | "probing…".
+    pub encoder: String,
+    /// Saved `gpu` setting: "auto" | "cpu" | an adapter name.
+    pub gpu_choice: String,
+    /// The `gpu` setting this run started with (same forms).
+    pub gpu_running: String,
+    /// The saved choice differs from the running one: a restart applies it.
+    pub restart_needed: bool,
+}
+
+/// One entry of the "Video processing" picker.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuInfo {
+    /// "auto", "cpu" or the exact adapter name (the value to save).
+    pub name: String,
+    /// "auto" | "discrete" | "onboard" | "cpu"
+    pub kind: String,
 }
 
 /// Software update state for the banner.
@@ -188,4 +208,11 @@ pub trait Controls: Send + Sync + 'static {
     fn set_cutout_engine(&self, engine: &str) -> anyhow::Result<()>;
     /// Download, verify and run the newer installer (the app then closes).
     fn install_update(&self) -> anyhow::Result<()>;
+    /// The picker's choices: "auto" first, each hardware GPU, "cpu" last.
+    fn gpus(&self) -> Vec<GpuInfo>;
+    /// Save the `gpu` setting ("auto", "cpu" or a listed adapter name); it
+    /// applies after a restart. Errors on anything else.
+    fn set_gpu_choice(&self, choice: &str) -> anyhow::Result<()>;
+    /// Close and start again (same command line); returns before closing.
+    fn restart(&self) -> anyhow::Result<()>;
 }

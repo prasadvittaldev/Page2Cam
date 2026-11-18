@@ -2,10 +2,12 @@ mod app;
 mod config;
 mod logging;
 mod pattern;
+mod restart;
 mod update;
 mod video;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, OnceLock};
 
 use anyhow::Context;
@@ -67,6 +69,16 @@ struct Cli {
     /// Use a still image (PNG/JPEG) as the webcam, for testing without a camera
     #[arg(long, value_name = "IMAGE")]
     fake_webcam: Option<PathBuf>,
+    /// Relaunch: wait for this (old) Page2Cam process to exit first.
+    #[arg(long, hide = true, value_name = "PID")]
+    wait_for_pid: Option<u32>,
+    /// Relaunch after Chromium closed unexpectedly: how often in a row.
+    #[arg(long, hide = true, default_value_t = 0)]
+    unexpected_exit_count: u32,
+    /// `gpu` setting for this run only ("cpu" after repeated GPU crashes);
+    /// the saved setting is unchanged.
+    #[arg(long, hide = true, value_name = "GPU")]
+    gpu_override: Option<String>,
 }
 
 impl Cli {
@@ -123,6 +135,18 @@ fn main() -> anyhow::Result<()> {
 fn run() -> anyhow::Result<()> {
     let log_file = logging::current_path();
     let cli = Cli::parse();
+    // A relaunch: let the old process release the camera, port and CEF
+    // profile before opening any of them.
+    if let Some(pid) = cli.wait_for_pid {
+        tracing::info!(pid, "waiting for the previous Page2Cam to close");
+        if !restart::wait_for_pid(pid, restart::WAIT_FOR_OLD) {
+            tracing::warn!(
+                pid,
+                "previous Page2Cam still running after 10 s; starting anyway"
+            );
+        }
+    }
+    let started = std::time::Instant::now();
     let cfg = cli.apply(Config::load(cli.config.as_deref())?);
     cfg.validate()?;
     tracing::info!(
@@ -194,8 +218,22 @@ fn run() -> anyhow::Result<()> {
 
     // GPU: resolved once from the `gpu` setting against a fresh adapter list
     // (adapter LUIDs are never stored: a stale one crashes Chromium).
+    let gpu_saved = app::normalize_gpu(&cfg.gpu);
+    let gpu_running = match &cli.gpu_override {
+        Some(o) => {
+            let o = app::normalize_gpu(o);
+            tracing::warn!(
+                gpu = %o,
+                saved = %gpu_saved,
+                "GPU setting overridden for this run (saved setting unchanged)"
+            );
+            o
+        }
+        None => gpu_saved.clone(),
+    };
     let adapters = p2c_d3d::enumerate();
-    let (gpu_choice, gpu_note) = p2c_d3d::choose(&adapters, &p2c_d3d::GpuSetting::parse(&cfg.gpu));
+    let (gpu_choice, gpu_note) =
+        p2c_d3d::choose(&adapters, &p2c_d3d::GpuSetting::parse(&gpu_running));
     if let Some(n) = &gpu_note {
         tracing::info!("{n}");
     }
@@ -293,6 +331,10 @@ fn run() -> anyhow::Result<()> {
         updater: updater.clone(),
         video: video.clone(),
         encoder: encoder_status.clone(),
+        gpu_saved: Mutex::new(gpu_saved),
+        gpu_running,
+        exit: Arc::default(),
+        quit_main: Mutex::new(None),
     });
 
     // Applies to the next stream start; a live stream is not restarted.
@@ -373,7 +415,10 @@ fn run() -> anyhow::Result<()> {
     let result = if cli.test_pattern {
         pattern::spawn(PAGE.clone(), cfg.width, cfg.height);
         let (tx, rx) = mpsc::channel();
+        *app.quit_main.lock() = Some(tx.clone());
+        let exit = app.exit.clone();
         ctrlc::set_handler(move || {
+            exit.user_shutdown.store(true, Ordering::SeqCst);
             let _ = tx.send(());
         })?;
         let _ = rx.recv();
@@ -403,8 +448,11 @@ fn run() -> anyhow::Result<()> {
         let (quit2, fell_back2, fallback2) = (quit.clone(), fell_back.clone(), fallback.clone());
         // CEF owns the main thread until shutdown; Ctrl-C asks it to close.
         p2c_browser::run(browser_cfg, PAGE.clone(), move |handle| {
-            let h = handle.clone();
-            if let Err(e) = ctrlc::set_handler(move || h.shutdown()) {
+            let (h, exit) = (handle.clone(), app2.exit.clone());
+            if let Err(e) = ctrlc::set_handler(move || {
+                exit.user_shutdown.store(true, Ordering::SeqCst);
+                h.shutdown()
+            }) {
                 tracing::error!(error = %e, "could not install Ctrl-C handler");
             }
             {
@@ -434,7 +482,75 @@ fn run() -> anyhow::Result<()> {
     ticker.stop();
     let _ = events_thread.join();
     stop_webcam(webcam);
-    result
+    let user_shutdown = app.exit.user_shutdown.load(Ordering::SeqCst);
+    let action = restart::after_browser_exit(
+        user_shutdown,
+        app.exit.restart.load(Ordering::SeqCst),
+        cli.unexpected_exit_count,
+        started.elapsed(),
+    );
+    finish(action, user_shutdown, &cli, started.elapsed(), result)
+}
+
+/// Log the exit decision (R28) and start the new process if there is one.
+fn finish(
+    action: restart::ExitAction,
+    user_shutdown: bool,
+    cli: &Cli,
+    uptime: std::time::Duration,
+    result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match action {
+        restart::ExitAction::Exit if user_shutdown => {
+            tracing::info!("closed by the operator (or for an update); not restarting");
+            return result;
+        }
+        restart::ExitAction::Exit => {
+            tracing::error!(
+                previous_unexpected_exits = cli.unexpected_exit_count,
+                uptime_s = uptime.as_secs(),
+                "not restarting: the page engine closed unexpectedly again, even in CPU mode"
+            );
+            return result;
+        }
+        restart::ExitAction::Relaunch {
+            unexpected_count: 0,
+            ..
+        } => tracing::info!("restarting Page2Cam as requested"),
+        restart::ExitAction::Relaunch {
+            unexpected_count,
+            gpu_cpu,
+        } => {
+            if let Err(e) = &result {
+                tracing::error!("page engine stopped: {e:#}");
+            }
+            if gpu_cpu {
+                tracing::warn!(
+                    unexpected_exits = unexpected_count,
+                    uptime_s = uptime.as_secs(),
+                    "the page engine closed unexpectedly twice within 60 s of start \
+                     (likely a GPU driver reset or update); restarting once in CPU mode \
+                     (--gpu-override cpu; the saved GPU setting is unchanged)"
+                );
+            } else {
+                tracing::warn!(
+                    unexpected_exits = unexpected_count,
+                    uptime_s = uptime.as_secs(),
+                    "the page engine closed unexpectedly; restarting Page2Cam \
+                     (GPUs are enumerated again)"
+                );
+            }
+        }
+    }
+    let current: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let args = restart::args_for(action, &current, std::process::id());
+    let exe = std::env::current_exe().context("finding page2cam's own path")?;
+    tracing::info!(exe = %exe.display(), ?args, "starting the new Page2Cam process");
+    restart::spawn(&exe, &args).context("could not restart Page2Cam; start it again by hand")?;
+    Ok(())
 }
 
 /// The video producer chosen at start, its status text, and (GPU) the parts

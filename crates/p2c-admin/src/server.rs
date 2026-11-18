@@ -16,7 +16,8 @@ use serde::Deserialize;
 use tokio::sync::watch;
 
 use crate::api::{
-    AudioSettings, Controls, InputEvent, KeyAction, MouseBtn, NavAction, PipDto, StreamRequest,
+    AudioSettings, Controls, GpuInfo, InputEvent, KeyAction, MouseBtn, NavAction, PipDto,
+    StreamRequest,
 };
 use crate::input::{map_preview, normalize_url};
 use crate::preview::spawn_encoder;
@@ -82,6 +83,9 @@ pub(crate) fn router(st: State) -> Router {
         .route("/api/pip", post(pip))
         .route("/api/cutout", post(cutout))
         .route("/api/update/install", post(update_install))
+        .route("/api/gpus", get(gpus))
+        .route("/api/gpu", post(gpu))
+        .route("/api/restart", post(restart))
         .route("/api/stream/start", post(stream_start))
         .route("/api/stream/stop", post(stream_stop))
         .route("/api/audio", post(audio))
@@ -259,6 +263,29 @@ async fn cutout(AxState(st): AxState<State>, Json(b): Json<CutoutBody>) -> Respo
     match st.controls.set_cutout_engine(&b.engine) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+async fn gpus(AxState(st): AxState<State>) -> Json<Vec<GpuInfo>> {
+    Json(st.controls.gpus())
+}
+
+#[derive(Deserialize)]
+struct GpuBody {
+    choice: String,
+}
+
+async fn gpu(AxState(st): AxState<State>, Json(b): Json<GpuBody>) -> Response {
+    match st.controls.set_gpu_choice(&b.choice) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+async fn restart(AxState(st): AxState<State>) -> Response {
+    match st.controls.restart() {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
 }
 
@@ -453,6 +480,15 @@ mod tests {
             pub streams: Mutex<Vec<StreamRequest>>,
             pub engine: Mutex<String>,
             pub updates: Mutex<u32>,
+            pub gpu: Mutex<String>,
+            pub restarts: Mutex<u32>,
+        }
+
+        fn gpu(name: &str, kind: &str) -> GpuInfo {
+            GpuInfo {
+                name: name.into(),
+                kind: kind.into(),
+            }
         }
 
         impl Controls for Fake {
@@ -499,6 +535,26 @@ mod tests {
             fn set_cutout_engine(&self, engine: &str) -> anyhow::Result<()> {
                 anyhow::ensure!(["quality", "fast"].contains(&engine), "unknown engine");
                 *self.engine.lock().unwrap() = engine.into();
+                Ok(())
+            }
+            fn gpus(&self) -> Vec<GpuInfo> {
+                vec![
+                    gpu("auto", "auto"),
+                    gpu("NVIDIA RTX 2000 Ada Generation Laptop GPU", "discrete"),
+                    gpu("Intel(R) Graphics", "onboard"),
+                    gpu("cpu", "cpu"),
+                ]
+            }
+            fn set_gpu_choice(&self, choice: &str) -> anyhow::Result<()> {
+                anyhow::ensure!(
+                    self.gpus().iter().any(|g| g.name == choice),
+                    "unknown GPU {choice:?}"
+                );
+                *self.gpu.lock().unwrap() = choice.into();
+                Ok(())
+            }
+            fn restart(&self) -> anyhow::Result<()> {
+                *self.restarts.lock().unwrap() += 1;
                 Ok(())
             }
         }
@@ -770,6 +826,106 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
         assert_eq!(v["status"]["cutout"], "Fast · CPU · 30 masks/s");
         assert_eq!(v["pip"]["style"], "box");
+    }
+
+    #[tokio::test]
+    async fn gpus_route_lists_auto_first_cpu_last() {
+        let r = app(Arc::new(Fake::default()))
+            .oneshot(req("GET", "/api/gpus", "127.0.0.1:8765", Some(TOKEN), None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let v: Vec<GpuInfo> = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v.len(), 4);
+        assert_eq!((v[0].name.as_str(), v[0].kind.as_str()), ("auto", "auto"));
+        assert_eq!(v[1].kind, "discrete");
+        assert_eq!((v[3].name.as_str(), v[3].kind.as_str()), ("cpu", "cpu"));
+    }
+
+    #[tokio::test]
+    async fn set_gpu_saves_choice() {
+        let fake = Arc::new(Fake::default());
+        assert_eq!(
+            post(
+                fake.clone(),
+                "/api/gpu",
+                r#"{"choice":"Intel(R) Graphics"}"#
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(*fake.gpu.lock().unwrap(), "Intel(R) Graphics");
+        assert_eq!(
+            post(fake.clone(), "/api/gpu", r#"{"choice":"cpu"}"#).await,
+            StatusCode::OK
+        );
+        assert_eq!(*fake.gpu.lock().unwrap(), "cpu");
+    }
+
+    #[tokio::test]
+    async fn set_gpu_rejects_unknown_name() {
+        let fake = Arc::new(Fake::default());
+        assert_eq!(
+            post(fake.clone(), "/api/gpu", r#"{"choice":"Voodoo 5"}"#).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(*fake.gpu.lock().unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn restart_route_calls_controls() {
+        let fake = Arc::new(Fake::default());
+        assert_eq!(
+            post(fake.clone(), "/api/restart", "{}").await,
+            StatusCode::OK
+        );
+        assert_eq!(*fake.restarts.lock().unwrap(), 1);
+    }
+
+    /// Same guard as every route (it answers 403, not 401).
+    #[tokio::test]
+    async fn gpu_routes_need_token() {
+        let fake = Arc::new(Fake::default());
+        for (method, uri, body) in [
+            ("GET", "/api/gpus", None),
+            ("POST", "/api/gpu", Some(r#"{"choice":"cpu"}"#)),
+            ("POST", "/api/restart", Some("{}")),
+        ] {
+            for host in ["127.0.0.1:8765", "evil.test:8765"] {
+                let token = (host == "evil.test:8765").then_some(TOKEN);
+                let r = app(fake.clone())
+                    .oneshot(req(method, uri, host, token, body))
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), StatusCode::FORBIDDEN, "{method} {uri} {host}");
+            }
+        }
+        assert_eq!(*fake.gpu.lock().unwrap(), "");
+        assert_eq!(*fake.restarts.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn state_includes_video_status() {
+        let r = app(Arc::new(Fake::default()))
+            .oneshot(req(
+                "GET",
+                "/api/state",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                None,
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        for k in [
+            "video",
+            "encoder",
+            "gpu_choice",
+            "gpu_running",
+            "restart_needed",
+        ] {
+            assert!(v["status"].get(k).is_some(), "missing {k}");
+        }
     }
 
     #[test]

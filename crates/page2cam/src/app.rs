@@ -2,7 +2,8 @@
 use std::sync::{Arc, OnceLock};
 
 use p2c_admin::{
-    AudioSettings, Controls, InputEvent, KeyAction, MouseBtn, NavAction, Status, StreamRequest,
+    AudioSettings, Controls, GpuInfo, InputEvent, KeyAction, MouseBtn, NavAction, Status,
+    StreamRequest,
 };
 use p2c_audio::{MicCapture, MixSettings, Mixer};
 use p2c_browser::{BrowserHandle, KeyInput, KeyKind, MouseButton};
@@ -49,8 +50,15 @@ pub struct App {
     /// "CPU (compatibility)" (changes at run time on a fallback).
     pub video: Arc<Mutex<String>>,
     /// Encoder for the next stream: "probing…", "NVENC", "Quick Sync", "AMF" or "x264".
-    #[allow(dead_code)] // shown in the admin status next
     pub encoder: Arc<Mutex<String>>,
+    /// Saved `gpu` setting (normalized); applies at the next start.
+    pub gpu_saved: Mutex<String>,
+    /// The `gpu` setting this run started with (incl. `--gpu-override`).
+    pub gpu_running: String,
+    /// Why the browser loop ended (read by `main` after it returns).
+    pub exit: Arc<crate::restart::ExitFlags>,
+    /// Ends the wait in `--test-pattern` mode (no browser to shut down).
+    pub quit_main: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 /// Longest mic delay applied for the cut-out (ms).
@@ -312,6 +320,7 @@ impl Controls for App {
             StreamState::Idle => "idle".to_string(),
             s => s.to_string(),
         };
+        let gpu_saved = self.gpu_saved.lock().clone();
         Status {
             url,
             width: self.width,
@@ -331,6 +340,11 @@ impl Controls for App {
             cutout: self.cutout_status(),
             cutout_engine: self.cutout_engine(),
             update: self.updater.info(),
+            video: display_video(&self.video.lock()),
+            encoder: self.encoder.lock().clone(),
+            restart_needed: restart_needed(&gpu_saved, &self.gpu_running),
+            gpu_choice: gpu_saved,
+            gpu_running: self.gpu_running.clone(),
         }
     }
 
@@ -340,12 +354,47 @@ impl Controls for App {
         // replaces it and starts it again. Close shortly, after this request
         // has been answered.
         tracing::info!("closing for the update");
+        self.exit
+            .user_shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let browser = self.browser.get().cloned();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(500));
             match browser {
                 Some(b) => b.shutdown(),
                 None => std::process::exit(0),
+            }
+        });
+        Ok(())
+    }
+
+    fn gpus(&self) -> Vec<GpuInfo> {
+        gpu_list(&p2c_d3d::enumerate())
+    }
+
+    fn set_gpu_choice(&self, choice: &str) -> anyhow::Result<()> {
+        let choice = check_gpu_choice(choice, &self.gpus())?;
+        tracing::info!(gpu = %choice, running = %self.gpu_running, "GPU choice saved; applies after a restart");
+        self.save_choice("gpu", &choice);
+        *self.gpu_saved.lock() = choice;
+        Ok(())
+    }
+
+    fn restart(&self) -> anyhow::Result<()> {
+        tracing::info!("restart requested from the admin page");
+        self.exit
+            .restart
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Close shortly, after this request has been answered; `main`
+        // starts the new process once everything is shut down.
+        let browser = self.browser.get().cloned();
+        let quit_main = self.quit_main.lock().clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Some(b) = browser {
+                b.shutdown();
+            } else if let Some(q) = quit_main {
+                let _ = q.send(());
             }
         });
         Ok(())
@@ -374,9 +423,209 @@ impl Controls for App {
     }
 }
 
+/// The `gpu` setting in its normal form: "auto" | "cpu" | an adapter name.
+pub fn normalize_gpu(s: &str) -> String {
+    p2c_d3d::GpuSetting::parse(s).as_str().to_string()
+}
+
+/// R32: the saved `gpu` choice differs from the one this run started with.
+pub fn restart_needed(saved: &str, running: &str) -> bool {
+    normalize_gpu(saved) != normalize_gpu(running)
+}
+
+const NVIDIA: u32 = 0x10DE;
+const AMD: u32 = 0x1002;
+
+/// The picker's list (R33): "auto", each hardware adapter by name, "cpu".
+/// "discrete": NVIDIA (no integrated GPUs on Windows PCs), or AMD when it is
+/// Windows' high-performance pick among several; everything else "onboard".
+pub fn gpu_list(adapters: &[p2c_d3d::AdapterInfo]) -> Vec<GpuInfo> {
+    let info = |name: &str, kind: &str| GpuInfo {
+        name: name.into(),
+        kind: kind.into(),
+    };
+    let hw: Vec<_> = adapters.iter().filter(|a| !a.software).collect();
+    let best = hw
+        .iter()
+        .min_by_key(|a| (a.perf_rank, a.index))
+        .map(|a| a.luid);
+    let mut out = vec![info("auto", "auto")];
+    for a in &hw {
+        if out.iter().any(|g| g.name == a.name) {
+            continue; // the setting stores a name: one entry per name
+        }
+        let discrete =
+            a.vendor_id == NVIDIA || (a.vendor_id == AMD && hw.len() > 1 && best == Some(a.luid));
+        out.push(info(&a.name, if discrete { "discrete" } else { "onboard" }));
+    }
+    out.push(info("cpu", "cpu"));
+    out
+}
+
+/// `choice` normalized, if the picker offers it.
+pub fn check_gpu_choice(choice: &str, list: &[GpuInfo]) -> anyhow::Result<String> {
+    let c = normalize_gpu(choice);
+    anyhow::ensure!(
+        list.iter().any(|g| g.name == c),
+        "unknown GPU choice {choice:?} (not \"auto\", \"cpu\" or a GPU on this PC)"
+    );
+    Ok(c)
+}
+
+/// Longest fallback reason shown in the admin page, in characters.
+const MAX_REASON_CHARS: usize = 120;
+
+/// R31: the video status for the admin page: a fallback reason cut to its
+/// first line and at most 120 characters (the log keeps it all).
+pub fn display_video(s: &str) -> String {
+    let short = |r: &str| {
+        let line = r.lines().next().unwrap_or("");
+        if line.chars().count() <= MAX_REASON_CHARS {
+            line.to_string()
+        } else {
+            let mut t: String = line.chars().take(MAX_REASON_CHARS - 1).collect();
+            t.push('…');
+            t
+        }
+    };
+    const PREFIX: &str = "CPU (fallback: ";
+    match s.strip_prefix(PREFIX) {
+        Some(rest) => {
+            let reason = rest.strip_suffix(')').unwrap_or(rest);
+            format!("{PREFIX}{})", short(reason))
+        }
+        None => short(s),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::smoothed_delay;
+    use super::*;
+
+    #[test]
+    fn restart_needed_when_saved_choice_differs() {
+        assert!(!restart_needed("auto", "auto"));
+        assert!(!restart_needed(" auto ", "auto"));
+        assert!(!restart_needed("Intel(R) Graphics", "Intel(R) Graphics"));
+        assert!(restart_needed("cpu", "auto"));
+        assert!(restart_needed("Intel(R) Graphics", "auto"));
+        // A one-run `--gpu-override cpu` counts as the running choice.
+        assert!(restart_needed("auto", "cpu"));
+    }
+
+    fn adapter(
+        index: u32,
+        name: &str,
+        vendor_id: u32,
+        perf_rank: u32,
+        software: bool,
+    ) -> p2c_d3d::AdapterInfo {
+        p2c_d3d::AdapterInfo {
+            index,
+            name: name.into(),
+            vendor_id,
+            luid: 100 + index as u64,
+            perf_rank,
+            software,
+        }
+    }
+
+    fn pairs(l: &[GpuInfo]) -> Vec<(&str, &str)> {
+        l.iter()
+            .map(|g| (g.name.as_str(), g.kind.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn gpu_list_auto_first_cpu_last_no_software() {
+        let l = gpu_list(&[
+            adapter(0, "Intel(R) Graphics", 0x8086, 1, false),
+            adapter(
+                1,
+                "NVIDIA RTX 2000 Ada Generation Laptop GPU",
+                0x10DE,
+                0,
+                false,
+            ),
+            adapter(2, "Microsoft Basic Render Driver", 0x1414, 2, true),
+        ]);
+        assert_eq!(
+            pairs(&l),
+            vec![
+                ("auto", "auto"),
+                ("Intel(R) Graphics", "onboard"),
+                ("NVIDIA RTX 2000 Ada Generation Laptop GPU", "discrete"),
+                ("cpu", "cpu"),
+            ]
+        );
+        assert_eq!(
+            pairs(&gpu_list(&[])),
+            vec![("auto", "auto"), ("cpu", "cpu")]
+        );
+    }
+
+    #[test]
+    fn amd_is_discrete_only_when_ranked_first_among_several() {
+        // A lone AMD APU (e.g. Ryzen 8600G) is onboard.
+        let apu = gpu_list(&[adapter(0, "AMD Radeon(TM) Graphics", 0x1002, 0, false)]);
+        assert_eq!(apu[1].kind, "onboard");
+        let two = gpu_list(&[
+            adapter(0, "AMD Radeon(TM) Graphics", 0x1002, 1, false),
+            adapter(1, "AMD Radeon RX 7600", 0x1002, 0, false),
+        ]);
+        assert_eq!(
+            pairs(&two)[1..3],
+            [
+                ("AMD Radeon(TM) Graphics", "onboard"),
+                ("AMD Radeon RX 7600", "discrete")
+            ]
+        );
+        // NVIDIA has no integrated GPUs on Windows PCs.
+        let nv = gpu_list(&[adapter(0, "NVIDIA GeForce RTX 4070", 0x10DE, 0, false)]);
+        assert_eq!(nv[1].kind, "discrete");
+    }
+
+    #[test]
+    fn gpu_list_drops_duplicate_names() {
+        let l = gpu_list(&[
+            adapter(0, "NVIDIA GeForce RTX 4070", 0x10DE, 0, false),
+            adapter(1, "NVIDIA GeForce RTX 4070", 0x10DE, 1, false),
+        ]);
+        assert_eq!(l.len(), 3);
+    }
+
+    #[test]
+    fn gpu_choice_must_be_listed() {
+        let l = gpu_list(&[adapter(0, "Intel(R) Graphics", 0x8086, 0, false)]);
+        assert_eq!(check_gpu_choice("auto", &l).unwrap(), "auto");
+        assert_eq!(check_gpu_choice(" cpu", &l).unwrap(), "cpu");
+        assert_eq!(
+            check_gpu_choice("Intel(R) Graphics", &l).unwrap(),
+            "Intel(R) Graphics"
+        );
+        assert!(check_gpu_choice("Voodoo 5", &l).is_err());
+        assert!(check_gpu_choice("", &l).is_err());
+    }
+
+    #[test]
+    fn video_status_shortens_fallback_reason() {
+        assert_eq!(
+            display_video("GPU: Intel(R) Graphics"),
+            "GPU: Intel(R) Graphics"
+        );
+        assert_eq!(
+            display_video("CPU (fallback: no frames\nCaused by: x)"),
+            "CPU (fallback: no frames)"
+        );
+        let long = format!("CPU (fallback: {})", "e".repeat(300));
+        let d = display_video(&long);
+        assert!(d.starts_with("CPU (fallback: eee"), "{d}");
+        assert!(d.ends_with("…)"), "{d}");
+        assert_eq!(d.chars().count(), "CPU (fallback: )".chars().count() + 120);
+        // Non-ASCII stays on character boundaries.
+        let d = display_video(&format!("CPU (fallback: {})", "é".repeat(200)));
+        assert!(d.ends_with("é…)"), "{d}");
+    }
 
     #[test]
     fn delay_ignores_one_slow_frame() {

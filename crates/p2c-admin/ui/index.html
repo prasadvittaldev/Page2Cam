@@ -40,7 +40,13 @@
     grid-template-rows: auto 1fr auto;
     min-height: 100vh;
   }
-  button, input { font: inherit; color: inherit; }
+  button, input, select { font: inherit; color: inherit; }
+  select.wide {
+    width: 100%; background: var(--well); border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px;
+  }
+  .video-state { margin-top: 4px; }
+  .restart-row { justify-content: space-between; }
+  .restart-row span { font-size: 13px; color: var(--amber); }
   :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 
   header {
@@ -166,6 +172,7 @@
     <button class="btn" type="button" id="save" title="Save this site to the quick list">Save</button>
   </form>
 </header>
+<div class="updatebar" id="restartBar" role="status" hidden>Page2Cam is restarting — a new admin page will open</div>
 <div class="updatebar" id="updateBar" hidden>
   <span id="updateText"></span>
   <button class="btn primary" id="updateBtn">Install update</button>
@@ -217,6 +224,13 @@
         <input type="range" id="pipSize" min="5" max="50" step="1">
       </div>
       <div class="state" id="webcamState"></div>
+      <p class="sub"><label for="gpuSel">Video processing</label></p>
+      <select class="wide" id="gpuSel" title="Which graphics chip builds the picture. Changes apply after a restart."></select>
+      <div class="state video-state" id="videoState"></div>
+      <div class="row restart-row" id="restartRow" hidden>
+        <span>Restart Page2Cam to apply</span>
+        <button class="btn primary" id="restartBtn">Restart now</button>
+      </div>
     </section>
 
     <section class="panel" aria-labelledby="h-stream">
@@ -275,6 +289,7 @@
   let state = null;
   let pip = { visible: true, x: 1, y: 1, width: 0.25 };
   let dragging = false;
+  let restarting = false;
 
   // ---------- navigation ----------
   $("urlform").addEventListener("submit", async (e) => {
@@ -316,7 +331,7 @@
     ws = new WebSocket(`ws://${location.host}/ws?t=${encodeURIComponent(token)}`);
     ws.binaryType = "blob";
     ws.onopen = () => { wsOpen = true; };
-    ws.onclose = () => { wsOpen = false; setTimeout(connect, 1000); };
+    ws.onclose = () => { wsOpen = false; if (!restarting) setTimeout(connect, 1000); };
     ws.onmessage = async (ev) => {
       try {
         const bmp = await createImageBitmap(ev.data);
@@ -510,6 +525,52 @@
     $("updateLink").href = u.page_url || "#";
   }
 
+  // ---------- video processing (GPU) ----------
+  const gpuSel = $("gpuSel");
+  let gpuChoice = null, gpusLoaded = false; // saved choice as last shown
+  let videoErrUntil = 0; // keep an error visible for a few seconds
+  function videoError(text) { setState("videoState", "error: " + text); videoErrUntil = Date.now() + 6000; }
+  function gpuLabel(g) {
+    if (g.kind === "auto") return "Auto (best GPU)";
+    if (g.kind === "cpu") return "CPU (compatibility)";
+    return g.name + (g.kind === "discrete" ? " (dedicated)" : " (built-in)");
+  }
+  async function loadGpus() {
+    try {
+      const r = await api("/api/gpus");
+      if (!r.ok) return;
+      const list = await r.json();
+      gpuSel.replaceChildren(...list.map((g) => new Option(gpuLabel(g), g.name)));
+      gpusLoaded = true; gpuChoice = null; syncGpu();
+    } catch {}
+  }
+  function syncGpu() {
+    if (!state || !gpusLoaded || document.activeElement === gpuSel) return;
+    const want = state.status.gpu_choice;
+    if (want === gpuChoice && gpuSel.value === want) return;
+    // A saved GPU that is gone (e.g. unplugged) still shows as chosen.
+    if (want && ![...gpuSel.options].some((o) => o.value === want)) {
+      gpuSel.add(new Option(want + " (not found; Auto is used)", want));
+    }
+    gpuSel.value = want; gpuChoice = want;
+  }
+  gpuSel.onchange = async () => {
+    const r = await api("/api/gpu", { choice: gpuSel.value });
+    if (!r.ok) { videoError(await r.text()); gpuChoice = null; }
+    gpuSel.blur();
+    refresh();
+  };
+  $("restartBtn").onclick = async () => {
+    if (!confirm("Restarting closes Page2Cam and briefly turns off its camera and any live stream.\n\nA new admin page opens when it is back. Restart now?")) return;
+    $("restartBtn").disabled = true;
+    const r = await api("/api/restart", {});
+    if (!r.ok) { videoError(await r.text()); $("restartBtn").disabled = false; return; }
+    restarting = true;
+    $("restartBar").hidden = false;
+    $("restartRow").hidden = true;
+  };
+  loadGpus();
+
   // ---------- status ----------
   function setState(id, text) { const el = $(id); el.textContent = text || ""; el.classList.toggle("err", /^error/.test(text || "")); }
   function lamp(id, text, liveWord) {
@@ -519,6 +580,7 @@
   }
   let first = true;
   async function refresh() {
+    if (restarting) return;
     try {
       const r = await api("/api/state");
       if (!r.ok) { setState("streamState", "error: this page lost access. Reopen it from the Page2Cam window."); return; }
@@ -541,6 +603,14 @@
       setState("webcamState", s.webcam === "none" ? "No webcam found. Plug one in and restart Page2Cam." : /^error/.test(s.webcam) ? s.webcam : "");
       document.querySelectorAll("[data-engine]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.engine === s.cutout_engine)));
       setState("cutoutState", s.cutout);
+      syncGpu();
+      if (Date.now() > videoErrUntil) {
+        const v = $("videoState");
+        v.textContent = [s.video, s.encoder && "encoder " + s.encoder].filter(Boolean).join(" · ");
+        v.classList.toggle("err", /fallback/.test(s.video));
+        v.title = s.gpu_running ? "Running with: " + (s.gpu_running === "auto" ? "Auto" : s.gpu_running) : "";
+      }
+      $("restartRow").hidden = !s.restart_needed;
       showUpdate(s.update);
       setState("micState", /^error/.test(s.mic) ? s.mic : s.mic === "none" ? "No microphone found." : "");
       const camOn = /^ok/.test(s.vcam);
