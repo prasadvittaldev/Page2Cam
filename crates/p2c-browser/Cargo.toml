@@ -12,6 +12,9 @@ tracing.workspace = true
 # Pinned: the CEF binary distribution must match this exact version.
 cef = { version = "=156.6.0", default-features = false }
 
+[target.'cfg(windows)'.dev-dependencies]
+p2c-d3d.workspace = true
+
 # CEF re-launches the current executable as helper processes with Chromium
 # flags, which the libtest harness would reject, so these tests own `main`.
 [[test]]

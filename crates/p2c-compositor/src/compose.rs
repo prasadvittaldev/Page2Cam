@@ -67,6 +67,23 @@ fn same<T>(a: &Option<Arc<T>>, b: Option<&Arc<T>>) -> bool {
     }
 }
 
+/// Webcam, mask actually used, and layout actually drawn.
+type EffectivePip<'a> = (&'a Arc<Frame>, Option<&'a Arc<Mask>>, PipLayout);
+
+/// Cut-out styles need a mask; without one the webcam is drawn as a Box.
+fn effective(p: Pip) -> EffectivePip {
+    let mut layout = *p.layout;
+    let mask = if layout.style.is_cutout() {
+        p.mask
+    } else {
+        None
+    };
+    if layout.style.is_cutout() && mask.is_none() {
+        layout.style = OverlayStyle::Box;
+    }
+    (p.cam, mask, layout)
+}
+
 impl Default for Compositor {
     fn default() -> Self {
         Self::new()
@@ -94,27 +111,8 @@ impl Compositor {
         pip: Option<Pip>,
         out: &mut Frame,
     ) -> bool {
-        // Cut-out styles need a mask; without one the webcam is drawn as a Box.
-        let pip = pip.map(|p| {
-            let mut layout = *p.layout;
-            let mask = if layout.style.is_cutout() {
-                p.mask
-            } else {
-                None
-            };
-            if layout.style.is_cutout() && mask.is_none() {
-                layout.style = OverlayStyle::Box;
-            }
-            (p.cam, mask, layout)
-        });
-        let unchanged = self.last.as_ref().is_some_and(|l| {
-            same(&l.page, page)
-                && same(&l.cam, pip.map(|p| p.0))
-                && same(&l.mask, pip.and_then(|p| p.1))
-                && l.layout == pip.map(|p| p.2)
-                && l.out == (out.width, out.height)
-        });
-        if unchanged {
+        let pip = pip.map(effective);
+        if self.same_inputs(page, pip, (out.width, out.height)) {
             return false;
         }
         self.draw_page(page, out);
@@ -139,6 +137,33 @@ impl Compositor {
             out: (out.width, out.height),
         });
         true
+    }
+
+    /// Whether [`Compositor::compose`] would return false for these inputs
+    /// and a `width` x `height` output (lets callers skip getting a target).
+    pub fn is_unchanged(
+        &self,
+        page: Option<&Arc<Frame>>,
+        pip: Option<Pip>,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        self.same_inputs(page, pip.map(effective), (width, height))
+    }
+
+    fn same_inputs(
+        &self,
+        page: Option<&Arc<Frame>>,
+        pip: Option<EffectivePip>,
+        out: (u32, u32),
+    ) -> bool {
+        self.last.as_ref().is_some_and(|l| {
+            same(&l.page, page)
+                && same(&l.cam, pip.map(|p| p.0))
+                && same(&l.mask, pip.and_then(|p| p.1))
+                && l.layout == pip.map(|p| p.2)
+                && l.out == out
+        })
     }
 
     fn draw_page(&mut self, page: Option<&Arc<Frame>>, out: &mut Frame) {

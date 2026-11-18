@@ -597,3 +597,162 @@ fn bench_compose_1080p_cutout_full() {
         );
     }
 }
+
+// ---- Device-loss recovery (Task 8) ----
+
+use p2c_d3d::{is_device_lost, PageHolder, RecoveringProducer};
+
+/// Sets `P2C_FAKE_DEVICE_LOSS` for the guard's lifetime (tests run with
+/// `--test-threads=1`, so no other producer sees it).
+struct FakeLoss;
+impl FakeLoss {
+    fn after(n: u32) -> FakeLoss {
+        std::env::set_var("P2C_FAKE_DEVICE_LOSS", n.to_string());
+        FakeLoss
+    }
+}
+impl Drop for FakeLoss {
+    fn drop(&mut self) {
+        std::env::remove_var("P2C_FAKE_DEVICE_LOSS");
+    }
+}
+
+fn no_inputs() -> TickInputs {
+    TickInputs {
+        page: None,
+        cam: None,
+        mask: None,
+        layout: PipLayout::default(),
+    }
+}
+
+#[test]
+#[ignore]
+fn device_loss_recreates_once_then_fails() {
+    if !cfg!(debug_assertions) {
+        println!("P2C_FAKE_DEVICE_LOSS is debug-only; skipped");
+        return;
+    }
+    for a in hardware() {
+        let _fake = FakeLoss::after(5);
+        let holder = PageHolder::default();
+        let mut p = RecoveringProducer::new(a.luid, spec(64, 36), holder.clone()).unwrap();
+        let first_gpu = p.gpu().clone();
+        let first_page = holder.current().expect("page input published");
+        let inputs = no_inputs();
+        for i in 1..=5 {
+            p.produce(&inputs, false)
+                .unwrap_or_else(|e| panic!("call {i}: {e:#}"));
+        }
+        // Call 6: device lost -> error returned, rebuild started.
+        let e = p.produce(&inputs, false).unwrap_err();
+        assert!(is_device_lost(&e), "{e:#}");
+        // Until the new device is ready: Ok(None) (the ticker repeats).
+        let start = Instant::now();
+        let mut waits = 0;
+        let mut calls_on_new;
+        let mut got_frame = false;
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(5), "rebuild hangs");
+            let out = p
+                .produce(&inputs, false)
+                .unwrap_or_else(|e| panic!("{e:#}"));
+            if !p.gpu().same(&first_gpu) {
+                calls_on_new = 1;
+                got_frame |= out.is_some();
+                break;
+            }
+            assert!(out.is_none());
+            waits += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(p.gpu().luid(), a.luid);
+        // Shared textures now reach the new device's page input.
+        let shared = p.gpu().create_shared_bgra(&gradient(64, 36, 1)).unwrap();
+        holder.on_shared_texture(shared.handle()).unwrap();
+        assert_eq!(holder.current().unwrap().seq(), 1);
+        assert_eq!(first_page.seq(), 0, "old page input still fed");
+        // The new producer works (its own 5 calls), then loses the device
+        // again: no second recreate.
+        let second_gpu = p.gpu().clone();
+        while calls_on_new < 5 {
+            calls_on_new += 1;
+            let out = p
+                .produce(&inputs, false)
+                .unwrap_or_else(|e| panic!("after recreate, call {calls_on_new}: {e:#}"));
+            got_frame |= out.is_some_and(|o| o.nv12.is_some());
+        }
+        assert!(got_frame, "recreated producer gave no frame");
+        println!(
+            "  rebuild took {:?} ({waits} waiting calls)",
+            start.elapsed()
+        );
+        for _ in 0..3 {
+            let e = p.produce(&inputs, false).unwrap_err();
+            assert!(is_device_lost(&e), "{e:#}");
+            assert!(p.gpu().same(&second_gpu), "recreated twice");
+        }
+        println!("recreated once, then failed, on {}", a.name);
+    }
+}
+
+#[test]
+#[ignore]
+fn ticker_falls_back_to_cpu_after_second_device_loss() {
+    use p2c_compositor::{FrameSink, Output, ProducerEvent, Ticker};
+    use p2c_core::FrameSlot;
+    if !cfg!(debug_assertions) {
+        println!("P2C_FAKE_DEVICE_LOSS is debug-only; skipped");
+        return;
+    }
+    struct Rec(Arc<std::sync::Mutex<Vec<(Instant, Output)>>>);
+    impl FrameSink for Rec {
+        fn push(&mut self, out: &Output) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push((Instant::now(), out.clone()));
+            Ok(())
+        }
+    }
+    let a = hardware().into_iter().min_by_key(|a| a.perf_rank).unwrap();
+    // Kept for the whole test: the recreated producer reads it too.
+    let _fake = FakeLoss::after(10);
+    let s = spec(64, 36);
+    let p = RecoveringProducer::new(a.luid, s, PageHolder::default()).unwrap();
+    // A CPU page for the fallback (the browser would repaint on the CPU).
+    let page = FrameSlot::new();
+    page.put(gradient(64, 36, 2));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = Ticker::spawn(
+        s,
+        Some(page),
+        None,
+        None,
+        Arc::new(parking_lot::RwLock::new(PipLayout::default())),
+        Box::new(p),
+        vec![Box::new(Rec(seen.clone()))],
+        tx,
+    );
+    let ev = rx.recv_timeout(Duration::from_secs(5));
+    let at = Instant::now();
+    std::thread::sleep(Duration::from_millis(300));
+    t.stop();
+    let ProducerEvent::Failed(reason) = ev.expect("no fallback event");
+    assert!(reason.contains("fake device loss"), "{reason}");
+    let seen = seen.lock().unwrap();
+    let gaps = seen
+        .windows(2)
+        .map(|w| w[1].0.duration_since(w[0].0))
+        .max()
+        .unwrap();
+    assert!(gaps < Duration::from_millis(100), "sinks stalled {gaps:?}");
+    let after: Vec<_> = seen.iter().filter(|(t, _)| *t > at).collect();
+    assert!(
+        after.len() >= 5,
+        "{} pushes after the fallback",
+        after.len()
+    );
+    let cpu = bgra_to_nv12(&gradient(64, 36, 2), 64, 36);
+    let last = after.last().unwrap().1.nv12.clone().expect("nv12");
+    assert_eq!(last.data, cpu.data, "not the CPU compositor's frame");
+    println!("fell back on {}: {reason}", a.name);
+}

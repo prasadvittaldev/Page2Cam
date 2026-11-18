@@ -45,6 +45,9 @@ pub struct App {
     pub mic_delay_ms: Mutex<u32>,
     pub latencies: Mutex<std::collections::VecDeque<u32>>,
     pub updater: Arc<crate::update::Updater>,
+    /// What makes the video: "GPU: <adapter>", "CPU (fallback: <reason>)",
+    /// "CPU (compatibility)" (changes at run time on a fallback).
+    pub video: Arc<Mutex<String>>,
 }
 
 /// Longest mic delay applied for the cut-out (ms).

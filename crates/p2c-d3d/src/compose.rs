@@ -220,6 +220,24 @@ pub struct GpuProducer {
     drain: u8,
     /// Counts composites (0 = none yet).
     composite: u64,
+    /// Debug builds: `P2C_FAKE_DEVICE_LOSS` → (fail after this many
+    /// `produce` calls, calls so far).
+    #[cfg(debug_assertions)]
+    fake_loss: Option<(u32, u32)>,
+}
+
+/// Debug builds only: `P2C_FAKE_DEVICE_LOSS=1` makes every `GpuProducer`
+/// report device loss from its 91st `produce` call on (3 s at 30 fps), so the
+/// recreate-then-fall-back path can be watched in a real run. Another number
+/// `n` > 1 fails from call `n + 1` on.
+#[cfg(debug_assertions)]
+fn fake_loss_after() -> Option<u32> {
+    let v = std::env::var("P2C_FAKE_DEVICE_LOSS").ok()?;
+    match v.trim().parse::<u32>().ok()? {
+        0 => None,
+        1 => Some(90),
+        n => Some(n),
+    }
 }
 
 impl GpuProducer {
@@ -271,6 +289,8 @@ impl GpuProducer {
             last: None,
             drain: 0,
             composite: 0,
+            #[cfg(debug_assertions)]
+            fake_loss: fake_loss_after().map(|n| (n, 0)),
         })
     }
 
@@ -521,6 +541,35 @@ fn preview_size(w: u32, h: u32) -> (u32, u32) {
 
 impl OutputProducer for GpuProducer {
     fn produce(&mut self, inputs: &TickInputs, preview_due: bool) -> Result<Option<Output>> {
+        #[cfg(debug_assertions)]
+        if let Some((after, calls)) = &mut self.fake_loss {
+            *calls += 1;
+            if *calls > *after {
+                let e = windows::core::Error::from(
+                    windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED,
+                );
+                return Err(
+                    anyhow::Error::from(e).context("fake device loss (P2C_FAKE_DEVICE_LOSS)")
+                );
+            }
+        }
+        let r = self.produce_inner(inputs, preview_due);
+        if r.is_err() {
+            // The change key may have been set before the failing step: draw
+            // again on the next tick.
+            self.last_key = None;
+            self.drain = 0;
+        }
+        r
+    }
+
+    fn name(&self) -> String {
+        "GPU".into()
+    }
+}
+
+impl GpuProducer {
+    fn produce_inner(&mut self, inputs: &TickInputs, preview_due: bool) -> Result<Option<Output>> {
         let key = Key::of(self.page.seq(), inputs);
         let changed = !self.last_key.as_ref().is_some_and(|k| k.same_as(&key));
         let fresh = if changed {
@@ -555,10 +604,6 @@ impl OutputProducer for GpuProducer {
             return Ok(None);
         }
         Ok(Some(Output { preview, ..last }))
-    }
-
-    fn name(&self) -> String {
-        "GPU".into()
     }
 }
 

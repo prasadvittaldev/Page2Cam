@@ -26,6 +26,38 @@ pub struct BrowserConfig {
     pub profile_dir: PathBuf,
     /// Where page audio goes (48 kHz stereo). `None`: the page plays to speakers.
     pub audio: Option<AudioRing>,
+    /// GPU path (Windows): Chromium renders on this adapter and hands each
+    /// frame over as a shared texture instead of a CPU buffer. `None`: CPU
+    /// paints into the `FrameSlot` (Linux, CPU mode).
+    pub gpu_page: Option<GpuPage>,
+}
+
+/// Chromium on a chosen GPU, delivering shared textures.
+#[derive(Clone)]
+pub struct GpuPage {
+    /// The adapter's LUID (`(HighPart as u32 as u64) << 32 | LowPart`). It
+    /// **must** come from a DXGI enumeration made in this process run: a LUID
+    /// that matches no adapter makes Chromium's GPU process crash and CEF exit.
+    pub adapter_luid: u64,
+    /// Called on the CEF UI thread with each frame's shared NT handle (valid
+    /// only during the call) and size. Must copy quickly and never block on
+    /// the compositor. Returns false when the texture could not be opened.
+    pub on_texture: Arc<dyn Fn(isize, u32, u32) -> bool + Send + Sync>,
+}
+
+impl std::fmt::Debug for GpuPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuPage")
+            .field("adapter_luid", &format_args!("{:#x}", self.adapter_luid))
+            .finish_non_exhaustive()
+    }
+}
+
+/// The `use-adapter-luid` switch value: `<HighPart>,<LowPart>` in decimal,
+/// HighPart signed (Chromium parses them with StringToInt / StringToUint;
+/// hex is not accepted).
+pub fn luid_switch_value(luid: u64) -> String {
+    format!("{},{}", (luid >> 32) as u32 as i32, luid as u32)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +113,7 @@ enum Cmd {
         mods: u32,
     },
     Key(KeyInput),
+    RecreateCpu,
     Shutdown,
 }
 
@@ -152,6 +185,13 @@ impl BrowserHandle {
     pub fn shutdown(&self) {
         self.send(Cmd::Shutdown);
     }
+
+    /// CPU fallback without re-initialising CEF: replace the browser with one
+    /// that paints into the `FrameSlot` (`shared_texture_enabled = 0`), on the
+    /// current URL. Does nothing if the browser already paints on the CPU.
+    pub fn recreate_cpu(&self) {
+        self.send(Cmd::RecreateCpu);
+    }
 }
 
 /// If this process is a CEF helper subprocess (renderer, GPU, ...), run it and
@@ -166,7 +206,7 @@ pub fn maybe_run_subprocess() -> Option<i32> {
     if is_browser {
         return None;
     }
-    let mut app = handlers::app();
+    let mut app = handlers::app(None);
     Some(cef::execute_process(
         Some(args.as_main_args()),
         Some(&mut app),
@@ -185,7 +225,20 @@ pub fn run(
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
     std::fs::create_dir_all(&cfg.profile_dir)?;
     let args = Args::new();
-    let mut app = handlers::app();
+    // Shared textures are a Windows (D3D11) feature here; elsewhere CPU paints.
+    let gpu_page = if cfg!(windows) {
+        cfg.gpu_page.clone()
+    } else {
+        if cfg.gpu_page.is_some() {
+            tracing::warn!("GPU page textures are Windows-only; using CPU paints");
+        }
+        None
+    };
+    let adapter_luid = gpu_page.as_ref().map(|g| luid_switch_value(g.adapter_luid));
+    if let Some(v) = &adapter_luid {
+        tracing::info!(use_adapter_luid = %v, "Chromium on the chosen GPU, shared textures");
+    }
+    let mut app = handlers::app(adapter_luid);
     let settings = cef::Settings {
         windowless_rendering_enabled: 1,
         no_sandbox: 1,
@@ -203,39 +256,50 @@ pub fn run(
         "CEF failed to initialize (is CEF_PATH/LD_LIBRARY_PATH set and the CEF version matching?)"
     );
 
-    let closed = Arc::new(AtomicBool::new(false));
     let url = Arc::new(Mutex::new(cfg.url.clone()));
-    let mut client = handlers::client(handlers::ClientParts {
-        slot,
-        width: cfg.width,
-        height: cfg.height,
-        closed: closed.clone(),
-        url: url.clone(),
-        audio: cfg.audio.clone(),
-    });
-    let window_info = cef::WindowInfo {
-        windowless_rendering_enabled: 1,
-        ..Default::default()
+    let create = |gpu: Option<&GpuPage>, at: &str| {
+        // Each browser has its own `closed` flag, so closing a replaced
+        // browser doesn't end the pump loop.
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut client = handlers::client(handlers::ClientParts {
+            slot: slot.clone(),
+            width: cfg.width,
+            height: cfg.height,
+            closed: closed.clone(),
+            url: url.clone(),
+            audio: cfg.audio.clone(),
+            on_texture: gpu.map(|g| g.on_texture.clone()),
+        });
+        let window_info = cef::WindowInfo {
+            windowless_rendering_enabled: 1,
+            shared_texture_enabled: gpu.is_some() as _,
+            ..Default::default()
+        };
+        let browser_settings = cef::BrowserSettings {
+            windowless_frame_rate: cfg.fps as _,
+            ..Default::default()
+        };
+        cef::browser_host_create_browser_sync(
+            Some(&window_info),
+            Some(&mut client),
+            Some(&CefString::from(at)),
+            Some(&browser_settings),
+            None,
+            None,
+        )
+        .map(|b| (b, closed))
     };
-    let browser_settings = cef::BrowserSettings {
-        windowless_frame_rate: cfg.fps as _,
-        ..Default::default()
-    };
-    let browser = cef::browser_host_create_browser_sync(
-        Some(&window_info),
-        Some(&mut client),
-        Some(&CefString::from(cfg.url.as_str())),
-        Some(&browser_settings),
-        None,
-        None,
-    );
-    let Some(browser) = browser else {
+    let Some((mut browser, mut closed)) = create(gpu_page.as_ref(), &cfg.url) else {
         cef::shutdown();
         anyhow::bail!("CEF failed to create the browser");
     };
+    let mut on_gpu = gpu_page.is_some();
 
     let (tx, rx): (Sender<Cmd>, Receiver<Cmd>) = mpsc::channel();
-    ready(BrowserHandle { tx, url });
+    ready(BrowserHandle {
+        tx,
+        url: url.clone(),
+    });
 
     // Pump CEF from this thread; poll commands between pumps.
     let mut closing_since: Option<Instant> = None;
@@ -289,6 +353,23 @@ pub fn run(
                         host.send_key_event(Some(&key_event(k)));
                     }
                 }
+                Cmd::RecreateCpu if on_gpu && closing_since.is_none() => {
+                    // New browser first: if it can't be made, keep the old one.
+                    let at = url.lock().clone();
+                    match create(None, &at) {
+                        Some((b, c)) => {
+                            if let Some(host) = browser.host() {
+                                host.close_browser(1);
+                            }
+                            browser = b;
+                            closed = c;
+                            on_gpu = false;
+                            tracing::info!(url = %at, "browser recreated with CPU paints");
+                        }
+                        None => tracing::error!("could not recreate the browser with CPU paints"),
+                    }
+                }
+                Cmd::RecreateCpu => {}
                 Cmd::Shutdown if closing_since.is_none() => {
                     if let Some(host) = browser.host() {
                         host.close_browser(1);
@@ -351,7 +432,14 @@ fn should_exit(closed: bool, closing_since: Option<Instant>, now: Instant) -> bo
     closed || closing_since.is_some_and(|t| now.duration_since(t) > Duration::from_secs(3))
 }
 
-pub(crate) fn add_switches(cmd: &mut cef::CommandLine) {
+/// `adapter_luid`: value for `use-adapter-luid` (see [`luid_switch_value`]).
+pub(crate) fn add_switches(cmd: &mut cef::CommandLine, adapter_luid: Option<&str>) {
+    if let Some(v) = adapter_luid {
+        cmd.append_switch_with_value(
+            Some(&CefString::from("use-adapter-luid")),
+            Some(&CefString::from(v)),
+        );
+    }
     for s in [
         "noerrdialogs",
         "hide-crash-restore-bubble",
@@ -380,6 +468,16 @@ mod tests {
     #[test]
     fn keeps_running_while_open() {
         assert!(!should_exit(false, None, Instant::now()));
+    }
+
+    #[test]
+    fn luid_switch_is_decimal_high_comma_low() {
+        // The spike's NVIDIA and Intel LUIDs (hex is rejected by Chromium).
+        assert_eq!(luid_switch_value(0x0000_0000_0002_c996), "0,182678");
+        assert_eq!(luid_switch_value(0x0000_0000_0002_c3e9), "0,181225");
+        // HighPart is signed (LONG), LowPart unsigned (DWORD).
+        assert_eq!(luid_switch_value(0xffff_ffff_8000_0000), "-1,2147483648");
+        assert_eq!(luid_switch_value(0x0000_0001_ffff_ffff), "1,4294967295");
     }
 
     #[test]

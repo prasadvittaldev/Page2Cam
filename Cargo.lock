@@ -2472,6 +2472,7 @@ dependencies = [
  "anyhow",
  "cef",
  "p2c-core",
+ "p2c-d3d",
  "parking_lot",
  "tracing",
 ]
@@ -2502,6 +2503,8 @@ dependencies = [
  "anyhow",
  "p2c-compositor",
  "p2c-core",
+ "parking_lot",
+ "tracing",
  "windows 0.62.2",
 ]
 

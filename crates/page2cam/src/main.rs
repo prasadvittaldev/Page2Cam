@@ -3,6 +3,7 @@ mod config;
 mod logging;
 mod pattern;
 mod update;
+mod video;
 
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, OnceLock};
@@ -12,7 +13,9 @@ use clap::Parser;
 use p2c_admin::{AdminConfig, PreviewSink};
 use p2c_audio::{MixSettings, Mixer};
 use p2c_browser::BrowserConfig;
-use p2c_compositor::{CpuProducer, FrameSink, OutputFormat, OutputSpec, Ticker};
+use p2c_compositor::{
+    CpuProducer, FrameSink, OutputFormat, OutputProducer, OutputSpec, ProducerEvent, Ticker,
+};
 use p2c_core::AudioRing;
 use p2c_core::FrameSlot;
 use p2c_stream::StreamController;
@@ -193,26 +196,33 @@ fn run() -> anyhow::Result<()> {
     // (adapter LUIDs are never stored: a stale one crashes Chromium).
     let adapters = p2c_d3d::enumerate();
     let (gpu_choice, gpu_note) = p2c_d3d::choose(&adapters, &p2c_d3d::GpuSetting::parse(&cfg.gpu));
-    match &gpu_choice {
-        p2c_d3d::GpuChoice::Gpu(a) => {
-            tracing::info!(adapter = %a.name, index = a.index, "GPU chosen")
-        }
-        p2c_d3d::GpuChoice::Cpu { reason } => tracing::info!(%reason, "GPU not used"),
-    }
     if let Some(n) = &gpu_note {
         tracing::info!("{n}");
     }
     // CPU compatibility mode keeps the 0.3.0 behaviour: the cut-out still uses
     // the high-performance GPU if there is a hardware adapter.
-    let cutout_gpu = match &gpu_choice {
-        p2c_d3d::GpuChoice::Gpu(a) => Some(a.index),
+    let cutout_adapter = match &gpu_choice {
+        p2c_d3d::GpuChoice::Gpu(a) => Some(a.clone()),
         p2c_d3d::GpuChoice::Cpu { .. } => {
             match p2c_d3d::choose(&adapters, &p2c_d3d::GpuSetting::Auto).0 {
-                p2c_d3d::GpuChoice::Gpu(a) => Some(a.index),
+                p2c_d3d::GpuChoice::Gpu(a) => Some(a),
                 p2c_d3d::GpuChoice::Cpu { .. } => None,
             }
         }
     };
+    let cutout_gpu = cutout_adapter.as_ref().map(|a| a.index);
+
+    // Video: the GPU compositor on the chosen adapter (Chromium hands it
+    // shared textures), else the CPU compositor. Decided before CEF starts.
+    let video_start = start_video(&gpu_choice, spec, cli.test_pattern);
+    let video = Arc::new(Mutex::new(video_start.status.clone()));
+    tracing::info!(
+        "video: {}; cut-out GPU: {}",
+        video_start.status,
+        cutout_adapter
+            .as_ref()
+            .map_or("none (CPU)", |a| a.name.as_str())
+    );
 
     // Cut-out: segmentation runs on its own thread and publishes the person
     // mask; the ticker combines it with the newest webcam frame.
@@ -224,15 +234,20 @@ fn run() -> anyhow::Result<()> {
         let l = *layout.read();
         seg.set_enabled(l.visible && l.style.is_cutout());
     }
+    let (events_tx, events) = mpsc::channel();
     let ticker = Ticker::spawn(
         spec,
-        Box::new(CpuProducer::new(spec)),
+        // CPU page frames (CPU mode, and after a fallback).
         Some(PAGE.clone()),
         webcam_slot.clone(),
         segmenter.as_ref().map(|_| matte.clone()),
         layout.clone(),
+        video_start.producer,
         sinks,
+        events_tx,
     );
+    let fallback = ticker.fallback_trigger();
+    let gpu_video = video_start.gpu;
 
     let updater = Arc::new(update::Updater::new(
         env!("CARGO_PKG_VERSION"),
@@ -273,7 +288,30 @@ fn run() -> anyhow::Result<()> {
         mic_delay_ms: Mutex::new(0),
         latencies: Mutex::new(Default::default()),
         updater: updater.clone(),
+        video: video.clone(),
     });
+
+    // The ticker switched to the CPU compositor: say so, and make Chromium
+    // paint on the CPU (once the browser exists; see the `run` callback).
+    let fell_back = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let events_thread = {
+        let (app, fell_back) = (app.clone(), fell_back.clone());
+        std::thread::Builder::new()
+            .name("p2c-video-events".into())
+            .spawn(move || {
+                // Ends when the ticker stops (its sender is dropped).
+                for ev in events {
+                    let ProducerEvent::Failed(reason) = ev;
+                    let s = video::status_fallback(&reason);
+                    tracing::warn!("video: {s}");
+                    *app.video.lock() = s;
+                    fell_back.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(b) = app.browser.get() {
+                        b.recreate_cpu();
+                    }
+                }
+            })?
+    };
 
     // Keep the mic in step with the cut-out's processing delay.
     let quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -322,16 +360,32 @@ fn run() -> anyhow::Result<()> {
             fps: cfg.fps,
             profile_dir,
             audio: Some(page_ring),
+            // Built from a LUID enumerated again just now (R7).
+            gpu_page: gpu_page(gpu_video.as_ref(), &fallback),
         };
+        let watch = browser_cfg
+            .gpu_page
+            .is_some()
+            .then(|| gpu_video.as_ref().map(|g| g.stats.clone()))
+            .flatten();
         tracing::info!(url = %cfg.url, "loading page");
         let app2 = app.clone();
+        let (quit2, fell_back2, fallback2) = (quit.clone(), fell_back.clone(), fallback.clone());
         // CEF owns the main thread until shutdown; Ctrl-C asks it to close.
         p2c_browser::run(browser_cfg, PAGE.clone(), move |handle| {
             let h = handle.clone();
             if let Err(e) = ctrlc::set_handler(move || h.shutdown()) {
                 tracing::error!(error = %e, "could not install Ctrl-C handler");
             }
-            let _ = app2.browser.set(handle);
+            let _ = app2.browser.set(handle.clone());
+            // A fallback before the browser existed: switch it now.
+            // (recreate_cpu is idempotent, so a race with the events thread is harmless.)
+            if fell_back2.load(std::sync::atomic::Ordering::SeqCst) {
+                handle.recreate_cpu();
+            }
+            if let Some(stats) = watch {
+                spawn_watchdog(stats, fallback2, fell_back2, quit2);
+            }
         })
     };
     tracing::info!("shutting down");
@@ -345,8 +399,149 @@ fn run() -> anyhow::Result<()> {
         m.stop();
     }
     ticker.stop();
+    let _ = events_thread.join();
     stop_webcam(webcam);
     result
+}
+
+/// The video producer chosen at start, its status text, and (GPU) the parts
+/// the browser needs.
+struct VideoStart {
+    producer: Box<dyn OutputProducer>,
+    status: String,
+    gpu: Option<GpuVideo>,
+}
+
+/// The GPU path's browser side: shared textures go through `holder` to the
+/// current device; `stats` feeds the watchdog.
+#[cfg(windows)]
+struct GpuVideo {
+    adapter: p2c_d3d::AdapterInfo,
+    holder: p2c_d3d::PageHolder,
+    stats: Arc<video::TextureStats>,
+}
+
+/// Never built off Windows (no GPU path there).
+#[allow(dead_code)]
+#[cfg(not(windows))]
+struct GpuVideo {
+    stats: Arc<video::TextureStats>,
+}
+
+/// GPU mode: device, page input and GPU compositor on the chosen adapter.
+/// Any failure here starts in CPU mode for this run (CEF has not started, so
+/// Chromium simply gets no adapter switch).
+#[cfg(windows)]
+fn start_video(choice: &p2c_d3d::GpuChoice, spec: OutputSpec, test_pattern: bool) -> VideoStart {
+    let cpu = |status: String| VideoStart {
+        producer: Box::new(CpuProducer::new(spec)),
+        status,
+        gpu: None,
+    };
+    let a = match choice {
+        p2c_d3d::GpuChoice::Cpu { reason } => {
+            tracing::info!(%reason, "video on the CPU");
+            return cpu(video::STATUS_COMPAT.into());
+        }
+        // The test pattern paints into the CPU page slot.
+        p2c_d3d::GpuChoice::Gpu(_) if test_pattern => return cpu("CPU (test pattern)".into()),
+        p2c_d3d::GpuChoice::Gpu(a) => a,
+    };
+    let holder = p2c_d3d::PageHolder::default();
+    match p2c_d3d::RecoveringProducer::new(a.luid, spec, holder.clone()) {
+        Ok(p) => VideoStart {
+            producer: Box::new(p),
+            status: video::status_gpu(&a.name),
+            gpu: Some(GpuVideo {
+                adapter: a.clone(),
+                holder,
+                stats: Arc::default(),
+            }),
+        },
+        Err(e) => {
+            let reason = format!("GPU {} unusable: {e:#}", a.name);
+            tracing::warn!("{reason}");
+            cpu(video::status_fallback(&reason))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn start_video(_choice: &p2c_d3d::GpuChoice, spec: OutputSpec, _test_pattern: bool) -> VideoStart {
+    VideoStart {
+        producer: Box::new(CpuProducer::new(spec)),
+        status: "CPU".into(),
+        gpu: None,
+    }
+}
+
+/// Chromium's GPU settings, or `None` (CPU paints). The LUID is checked
+/// against a fresh enumeration right before CEF starts: a LUID Chromium can't
+/// find crashes it, so a vanished adapter means CPU mode instead.
+#[cfg(windows)]
+fn gpu_page(
+    gpu: Option<&GpuVideo>,
+    fallback: &p2c_compositor::FallbackTrigger,
+) -> Option<p2c_browser::GpuPage> {
+    let g = gpu?;
+    if !p2c_d3d::enumerate()
+        .iter()
+        .any(|a| a.luid == g.adapter.luid && !a.software)
+    {
+        fallback.fall_back(format!("GPU {} is no longer present", g.adapter.name));
+        return None;
+    }
+    let (holder, stats) = (g.holder.clone(), g.stats.clone());
+    Some(p2c_browser::GpuPage {
+        adapter_luid: g.adapter.luid,
+        on_texture: Arc::new(
+            move |handle, _w, _h| match holder.on_shared_texture(handle) {
+                Ok(()) => {
+                    stats.record_ok();
+                    true
+                }
+                Err(e) => {
+                    stats.record_err(format!("{e:#}"));
+                    false
+                }
+            },
+        ),
+    })
+}
+
+#[cfg(not(windows))]
+fn gpu_page(
+    _gpu: Option<&GpuVideo>,
+    _fallback: &p2c_compositor::FallbackTrigger,
+) -> Option<p2c_browser::GpuPage> {
+    None
+}
+
+/// Watches Chromium's shared textures from browser creation on: none within
+/// 5 s, or 10 failed opens in a row → CPU fallback (the ticker switches and
+/// reports it; the events thread recreates the browser with CPU paints).
+fn spawn_watchdog(
+    stats: Arc<video::TextureStats>,
+    fallback: p2c_compositor::FallbackTrigger,
+    fell_back: Arc<std::sync::atomic::AtomicBool>,
+    quit: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let start = std::time::Instant::now();
+    let spawned = std::thread::Builder::new()
+        .name("p2c-gpu-watchdog".into())
+        .spawn(move || {
+            use std::sync::atomic::Ordering::SeqCst;
+            while !quit.load(SeqCst) && !fell_back.load(SeqCst) {
+                if let Some(reason) = stats.verdict(start.elapsed()) {
+                    fallback.fall_back(reason);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "could not start the GPU watchdog");
+    }
 }
 
 /// Composited page frames. A static so the browser and ticker share one slot.

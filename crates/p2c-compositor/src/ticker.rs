@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -96,7 +97,71 @@ pub trait OutputProducer: Send {
         -> anyhow::Result<Option<Output>>;
     /// Short name for logs ("CPU", ...).
     fn name(&self) -> String;
+    /// Whether the ticker may replace this producer with the CPU compositor
+    /// after repeated failures (false for the CPU compositor itself).
+    fn can_fall_back(&self) -> bool {
+        true
+    }
 }
+
+/// What the ticker reports about its producer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProducerEvent {
+    /// The producer failed (twice in a row, or on request) and the ticker
+    /// switched to the CPU compositor. The text says why.
+    Failed(String),
+}
+
+/// Asks a running ticker to switch to the CPU compositor (e.g. when the
+/// browser never delivers GPU frames). Cloneable; only the first request counts.
+#[derive(Clone, Default)]
+pub struct FallbackTrigger(Arc<parking_lot::Mutex<TriggerState>>);
+
+#[derive(Default)]
+struct TriggerState {
+    reason: Option<String>,
+    /// A request was made (later ones are ignored).
+    requested: bool,
+}
+
+impl FallbackTrigger {
+    pub fn fall_back(&self, reason: impl Into<String>) {
+        let mut s = self.0.lock();
+        if !s.requested {
+            s.requested = true;
+            s.reason = Some(reason.into());
+        }
+    }
+
+    /// The pending request, once.
+    fn take(&self) -> Option<String> {
+        self.0.lock().reason.take()
+    }
+
+    /// Mark as used without a request (the ticker fell back on its own).
+    fn close(&self) {
+        let mut s = self.0.lock();
+        s.requested = true;
+        s.reason = None;
+    }
+}
+
+/// Whether `o` carries another frame than `prev` (a re-pushed or replayed
+/// output, e.g. the same frame with a late preview, is not a redraw).
+fn is_redraw(prev: Option<&Output>, o: &Output) -> bool {
+    fn same<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+    !prev.is_some_and(|p| same(&p.bgra, &o.bgra) && same(&p.nv12, &o.nv12))
+}
+
+/// After a fallback, how long to keep the last frame while the CPU page
+/// (the recreated browser's first paint) is missing.
+const WAIT_FOR_CPU_PAGE: Duration = Duration::from_secs(3);
 
 /// Composited frames that sinks may hold at once (the ticker's previous
 /// output, the stream slot, the preview slot) plus one to draw into.
@@ -158,9 +223,12 @@ impl OutputProducer for CpuProducer {
             mask: inputs.mask.as_ref(),
             layout: &inputs.layout,
         });
-        let i = self.free_frame();
-        let target = Arc::get_mut(&mut self.pool[i]).expect("free pool frame");
-        if !self.compositor.compose(inputs.page.as_ref(), pip, target) {
+        let (w, h) = (self.spec.width, self.spec.height);
+        // Check before taking a target: that may allocate a whole frame.
+        if self
+            .compositor
+            .is_unchanged(inputs.page.as_ref(), pip, w, h)
+        {
             // Unchanged, but the preview may still lack the latest frame.
             if preview_due && self.preview_pending {
                 if let Some((out, frame)) = &self.last {
@@ -173,8 +241,10 @@ impl OutputProducer for CpuProducer {
             }
             return Ok(None);
         }
+        let i = self.free_frame();
+        let target = Arc::get_mut(&mut self.pool[i]).expect("free pool frame");
+        self.compositor.compose(inputs.page.as_ref(), pip, target);
         let frame = self.pool[i].clone();
-        let (w, h) = (self.spec.width, self.spec.height);
         let mut out = match self.spec.format {
             OutputFormat::Bgra => Output {
                 bgra: Some(frame.clone()),
@@ -213,42 +283,144 @@ impl OutputProducer for CpuProducer {
     fn name(&self) -> String {
         "CPU".into()
     }
+
+    fn can_fall_back(&self) -> bool {
+        false
+    }
 }
 
 /// Runs compositing at a fixed rate on its own thread.
 pub struct Ticker {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
+    trigger: FallbackTrigger,
+}
+
+/// The ticker's producer, replaced by the CPU compositor after it fails twice
+/// in a row (or on request).
+struct ProducerSlot {
+    spec: OutputSpec,
+    producer: Box<dyn OutputProducer>,
+    name: String,
+    /// Consecutive `produce` errors.
+    errors: u32,
+    fell_back: bool,
+    /// After a fallback: keep the last frame until the CPU page arrives.
+    wait_for_page: Option<Instant>,
+    events: Sender<ProducerEvent>,
+    trigger: FallbackTrigger,
+    warned: Option<Instant>,
+}
+
+impl ProducerSlot {
+    fn produce(
+        &mut self,
+        inputs: &TickInputs,
+        preview_due: bool,
+        has_prev: bool,
+    ) -> anyhow::Result<Option<Output>> {
+        if let Some(reason) = self.trigger.take() {
+            self.fall_back(reason, has_prev);
+        }
+        let r = self.produce_once(inputs, preview_due);
+        let Err(e) = r else {
+            self.errors = 0;
+            return r;
+        };
+        self.errors += 1;
+        if self
+            .warned
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+        {
+            tracing::warn!(producer = %self.name, error = %format!("{e:#}"), "output frame failed");
+            self.warned = Some(Instant::now());
+        }
+        // One failure is retried on the next tick (a GPU producer recreates
+        // its device in between); a second one in a row switches to the CPU.
+        if self.errors >= 2 && !self.fell_back && self.producer.can_fall_back() {
+            self.fall_back(format!("{e:#}"), has_prev);
+            return self.produce_once(inputs, preview_due);
+        }
+        Err(e)
+    }
+
+    fn produce_once(
+        &mut self,
+        inputs: &TickInputs,
+        preview_due: bool,
+    ) -> anyhow::Result<Option<Output>> {
+        if let Some(since) = self.wait_for_page {
+            if inputs.page.is_none() && since.elapsed() < WAIT_FOR_CPU_PAGE {
+                return Ok(None);
+            }
+            self.wait_for_page = None;
+        }
+        self.producer.produce(inputs, preview_due)
+    }
+
+    fn fall_back(&mut self, reason: String, has_prev: bool) {
+        self.trigger.close();
+        if self.fell_back || !self.producer.can_fall_back() {
+            tracing::info!(producer = %self.name, %reason, "fallback request ignored");
+            return;
+        }
+        tracing::warn!(from = %self.name, %reason, "video falls back to the CPU compositor");
+        self.producer = Box::new(CpuProducer::new(self.spec));
+        self.name = self.producer.name();
+        self.fell_back = true;
+        self.errors = 0;
+        self.wait_for_page = has_prev.then(Instant::now);
+        let _ = self.events.send(ProducerEvent::Failed(reason));
+    }
 }
 
 impl Ticker {
-    /// `producer` turns each tick's inputs into an `Output` for the sinks.
-    /// `page`: the page frames (`None` when the producer has its own source).
+    /// `page`: the page frames for the CPU compositor (also used after a
+    /// fallback; a GPU producer reads its own page texture).
     /// `webcam`: optional PIP source; a webcam frame not updated for 1 s is treated
     /// as absent. `mask`: the latest cut-out mask, used by cut-out styles (same
     /// 1 s staleness; without a fresh one the webcam is drawn as a box, never a
-    /// frozen cut-out). `layout` may be changed live. A preview is due every
+    /// frozen cut-out). `layout` may be changed live. `producer` turns each
+    /// tick's inputs into an `Output` for the sinks. A preview is due every
     /// `max(1, fps / 12)` ticks.
+    ///
+    /// A failed tick pushes the previous output again. If `produce` fails twice
+    /// in a row, or [`FallbackTrigger::fall_back`] is called, the ticker
+    /// switches to a [`CpuProducer`] for good and sends
+    /// [`ProducerEvent::Failed`] on `events` (once). Until the first CPU page
+    /// frame arrives (up to 3 s) it keeps pushing the last output.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         spec: OutputSpec,
-        mut producer: Box<dyn OutputProducer>,
         page: Option<FrameSlot>,
         webcam: Option<FrameSlot>,
         mask: Option<MaskSlot>,
         layout: Arc<RwLock<PipLayout>>,
+        producer: Box<dyn OutputProducer>,
         mut sinks: Vec<Box<dyn FrameSink>>,
+        events: Sender<ProducerEvent>,
     ) -> Ticker {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
+        let trigger = FallbackTrigger::default();
+        let mut slot = ProducerSlot {
+            spec,
+            name: producer.name(),
+            producer,
+            errors: 0,
+            fell_back: false,
+            wait_for_page: None,
+            events,
+            trigger: trigger.clone(),
+            warned: None,
+        };
         let handle = std::thread::Builder::new()
             .name("p2c-ticker".into())
             .spawn(move || {
                 let period = Duration::from_secs_f64(1.0 / spec.fps.max(1) as f64);
                 let preview_every = (spec.fps / PREVIEW_FPS).max(1);
-                let name = producer.name();
                 let mut prev: Option<Output> = None;
                 let mut last_warn: Vec<Option<Instant>> = vec![None; sinks.len()];
-                let mut produce_warn: Option<Instant> = None;
                 let start = Instant::now();
                 let mut n: u32 = 0;
                 let mut k: u32 = 0;
@@ -270,20 +442,16 @@ impl Ticker {
                     k = k.wrapping_add(1);
                     // Unchanged or failed: push the previous output again (same
                     // Arcs, no conversion), with its preview only when one is due.
-                    let repeat = match producer.produce(&inputs, preview_due) {
+                    let repeat = match slot.produce(&inputs, preview_due, prev.is_some()) {
                         Ok(Some(o)) => {
-                            redrawn += 1;
+                            if is_redraw(prev.as_ref(), &o) {
+                                redrawn += 1;
+                            }
                             prev = Some(o);
                             false
                         }
-                        Ok(None) => true,
-                        Err(e) => {
-                            if produce_warn.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
-                                tracing::warn!(producer = %name, error = %e, "output frame failed");
-                                produce_warn = Some(Instant::now());
-                            }
-                            true
-                        }
+                        // Warned (rate-limited) by the slot.
+                        Ok(None) | Err(_) => true,
                     };
                     let t1 = Instant::now();
                     compose_t.record(t1 - t0);
@@ -332,7 +500,8 @@ impl Ticker {
                                 ticks,
                                 redrawn,
                                 skipped,
-                                "output ({name}): compose {c}; sinks {s}"
+                                "output ({}): compose {c}; sinks {s}",
+                                slot.name
                             );
                         }
                         (ticks, redrawn, skipped) = (0, 0, 0);
@@ -342,7 +511,16 @@ impl Ticker {
                 }
             })
             .expect("spawn ticker thread");
-        Ticker { stop, handle }
+        Ticker {
+            stop,
+            handle,
+            trigger,
+        }
+    }
+
+    /// A handle that switches this ticker to the CPU compositor.
+    pub fn fallback_trigger(&self) -> FallbackTrigger {
+        self.trigger.clone()
     }
 
     pub fn stop(self) {
@@ -398,12 +576,13 @@ mod tests {
     ) -> Ticker {
         Ticker::spawn(
             spec,
-            Box::new(CpuProducer::new(spec)),
             Some(page),
             webcam,
             mask,
             layout,
+            Box::new(CpuProducer::new(spec)),
             sinks,
+            std::sync::mpsc::channel().0,
         )
     }
 
@@ -729,5 +908,227 @@ mod tests {
         std::thread::sleep(Duration::from_secs(1));
         t.stop();
         assert!(n.load(Ordering::SeqCst) >= 27);
+    }
+
+    /// A producer that draws a fixed BLUE frame and fails on the calls
+    /// (1-based) `fail` picks, with a device-lost-like message.
+    struct Fake {
+        n: u32,
+        fail: Box<dyn Fn(u32) -> bool + Send>,
+        frame: Arc<Frame>,
+        can_fall_back: bool,
+    }
+
+    impl Fake {
+        fn new(fail: impl Fn(u32) -> bool + Send + 'static) -> Fake {
+            Fake {
+                n: 0,
+                fail: Box::new(fail),
+                frame: Arc::new(Frame::from_bgra(64, 36, BLUE.repeat(64 * 36)).unwrap()),
+                can_fall_back: true,
+            }
+        }
+    }
+
+    impl OutputProducer for Fake {
+        fn produce(&mut self, _: &TickInputs, _: bool) -> anyhow::Result<Option<Output>> {
+            self.n += 1;
+            if (self.fail)(self.n) {
+                anyhow::bail!("fake device lost (call {})", self.n);
+            }
+            Ok(Some(Output {
+                bgra: Some(self.frame.clone()),
+                ..Output::default()
+            }))
+        }
+        fn name(&self) -> String {
+            "Fake".into()
+        }
+        fn can_fall_back(&self) -> bool {
+            self.can_fall_back
+        }
+    }
+
+    /// Runs `producer` over `page`; returns the samples at (10, 10), the
+    /// ticker (still running) and the event receiver.
+    fn spawn_fake(
+        producer: Box<dyn OutputProducer>,
+        page: FrameSlot,
+    ) -> (Samples, Ticker, std::sync::mpsc::Receiver<ProducerEvent>) {
+        let samples: Samples = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = Ticker::spawn(
+            small_spec(),
+            Some(page),
+            None,
+            None,
+            layout(),
+            producer,
+            vec![Box::new(Sampler(samples.clone(), 10, 10))],
+            tx,
+        );
+        (samples, t, rx)
+    }
+
+    /// Largest gap between consecutive pushes.
+    fn max_gap(s: &[(std::time::Instant, [u8; 4])]) -> Duration {
+        s.windows(2)
+            .map(|w| w[1].0.duration_since(w[0].0))
+            .max()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn producer_falls_back_after_repeated_device_loss() {
+        let (samples, t, rx) = spawn_fake(Box::new(Fake::new(|n| n > 3)), red_page());
+        let ev = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("no ProducerEvent");
+        let at = std::time::Instant::now();
+        let ProducerEvent::Failed(reason) = ev;
+        assert!(reason.contains("fake device lost"), "{reason}");
+        std::thread::sleep(Duration::from_millis(300));
+        t.stop();
+        let s = samples.lock();
+        assert_eq!(s.first().map(|x| x.1), Some(BLUE), "producer frames first");
+        let first_red = s
+            .iter()
+            .find(|(_, px)| *px == RED)
+            .expect("no frame from the CPU fallback");
+        assert!(
+            first_red.0 <= at + Duration::from_millis(100),
+            "fallback frame {:?} after the event",
+            first_red.0.saturating_duration_since(at)
+        );
+        assert!(s.iter().skip_while(|x| x.1 != RED).all(|x| x.1 == RED));
+        // The failing ticks re-pushed the previous output: no stall.
+        assert!(max_gap(&s) < Duration::from_millis(80), "{:?}", max_gap(&s));
+        assert!(rx.try_recv().is_err(), "more than one event");
+    }
+
+    #[test]
+    fn producer_single_error_is_retried() {
+        let (samples, t, rx) = spawn_fake(Box::new(Fake::new(|n| n == 3)), red_page());
+        std::thread::sleep(Duration::from_millis(500));
+        t.stop();
+        assert!(rx.try_recv().is_err(), "fell back after one error");
+        let s = samples.lock();
+        assert!(s.len() >= 12, "{} pushes", s.len());
+        assert!(s.iter().all(|x| x.1 == BLUE), "not the producer's frames");
+        assert!(max_gap(&s) < Duration::from_millis(80));
+    }
+
+    #[test]
+    fn non_consecutive_errors_do_not_fall_back() {
+        let (_s, t, rx) = spawn_fake(Box::new(Fake::new(|n| n % 3 == 0)), red_page());
+        std::thread::sleep(Duration::from_millis(400));
+        t.stop();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn fallback_can_be_triggered_from_outside() {
+        let (samples, t, rx) = spawn_fake(Box::new(Fake::new(|_| false)), red_page());
+        std::thread::sleep(Duration::from_millis(150));
+        t.fallback_trigger().fall_back("no page texture within 5 s");
+        let at = std::time::Instant::now();
+        let ProducerEvent::Failed(reason) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(reason, "no page texture within 5 s");
+        // A second request does nothing.
+        t.fallback_trigger().fall_back("again");
+        std::thread::sleep(Duration::from_millis(200));
+        t.stop();
+        assert!(rx.try_recv().is_err());
+        let s = samples.lock();
+        let first_red = s.iter().find(|(_, px)| *px == RED).expect("no CPU frame");
+        assert!(first_red.0 <= at + Duration::from_millis(100));
+    }
+
+    #[test]
+    fn producer_that_cannot_fall_back_keeps_running() {
+        // Like the CPU compositor itself: errors forever, nothing to switch to.
+        let mut fake = Fake::new(|_| true);
+        fake.can_fall_back = false;
+        let (_s, t, rx) = spawn_fake(Box::new(fake), red_page());
+        t.fallback_trigger().fall_back("ignored");
+        std::thread::sleep(Duration::from_millis(200));
+        t.stop();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn keeps_last_frame_until_the_cpu_page_arrives() {
+        // After a fallback with no CPU page yet (the browser is being
+        // recreated), keep showing the last frame instead of black.
+        let page = FrameSlot::new();
+        let (samples, t, rx) = spawn_fake(Box::new(Fake::new(|n| n > 3)), page.clone());
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            samples.lock().iter().all(|x| x.1 == BLUE),
+            "black before the CPU page arrived"
+        );
+        page.put(Frame::from_bgra(64, 36, RED.repeat(64 * 36)).unwrap());
+        std::thread::sleep(Duration::from_millis(150));
+        t.stop();
+        assert_eq!(samples.lock().last().map(|x| x.1), Some(RED));
+    }
+
+    #[test]
+    fn unchanged_tick_allocates_nothing_when_pool_is_held() {
+        let mut p = CpuProducer::new(small_spec());
+        let mut held = Vec::new();
+        let mut last = None;
+        // Sinks hold every pool frame.
+        for i in 0..POOL {
+            let px = [i as u8, 0, 0, 255];
+            let page = Arc::new(Frame::from_bgra(64, 36, px.repeat(64 * 36)).unwrap());
+            let inputs = TickInputs {
+                page: Some(page),
+                cam: None,
+                mask: None,
+                layout: crate::PipLayout::default(),
+            };
+            held.push(p.produce(&inputs, false).unwrap().unwrap());
+            last = Some(inputs);
+        }
+        let pool: Vec<_> = p.pool.clone();
+        assert_eq!(pool.len(), POOL);
+        assert!(p.produce(last.as_ref().unwrap(), false).unwrap().is_none());
+        assert!(
+            p.pool.iter().zip(&pool).all(|(a, b)| Arc::ptr_eq(a, b)),
+            "a pool frame was replaced on an unchanged tick"
+        );
+    }
+
+    #[test]
+    fn replayed_output_is_not_a_redraw() {
+        let f = Arc::new(Frame::new_black(4, 4));
+        let a = Output {
+            bgra: Some(f.clone()),
+            ..Output::default()
+        };
+        let with_preview = Output {
+            preview: Some(f.clone()),
+            ..a.clone()
+        };
+        assert!(is_redraw(None, &a));
+        assert!(!is_redraw(Some(&a), &with_preview));
+        let b = Output {
+            bgra: Some(Arc::new(Frame::new_black(4, 4))),
+            ..Output::default()
+        };
+        assert!(is_redraw(Some(&a), &b));
+        let n = Arc::new(p2c_core::bgra_to_nv12(&Frame::new_black(4, 4), 4, 4));
+        let c = Output {
+            nv12: Some(n.clone()),
+            ..Output::default()
+        };
+        let d = Output {
+            nv12: Some(n),
+            preview: Some(f),
+            ..Output::default()
+        };
+        assert!(!is_redraw(Some(&c), &d));
     }
 }

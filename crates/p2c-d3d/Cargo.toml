@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 p2c-core.workspace = true
 p2c-compositor.workspace = true
+tracing.workspace = true
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
@@ -20,5 +21,6 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
+parking_lot.workspace = true
 p2c-core.workspace = true
 p2c-compositor.workspace = true

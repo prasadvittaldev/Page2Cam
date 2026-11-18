@@ -7,7 +7,10 @@ use p2c_core::{AudioRing, Frame, FrameSlot, SAMPLE_RATE};
 use parking_lot::Mutex;
 
 wrap_app! {
-    struct P2cApp {}
+    struct P2cApp {
+        // `use-adapter-luid` value (browser process, GPU path only).
+        adapter_luid: Option<String>,
+    }
 
     impl App {
         fn on_before_command_line_processing(
@@ -16,14 +19,31 @@ wrap_app! {
             command_line: Option<&mut CommandLine>,
         ) {
             if let Some(cmd) = command_line {
-                crate::add_switches(cmd);
+                crate::add_switches(cmd, self.adapter_luid.as_deref());
             }
         }
     }
 }
 
-pub(crate) fn app() -> App {
-    P2cApp::new()
+/// `adapter_luid`: the `use-adapter-luid` switch value, or `None`.
+pub(crate) fn app(adapter_luid: Option<String>) -> App {
+    P2cApp::new(adapter_luid)
+}
+
+/// Called with each shared page texture (see `crate::GpuPage`).
+pub(crate) type TextureFn = Arc<dyn Fn(isize, u32, u32) -> bool + Send + Sync>;
+
+/// The shared NT handle and size of an accelerated paint (Windows only).
+#[cfg(windows)]
+fn shared_texture(info: &AcceleratedPaintInfo) -> Option<(isize, u32, u32)> {
+    let handle = info.shared_texture_handle as isize;
+    let s = &info.extra.coded_size;
+    (handle != 0).then_some((handle, s.width.max(0) as u32, s.height.max(0) as u32))
+}
+
+#[cfg(not(windows))]
+fn shared_texture(_info: &AcceleratedPaintInfo) -> Option<(isize, u32, u32)> {
+    None
 }
 
 wrap_render_handler! {
@@ -31,6 +51,8 @@ wrap_render_handler! {
         slot: FrameSlot,
         width: u32,
         height: u32,
+        // GPU path: receives `on_accelerated_paint` textures.
+        on_texture: Option<TextureFn>,
     }
 
     impl RenderHandler {
@@ -77,6 +99,25 @@ wrap_render_handler! {
             let data = unsafe { std::slice::from_raw_parts(buffer, len) }.to_vec();
             if let Ok(frame) = Frame::from_bgra(width as u32, height as u32, data) {
                 self.slot.put(frame);
+            }
+        }
+
+        fn on_accelerated_paint(
+            &self,
+            _browser: Option<&mut Browser>,
+            type_: PaintElementType,
+            _dirty_rects: Option<&[Rect]>,
+            info: Option<&AcceleratedPaintInfo>,
+        ) {
+            // Popups are not composited (as in on_paint).
+            if type_ != PaintElementType::default() {
+                return;
+            }
+            if let (Some(f), Some((handle, w, h))) =
+                (&self.on_texture, info.and_then(shared_texture))
+            {
+                // The handle is valid only during this callback; `f` copies it.
+                f(handle, w, h);
             }
         }
     }
@@ -191,11 +232,12 @@ pub(crate) struct ClientParts {
     pub closed: Arc<AtomicBool>,
     pub url: Arc<Mutex<String>>,
     pub audio: Option<AudioRing>,
+    pub on_texture: Option<TextureFn>,
 }
 
 pub(crate) fn client(p: ClientParts) -> Client {
     P2cClient::new(
-        P2cRenderHandler::new(p.slot, p.width, p.height),
+        P2cRenderHandler::new(p.slot, p.width, p.height, p.on_texture),
         P2cLifeSpan::new(p.closed),
         P2cDisplay::new(p.url),
         p.audio

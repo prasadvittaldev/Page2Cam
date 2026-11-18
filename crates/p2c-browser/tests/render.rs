@@ -2,7 +2,9 @@
 //! Run: cargo test -p p2c-browser --test render -- --ignored
 //!
 //! CEF can be initialized only once per process, so all checks run as steps of
-//! one browser session, driven from a watcher thread.
+//! one browser session, driven from a watcher thread. On Windows with a
+//! hardware GPU the session starts with shared textures (GPU path) and then
+//! switches to CPU paints with `recreate_cpu`; the other steps run on CPU paints.
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -37,14 +39,111 @@ fn wait_for(slot: &FrameSlot, what: &str, check: impl Fn(&Frame) -> bool) -> Res
 }
 
 /// Left half green; right half red, turning blue after 500 ms (partial repaint);
-/// clicking the right half turns it yellow; a quiet 440 Hz tone plays.
+/// clicking the right half turns it yellow; a quiet 440 Hz tone plays. A tiny
+/// flickering square in the top-left corner keeps frames coming.
 const PAGE: &str = "<body style='margin:0'><div style='display:flex;height:100vh'>\
     <div style='flex:1;background:%2300ff00'></div>\
     <div id=r style='flex:1;background:%23ff0000' onclick=\"this.style.background='%23ffff00'\"></div></div>\
+    <div id=q style='position:fixed;left:0;top:0;width:4px;height:4px;background:%23000'></div>\
     <script>setTimeout(()=>r.style.background='%230000ff',500);\
+    (function f(){q.style.opacity=Math.random();requestAnimationFrame(f)})();\
     const c=new AudioContext(),o=c.createOscillator(),g=c.createGain();g.gain.value=0.2;\
     o.connect(g).connect(c.destination);o.start();\
     document.onkeypress=e=>{if(e.key==='k')r.style.background='%23ff00ff'};</script></body>";
+
+#[cfg(windows)]
+mod gpu {
+    //! The GPU path: Chromium on the chosen adapter, its shared textures
+    //! opened and copied by `p2c_d3d::PageInput` on the same adapter.
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    pub struct Session {
+        pub gpu: p2c_d3d::Gpu,
+        pub page: p2c_d3d::PageInput,
+        pub ok: Arc<AtomicU64>,
+        pub failed: Arc<AtomicU64>,
+        pub name: String,
+    }
+
+    /// The adapter `gpu = "auto"` picks, a device and page input on it, and
+    /// the `GpuPage` that feeds it. `None` without a hardware adapter.
+    pub fn setup() -> Option<(Session, p2c_browser::GpuPage)> {
+        let adapters = p2c_d3d::enumerate();
+        let p2c_d3d::GpuChoice::Gpu(a) = p2c_d3d::choose(&adapters, &p2c_d3d::GpuSetting::Auto).0
+        else {
+            return None;
+        };
+        let gpu = p2c_d3d::Gpu::new(a.luid).expect("D3D11 device");
+        let page = p2c_d3d::PageInput::new(&gpu, W, H).expect("page input");
+        let ok = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicU64::new(0));
+        let (p, o, f) = (page.clone(), ok.clone(), failed.clone());
+        let gpu_page = p2c_browser::GpuPage {
+            adapter_luid: a.luid,
+            on_texture: Arc::new(move |handle, _w, _h| match p.on_shared_texture(handle) {
+                Ok(()) => {
+                    o.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+                Err(e) => {
+                    if f.fetch_add(1, Ordering::SeqCst) == 0 {
+                        eprintln!("shared texture failed: {e:#}");
+                    }
+                    false
+                }
+            }),
+        };
+        Some((
+            Session {
+                gpu,
+                page,
+                ok,
+                failed,
+                name: a.name,
+            },
+            gpu_page,
+        ))
+    }
+
+    pub fn shared_textures_arrive(s: &Session) -> Result<(), String> {
+        // Chromium's GPU process may take a few seconds to start on a dGPU.
+        let start = Instant::now();
+        while s.ok.load(Ordering::SeqCst) == 0 {
+            if start.elapsed() > Duration::from_secs(10) {
+                return Err(format!(
+                    "no shared texture opened on {} within 10 s ({} failed opens)",
+                    s.name,
+                    s.failed.load(Ordering::SeqCst)
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let first = s.ok.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(2));
+        let n = s.ok.load(Ordering::SeqCst) - first;
+        if n < 10 {
+            return Err(format!("only {n} shared textures in 2 s"));
+        }
+        // Our copy holds the page (left half green).
+        let f = s
+            .gpu
+            .read_bgra(&s.page.texture())
+            .map_err(|e| format!("{e:#}"))?;
+        if (f.width, f.height) != (W, H) || !close(f.pixel(100, 180), GREEN) {
+            return Err(format!(
+                "page texture {}x{} pixel {:?}",
+                f.width,
+                f.height,
+                f.pixel(100, 180)
+            ));
+        }
+        println!("  ({n} textures in 2 s on {})", s.name);
+        println!("test shared_textures_arrive ... ok");
+        Ok(())
+    }
+}
 
 fn scenario(h: &BrowserHandle, slot: &FrameSlot, audio: &AudioRing) -> Result<(), String> {
     wait_for(slot, "red right half", |f| close(f.pixel(540, 180), RED))?;
@@ -112,6 +211,16 @@ fn main() {
     let audio = AudioRing::new(2000);
     let profile: PathBuf =
         std::env::temp_dir().join(format!("p2c-test-profile-{}", std::process::id()));
+    #[cfg(windows)]
+    let (session, gpu_page) = match gpu::setup() {
+        Some((s, p)) => (Some(s), Some(p)),
+        None => {
+            println!("no hardware GPU: shared texture step skipped");
+            (None, None)
+        }
+    };
+    #[cfg(not(windows))]
+    let gpu_page = None;
     let cfg = BrowserConfig {
         url: format!("data:text/html,{PAGE}"),
         width: W,
@@ -119,12 +228,28 @@ fn main() {
         fps: 30,
         profile_dir: profile.clone(),
         audio: Some(audio.clone()),
+        gpu_page,
     };
     let (tx, rx) = std::sync::mpsc::channel();
     let watch = slot.clone();
     p2c_browser::run(cfg, slot, move |h: BrowserHandle| {
         std::thread::spawn(move || {
-            tx.send(scenario(&h, &watch, &audio)).unwrap();
+            let gpu_steps = || -> Result<(), String> {
+                #[cfg(windows)]
+                if let Some(s) = &session {
+                    gpu::shared_textures_arrive(s)?;
+                    // CPU fallback without re-initialising CEF: the other
+                    // steps run on the recreated browser's CPU paints.
+                    h.recreate_cpu();
+                    wait_for(&watch, "CPU paint after recreate_cpu", |f| {
+                        close(f.pixel(100, 180), GREEN)
+                    })?;
+                    println!("test recreate_cpu_paints_to_slot ... ok");
+                }
+                Ok(())
+            };
+            let r = gpu_steps().and_then(|()| scenario(&h, &watch, &audio));
+            tx.send(r).unwrap();
             h.shutdown();
         });
     })
