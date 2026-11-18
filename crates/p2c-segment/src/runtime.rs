@@ -64,7 +64,9 @@ pub fn session(model: &Path, prefer_gpu: bool) -> anyhow::Result<(Session, Devic
         let dml = Session::builder(env()?)
             .map_err(anyhow::Error::from)
             .and_then(|b| {
-                b.with_execution_providers([ort::ep::DirectML::default().build().error_on_failure()])
+                b.with_execution_providers([ort::ep::DirectML::default()
+                    .build()
+                    .error_on_failure()])
                     .map_err(|e| anyhow::anyhow!("{e}"))
             })
             .and_then(|mut b| b.commit_from_file(model).map_err(anyhow::Error::from));

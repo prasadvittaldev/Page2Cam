@@ -176,6 +176,7 @@ fn run() -> anyhow::Result<()> {
         spec,
         PAGE.clone(),
         webcam_slot.clone(),
+        None,
         layout.clone(),
         sinks,
     );

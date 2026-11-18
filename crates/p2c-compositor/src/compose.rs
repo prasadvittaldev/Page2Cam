@@ -12,8 +12,13 @@ pub fn compose(page: Option<&Frame>, pip: Option<(&Frame, &PipLayout)>, out: &mu
     compose_page(page, out);
     if let Some((cam, layout)) = pip {
         if let Some((x, y, w, h)) = pip_rect(layout, cam.width, cam.height, out.width, out.height) {
-            let scaled = scale(cam, w, h);
-            blit(scaled.buffer(), w, h, out, x, y);
+            if layout.style.is_cutout() {
+                let scaled = scale_straight(cam, w, h);
+                blend(scaled.buffer(), w, h, out, x, y);
+            } else {
+                let scaled = scale(cam, w, h);
+                blit(scaled.buffer(), w, h, out, x, y);
+            }
         }
     }
 }
@@ -65,13 +70,53 @@ pub(crate) fn scale(src: &Frame, dw: u32, dh: u32) -> Image<'static> {
     dst
 }
 
-/// Copy a tightly packed BGRA `src` (w x h) into `out` at (x, y). Caller guarantees it fits.
+/// Scale without treating alpha as premultiplication (the alpha byte is a
+/// cut-out mask and is scaled like any other channel).
+fn scale_straight(src: &Frame, dw: u32, dh: u32) -> Image<'static> {
+    let src_img = ImageRef::new(src.width, src.height, &src.data, PixelType::U8x4)
+        .expect("frame buffer matches its size");
+    let mut dst = Image::new(dw, dh, PixelType::U8x4);
+    let opts = ResizeOptions::new()
+        .resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
+        .use_alpha(false);
+    Resizer::new()
+        .resize(&src_img, &mut dst, &opts)
+        .expect("same pixel type on both sides");
+    dst
+}
+
+/// Alpha-blend a BGRA `src` (w x h; A = coverage) over `out` at (x, y).
+fn blend(src: &[u8], w: u32, h: u32, out: &mut Frame, x: u32, y: u32) {
+    let row = w as usize * 4;
+    let ostride = out.width as usize * 4;
+    for r in 0..h as usize {
+        let o = (y as usize + r) * ostride + x as usize * 4;
+        let dst = out.data[o..o + row].as_chunks_mut::<4>().0;
+        let s = src[r * row..(r + 1) * row].as_chunks::<4>().0;
+        for (d, s) in dst.iter_mut().zip(s) {
+            let a = s[3] as u32;
+            if a == 0 {
+                continue;
+            }
+            for c in 0..3 {
+                d[c] = ((s[c] as u32 * a + d[c] as u32 * (255 - a) + 127) / 255) as u8;
+            }
+        }
+    }
+}
+
+/// Copy a tightly packed BGRA `src` (w x h) into `out` at (x, y), opaque
+/// (the output never carries a source's alpha). Caller guarantees it fits.
 pub(crate) fn blit(src: &[u8], w: u32, h: u32, out: &mut Frame, x: u32, y: u32) {
     let row = w as usize * 4;
     let ostride = out.width as usize * 4;
     for r in 0..h as usize {
         let o = (y as usize + r) * ostride + x as usize * 4;
-        out.data[o..o + row].copy_from_slice(&src[r * row..(r + 1) * row]);
+        let dst = &mut out.data[o..o + row];
+        dst.copy_from_slice(&src[r * row..(r + 1) * row]);
+        for px in dst.as_chunks_mut::<4>().0 {
+            px[3] = 255;
+        }
     }
 }
 
@@ -103,11 +148,55 @@ mod tests {
             x: 0.0,
             y: 0.0,
             width: 0.25,
+            style: crate::OverlayStyle::Box,
         };
         let cam = solid(16, 9, BLUE);
         compose(Some(&solid(64, 36, RED)), Some((&cam, &layout)), &mut out);
         assert_eq!(out.pixel(2, 2), BLUE);
         assert_eq!(out.pixel(40, 20), RED);
+    }
+
+    fn full_layout(style: crate::OverlayStyle) -> crate::PipLayout {
+        crate::PipLayout {
+            visible: true,
+            x: 0.5,
+            y: 0.0,
+            width: 1.0,
+            style,
+        }
+    }
+
+    #[test]
+    fn blend_uses_alpha() {
+        // 3x1 white page, 3x1 black cam with alpha 0 / 128 / 255, full-size cut-out.
+        let mut out = Frame::new_black(3, 1);
+        let page = solid(3, 1, [255, 255, 255, 255]);
+        let cam = Frame::from_bgra(3, 1, vec![0, 0, 0, 0, 0, 0, 0, 128, 0, 0, 0, 255]).unwrap();
+        compose(
+            Some(&page),
+            Some((&cam, &full_layout(crate::OverlayStyle::CutoutFull))),
+            &mut out,
+        );
+        assert_eq!(out.pixel(0, 0)[0], 255);
+        assert!(
+            (out.pixel(1, 0)[0] as i32 - 127).abs() <= 1,
+            "{:?}",
+            out.pixel(1, 0)
+        );
+        assert_eq!(out.pixel(2, 0)[0], 0);
+    }
+
+    #[test]
+    fn box_ignores_alpha() {
+        let mut out = Frame::new_black(3, 1);
+        let page = solid(3, 1, [255, 255, 255, 255]);
+        let cam = Frame::from_bgra(3, 1, vec![0; 12]).unwrap();
+        let mut l = full_layout(crate::OverlayStyle::Box);
+        l.x = 0.0;
+        l.width = 1.0;
+        compose(Some(&page), Some((&cam, &l)), &mut out);
+        // Box keeps a 2% margin; on a 3 px frame that rounds to 0.
+        assert_eq!(out.pixel(1, 0)[0], 0);
     }
 
     #[test]

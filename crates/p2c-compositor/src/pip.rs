@@ -14,6 +14,43 @@ pub struct PipLayout {
     pub x: f32,
     pub y: f32,
     pub width: f32,
+    pub style: OverlayStyle,
+}
+
+/// How the webcam is drawn over the page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlayStyle {
+    /// Rectangle, room and all (alpha ignored).
+    #[default]
+    Box,
+    /// Person only (alpha = cut-out mask), standing on the bottom edge.
+    CutoutSmall,
+    /// Person only, full output height, like a call-app background.
+    CutoutFull,
+}
+
+impl OverlayStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OverlayStyle::Box => "box",
+            OverlayStyle::CutoutSmall => "cutout-small",
+            OverlayStyle::CutoutFull => "cutout-full",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<OverlayStyle> {
+        match s {
+            "box" => Some(OverlayStyle::Box),
+            "cutout-small" => Some(OverlayStyle::CutoutSmall),
+            "cutout-full" => Some(OverlayStyle::CutoutFull),
+            _ => None,
+        }
+    }
+
+    /// True for the styles that use the cut-out mask.
+    pub fn is_cutout(self) -> bool {
+        self != OverlayStyle::Box
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +74,7 @@ impl PipLayout {
             x,
             y,
             width,
+            style: OverlayStyle::Box,
         }
     }
 }
@@ -48,6 +86,9 @@ impl Default for PipLayout {
 }
 
 /// Pixel rect `(x, y, w, h)` of the PIP, always fully inside the output.
+/// Box: 2% margins, `x`/`y` place it. Cut-out small: side margins, bottom
+/// edge on the frame's bottom, `y` ignored. Cut-out full: full height
+/// (shrunk to fit the width), bottom-anchored, `x` slides it, `width` ignored.
 /// `None` when hidden or degenerate.
 pub fn pip_rect(
     layout: &PipLayout,
@@ -59,12 +100,24 @@ pub fn pip_rect(
     if !layout.visible || cam_w == 0 || cam_h == 0 || out_w == 0 || out_h == 0 {
         return None;
     }
-    let mx = (out_w as f32 * MARGIN).round() as u32;
-    let my = (out_h as f32 * MARGIN).round() as u32;
-    let (avail_w, avail_h) = (out_w.saturating_sub(2 * mx), out_h.saturating_sub(2 * my));
     let aspect = cam_h as f32 / cam_w as f32;
-    let mut w = (layout.width.max(0.0) * out_w as f32).round();
+    let (mx, my) = match layout.style {
+        OverlayStyle::Box => (
+            (out_w as f32 * MARGIN).round() as u32,
+            (out_h as f32 * MARGIN).round() as u32,
+        ),
+        OverlayStyle::CutoutSmall => ((out_w as f32 * MARGIN).round() as u32, 0),
+        OverlayStyle::CutoutFull => (0, 0),
+    };
+    let (avail_w, avail_h) = (out_w.saturating_sub(2 * mx), out_h.saturating_sub(2 * my));
+    let mut w = match layout.style {
+        OverlayStyle::CutoutFull => (out_h as f32 / aspect).round(),
+        _ => (layout.width.max(0.0) * out_w as f32).round(),
+    };
     let mut h = (w * aspect).round();
+    if layout.style == OverlayStyle::CutoutFull {
+        h = out_h as f32;
+    }
     // Too big for the frame: shrink, keeping aspect.
     if w > avail_w as f32 || h > avail_h as f32 {
         let s = (avail_w as f32 / w).min(avail_h as f32 / h);
@@ -76,7 +129,13 @@ pub fn pip_rect(
         return None;
     }
     let x = mx + ((layout.x.clamp(0.0, 1.0) * (avail_w - w) as f32).round() as u32);
-    let y = my + ((layout.y.clamp(0.0, 1.0) * (avail_h - h) as f32).round() as u32);
+    let y = match layout.style {
+        OverlayStyle::Box => {
+            my + ((layout.y.clamp(0.0, 1.0) * (avail_h - h) as f32).round() as u32)
+        }
+        // Cut-outs stand on the bottom edge.
+        _ => out_h - h,
+    };
     Some((x, y, w, h))
 }
 
@@ -118,6 +177,7 @@ mod tests {
                 x,
                 y,
                 width: 0.25,
+                style: OverlayStyle::Box,
             };
             let (px, py, w, h) = pip_rect(&l, 1280, 720, 1920, 1080).unwrap();
             assert!(
@@ -131,9 +191,70 @@ mod tests {
             x: 0.0,
             y: 0.0,
             width: 3.0,
+            style: OverlayStyle::Box,
         };
         let (px, py, w, h) = pip_rect(&l, 1280, 720, 1920, 1080).unwrap();
         assert!(px + w <= 1920 && py + h <= 1080);
+    }
+
+    fn cutout(style: OverlayStyle, x: f32, width: f32) -> PipLayout {
+        PipLayout {
+            visible: true,
+            x,
+            y: 0.0,
+            width,
+            style,
+        }
+    }
+
+    #[test]
+    fn style_names_round_trip() {
+        for s in [
+            OverlayStyle::Box,
+            OverlayStyle::CutoutSmall,
+            OverlayStyle::CutoutFull,
+        ] {
+            assert_eq!(OverlayStyle::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(OverlayStyle::parse("nope"), None);
+    }
+
+    #[test]
+    fn cutout_small_sits_on_bottom_edge() {
+        let r = pip_rect(
+            &cutout(OverlayStyle::CutoutSmall, 1.0, 0.25),
+            1280,
+            720,
+            1920,
+            1080,
+        );
+        assert_eq!(r, Some((1402, 810, 480, 270)));
+    }
+
+    #[test]
+    fn cutout_full_covers_height_centered() {
+        let r = pip_rect(
+            &cutout(OverlayStyle::CutoutFull, 0.5, 0.1),
+            640,
+            480,
+            1920,
+            1080,
+        );
+        assert_eq!(r, Some((240, 0, 1440, 1080)));
+    }
+
+    #[test]
+    fn cutout_full_wide_cam_shrinks() {
+        let (x, y, w, h) = pip_rect(
+            &cutout(OverlayStyle::CutoutFull, 0.5, 0.1),
+            2560,
+            720,
+            1920,
+            1080,
+        )
+        .unwrap();
+        assert_eq!((x, w), (0, 1920));
+        assert_eq!(y + h, 1080);
     }
 
     #[test]

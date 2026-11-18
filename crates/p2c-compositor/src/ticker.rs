@@ -11,6 +11,26 @@ use crate::{compose, PipLayout};
 
 const WEBCAM_STALE_AFTER: Duration = Duration::from_secs(1);
 
+/// Tracks when a slot last changed; frames older than 1 s count as absent.
+#[derive(Default)]
+struct Freshness {
+    seq: u64,
+    changed: Option<Instant>,
+}
+
+impl Freshness {
+    fn latest(&mut self, slot: &FrameSlot) -> Option<Arc<Frame>> {
+        let seq = slot.seq();
+        if seq != self.seq {
+            self.seq = seq;
+            self.changed = Some(Instant::now());
+        }
+        self.changed
+            .filter(|t| t.elapsed() < WEBCAM_STALE_AFTER)
+            .and_then(|_| slot.latest())
+    }
+}
+
 /// Output video format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputSpec {
@@ -32,11 +52,13 @@ pub struct Ticker {
 
 impl Ticker {
     /// `webcam`: optional PIP source; a webcam frame not updated for 1 s is treated
-    /// as absent. `layout` may be changed live by other threads.
+    /// as absent. `matte`: the webcam with the cut-out mask in its alpha byte,
+    /// used by cut-out styles (same 1 s staleness). `layout` may be changed live.
     pub fn spawn(
         spec: OutputSpec,
         page: FrameSlot,
         webcam: Option<FrameSlot>,
+        matte: Option<FrameSlot>,
         layout: Arc<RwLock<PipLayout>>,
         mut sinks: Vec<Box<dyn FrameSink>>,
     ) -> Ticker {
@@ -50,21 +72,26 @@ impl Ticker {
                 let mut last_warn: Vec<Option<Instant>> = vec![None; sinks.len()];
                 let start = Instant::now();
                 let mut n: u32 = 0;
-                let mut cam_seq = 0u64;
-                let mut cam_changed = Instant::now();
+                let mut cam_fresh = Freshness::default();
+                let mut matte_fresh = Freshness::default();
                 while !stop2.load(Ordering::Relaxed) {
                     let latest = page.latest();
-                    let cam = webcam.as_ref().and_then(|slot| {
-                        let seq = slot.seq();
-                        if seq != cam_seq {
-                            cam_seq = seq;
-                            cam_changed = Instant::now();
+                    let mut layout = *layout.read();
+                    let cam = webcam.as_ref().and_then(|s| cam_fresh.latest(s));
+                    let matted = matte.as_ref().and_then(|s| matte_fresh.latest(s));
+                    // Cut-out styles need a fresh matte; without one, show the raw
+                    // webcam as a box (never a frozen cut-out).
+                    let cam = if layout.style.is_cutout() {
+                        match matted {
+                            Some(m) => Some(m),
+                            None => {
+                                layout.style = crate::OverlayStyle::Box;
+                                cam
+                            }
                         }
-                        (cam_changed.elapsed() < WEBCAM_STALE_AFTER)
-                            .then(|| slot.latest())
-                            .flatten()
-                    });
-                    let layout = *layout.read();
+                    } else {
+                        cam
+                    };
                     compose(
                         latest.as_deref(),
                         cam.as_deref().map(|c| (c, &layout)),
@@ -166,6 +193,7 @@ mod tests {
             spec,
             page,
             Some(cam),
+            None,
             layout,
             vec![Box::new(Sampler(samples.clone(), 55, 30))],
         );
@@ -186,6 +214,121 @@ mod tests {
         );
     }
 
+    const RED: [u8; 4] = [0, 0, 255, 255];
+    const BLUE_CLEAR: [u8; 4] = [255, 0, 0, 0];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    const BLUE: [u8; 4] = [255, 0, 0, 255];
+
+    fn small_spec() -> OutputSpec {
+        OutputSpec {
+            width: 64,
+            height: 36,
+            fps: 30,
+        }
+    }
+
+    fn red_page() -> FrameSlot {
+        let page = FrameSlot::new();
+        page.put(Frame::from_bgra(64, 36, RED.repeat(64 * 36)).unwrap());
+        page
+    }
+
+    fn cutout_layout() -> Arc<parking_lot::RwLock<crate::PipLayout>> {
+        let mut l = crate::PipLayout::preset(crate::Corner::BottomRight, 0.25);
+        l.style = crate::OverlayStyle::CutoutSmall;
+        Arc::new(parking_lot::RwLock::new(l))
+    }
+
+    /// Runs the ticker for `ms`, refreshing `fill` every 30 ms, and returns
+    /// the colours seen at (55, 30) after `after_ms`.
+    fn run_sampled(
+        webcam: Option<FrameSlot>,
+        matte: Option<FrameSlot>,
+        fill: impl Fn() + Send + 'static,
+        ms: u64,
+        after_ms: u64,
+    ) -> Vec<[u8; 4]> {
+        let samples = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let start = std::time::Instant::now();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let feeder = std::thread::spawn(move || {
+            while !stop2.load(Ordering::SeqCst) {
+                fill();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let t = Ticker::spawn(
+            small_spec(),
+            red_page(),
+            webcam,
+            matte,
+            cutout_layout(),
+            vec![Box::new(Sampler(samples.clone(), 55, 30))],
+        );
+        std::thread::sleep(Duration::from_millis(ms));
+        t.stop();
+        stop.store(true, Ordering::SeqCst);
+        feeder.join().unwrap();
+        let s = samples.lock();
+        s.iter()
+            .filter(|(t, _)| t.duration_since(start) > Duration::from_millis(after_ms))
+            .map(|(_, px)| *px)
+            .collect()
+    }
+
+    #[test]
+    fn ticker_cutout_uses_matte() {
+        let cam = FrameSlot::new();
+        let matte = FrameSlot::new();
+        let (c, m) = (cam.clone(), matte.clone());
+        let seen = run_sampled(
+            Some(cam),
+            Some(matte),
+            move || {
+                c.put(Frame::from_bgra(16, 9, GREEN.repeat(16 * 9)).unwrap());
+                m.put(Frame::from_bgra(16, 9, BLUE.repeat(16 * 9)).unwrap());
+            },
+            400,
+            200,
+        );
+        assert!(
+            !seen.is_empty() && seen.iter().all(|p| *p == BLUE),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn ticker_cutout_falls_back_to_box_when_matte_stale() {
+        // Raw webcam has alpha 0: only an opaque Box draw makes it visible.
+        let cam = FrameSlot::new();
+        let c = cam.clone();
+        let seen = run_sampled(
+            Some(cam),
+            Some(FrameSlot::new()),
+            move || c.put(Frame::from_bgra(16, 9, BLUE_CLEAR.repeat(16 * 9)).unwrap()),
+            400,
+            200,
+        );
+        assert!(
+            !seen.is_empty() && seen.iter().all(|p| *p == BLUE),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn ticker_cutout_hides_when_both_stale() {
+        let cam = FrameSlot::new();
+        let matte = FrameSlot::new();
+        cam.put(Frame::from_bgra(16, 9, GREEN.repeat(16 * 9)).unwrap());
+        matte.put(Frame::from_bgra(16, 9, BLUE.repeat(16 * 9)).unwrap());
+        let seen = run_sampled(Some(cam), Some(matte), || {}, 1600, 1400);
+        assert!(
+            !seen.is_empty() && seen.iter().all(|p| *p == RED),
+            "{seen:?}"
+        );
+    }
+
     const SPEC: OutputSpec = OutputSpec {
         width: 16,
         height: 16,
@@ -198,6 +341,7 @@ mod tests {
         let t = Ticker::spawn(
             SPEC,
             FrameSlot::new(),
+            None,
             None,
             layout(),
             vec![Box::new(Counter(n.clone()))],
@@ -212,7 +356,7 @@ mod tests {
     fn failing_sink_does_not_starve_others() {
         let n = Arc::new(AtomicUsize::new(0));
         let sinks: Vec<Box<dyn FrameSink>> = vec![Box::new(Failing), Box::new(Counter(n.clone()))];
-        let t = Ticker::spawn(SPEC, FrameSlot::new(), None, layout(), sinks);
+        let t = Ticker::spawn(SPEC, FrameSlot::new(), None, None, layout(), sinks);
         std::thread::sleep(Duration::from_secs(1));
         t.stop();
         assert!(n.load(Ordering::SeqCst) >= 27);

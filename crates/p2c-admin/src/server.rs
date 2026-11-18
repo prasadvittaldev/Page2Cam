@@ -589,7 +589,8 @@ mod tests {
                 visible: true,
                 x: 0.25,
                 y: 0.75,
-                width: 0.3
+                width: 0.3,
+                style: p2c_compositor::OverlayStyle::Box,
             }
         );
     }

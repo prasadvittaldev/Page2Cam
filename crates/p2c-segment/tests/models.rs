@@ -34,7 +34,10 @@ fn both_models_load_and_report_shapes() {
         assert!(ins.iter().any(|i| i == n), "RVM input {n} missing: {ins:?}");
     }
     for n in ["fgr", "pha", "r1o", "r2o", "r3o", "r4o"] {
-        assert!(outs.iter().any(|o| o == n), "RVM output {n} missing: {outs:?}");
+        assert!(
+            outs.iter().any(|o| o == n),
+            "RVM output {n} missing: {outs:?}"
+        );
     }
 
     println!("MediaPipe selfie:");

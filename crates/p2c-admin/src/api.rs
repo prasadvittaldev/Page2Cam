@@ -113,6 +113,7 @@ impl From<PipDto> for PipLayout {
             x: d.x,
             y: d.y,
             width: d.width.clamp(0.05, 0.5),
+            style: p2c_compositor::OverlayStyle::Box,
         }
     }
 }

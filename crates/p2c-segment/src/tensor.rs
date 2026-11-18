@@ -30,8 +30,16 @@ pub fn write_alpha(frame: &mut Frame, mask: &[f32], mw: u32, mh: u32) {
         return;
     }
     // Corner-aligned mapping: frame edges sample mask edges exactly.
-    let sx = if w > 1 { (mw - 1) as f32 / (w - 1) as f32 } else { 0.0 };
-    let sy = if h > 1 { (mh - 1) as f32 / (h - 1) as f32 } else { 0.0 };
+    let sx = if w > 1 {
+        (mw - 1) as f32 / (w - 1) as f32
+    } else {
+        0.0
+    };
+    let sy = if h > 1 {
+        (mh - 1) as f32 / (h - 1) as f32
+    } else {
+        0.0
+    };
     let cols: Vec<(usize, usize, f32)> = (0..w)
         .map(|x| {
             let fx = x as f32 * sx;
