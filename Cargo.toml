@@ -23,3 +23,4 @@ p2c-webcam = { path = "crates/p2c-webcam" }
 p2c-audio = { path = "crates/p2c-audio" }
 p2c-stream = { path = "crates/p2c-stream" }
 p2c-admin = { path = "crates/p2c-admin" }
+p2c-segment = { path = "crates/p2c-segment" }

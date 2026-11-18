@@ -1,0 +1,19 @@
+[package]
+name = "p2c-segment"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+p2c-core.workspace = true
+p2c-compositor.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "std", "ndarray", "tracing", "api-24"] }
+
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "std", "ndarray", "tracing", "api-24", "directml"] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

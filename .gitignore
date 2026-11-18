@@ -2,3 +2,5 @@
 /third_party/cef
 /.superpowers
 /dist
+/third_party/models
+/third_party/onnxruntime
