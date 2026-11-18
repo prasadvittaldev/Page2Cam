@@ -1,5 +1,5 @@
 //! What the admin UI can ask of the app, and the JSON shapes it uses.
-use p2c_compositor::PipLayout;
+use p2c_compositor::{OverlayStyle, PipLayout};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -87,12 +87,19 @@ impl Default for AudioSettings {
 }
 
 /// PIP layout as JSON.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PipDto {
     pub visible: bool,
     pub x: f32,
     pub y: f32,
     pub width: f32,
+    /// "box" | "cutout-small" | "cutout-full"
+    #[serde(default = "default_style")]
+    pub style: String,
+}
+
+fn default_style() -> String {
+    OverlayStyle::Box.as_str().into()
 }
 
 impl From<PipLayout> for PipDto {
@@ -102,19 +109,24 @@ impl From<PipLayout> for PipDto {
             x: l.x,
             y: l.y,
             width: l.width,
+            style: l.style.as_str().into(),
         }
     }
 }
 
-impl From<PipDto> for PipLayout {
-    fn from(d: PipDto) -> Self {
-        PipLayout {
+impl TryFrom<PipDto> for PipLayout {
+    type Error = anyhow::Error;
+
+    fn try_from(d: PipDto) -> anyhow::Result<Self> {
+        let style = OverlayStyle::parse(&d.style)
+            .ok_or_else(|| anyhow::anyhow!("unknown overlay style {:?}", d.style))?;
+        Ok(PipLayout {
             visible: d.visible,
             x: d.x,
             y: d.y,
             width: d.width.clamp(0.05, 0.5),
-            style: p2c_compositor::OverlayStyle::Box,
-        }
+            style,
+        })
     }
 }
 
@@ -138,6 +150,10 @@ pub struct Status {
     /// "ok" | "none" | "error: <why>"
     pub mic: String,
     pub log_file: String,
+    /// Cut-out status line, e.g. "Quality · CPU · 24 masks/s", or why it isn't running.
+    pub cutout: String,
+    /// "quality" | "fast"
+    pub cutout_engine: String,
 }
 
 /// The app side of the admin UI. Implementations must be cheap and non-blocking.
@@ -152,4 +168,8 @@ pub trait Controls: Send + Sync + 'static {
     fn audio(&self) -> AudioSettings;
     fn set_audio(&self, a: AudioSettings);
     fn status(&self) -> Status;
+    /// "quality" | "fast": the operator's cut-out engine choice.
+    fn cutout_engine(&self) -> String;
+    /// Errors on an unknown engine name.
+    fn set_cutout_engine(&self, engine: &str) -> anyhow::Result<()>;
 }

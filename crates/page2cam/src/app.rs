@@ -220,6 +220,16 @@ impl Controls for App {
             has_saved_key: Self::saved_key().is_some(),
             mic: self.mic_status.lock().clone(),
             log_file: self.log_file.clone(),
+            cutout: "not available yet".into(),
+            cutout_engine: "quality".into(),
         }
+    }
+
+    fn cutout_engine(&self) -> String {
+        "quality".into()
+    }
+
+    fn set_cutout_engine(&self, _engine: &str) -> anyhow::Result<()> {
+        anyhow::bail!("the cut-out is not available yet")
     }
 }

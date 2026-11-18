@@ -10,6 +10,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
+use p2c_compositor::PipLayout;
 use p2c_core::FrameSlot;
 use serde::Deserialize;
 use tokio::sync::watch;
@@ -75,6 +76,7 @@ pub(crate) fn router(st: State) -> Router {
         .route("/api/navigate", post(navigate))
         .route("/api/nav", post(nav))
         .route("/api/pip", post(pip))
+        .route("/api/cutout", post(cutout))
         .route("/api/stream/start", post(stream_start))
         .route("/api/stream/stop", post(stream_stop))
         .route("/api/audio", post(audio))
@@ -213,9 +215,26 @@ async fn nav(AxState(st): AxState<State>, Json(b): Json<NavBody>) -> StatusCode 
     StatusCode::OK
 }
 
-async fn pip(AxState(st): AxState<State>, Json(b): Json<PipDto>) -> StatusCode {
-    st.controls.set_pip(b.into());
-    StatusCode::OK
+async fn pip(AxState(st): AxState<State>, Json(b): Json<PipDto>) -> Response {
+    match PipLayout::try_from(b) {
+        Ok(l) => {
+            st.controls.set_pip(l);
+            StatusCode::OK.into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CutoutBody {
+    engine: String,
+}
+
+async fn cutout(AxState(st): AxState<State>, Json(b): Json<CutoutBody>) -> Response {
+    match st.controls.set_cutout_engine(&b.engine) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
 }
 
 async fn stream_start(AxState(st): AxState<State>, Json(b): Json<StreamRequest>) -> Response {
@@ -394,7 +413,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
-    use p2c_compositor::PipLayout;
+
     use parking_lot_free::Fake;
     use tower::ServiceExt;
 
@@ -407,6 +426,7 @@ mod tests {
             pub navigated: Mutex<Vec<String>>,
             pub pip: Mutex<PipLayout>,
             pub streams: Mutex<Vec<StreamRequest>>,
+            pub engine: Mutex<String>,
         }
 
         impl Controls for Fake {
@@ -433,8 +453,17 @@ mod tests {
             fn status(&self) -> Status {
                 Status {
                     url: "https://example.com".into(),
+                    cutout: "Fast · CPU · 30 masks/s".into(),
                     ..Status::default()
                 }
+            }
+            fn cutout_engine(&self) -> String {
+                self.engine.lock().unwrap().clone()
+            }
+            fn set_cutout_engine(&self, engine: &str) -> anyhow::Result<()> {
+                anyhow::ensure!(["quality", "fast"].contains(&engine), "unknown engine");
+                *self.engine.lock().unwrap() = engine.into();
+                Ok(())
             }
         }
     }
@@ -593,6 +622,68 @@ mod tests {
                 style: p2c_compositor::OverlayStyle::Box,
             }
         );
+    }
+
+    async fn post(fake: Arc<Fake>, uri: &str, body: &str) -> StatusCode {
+        app(fake)
+            .oneshot(req("POST", uri, "127.0.0.1:8765", Some(TOKEN), Some(body)))
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn pip_style_round_trip() {
+        let fake = Arc::new(Fake::default());
+        let body = r#"{"visible":true,"x":0.5,"y":1.0,"width":0.3,"style":"cutout-full"}"#;
+        assert_eq!(post(fake.clone(), "/api/pip", body).await, StatusCode::OK);
+        assert_eq!(
+            fake.pip.lock().unwrap().style,
+            p2c_compositor::OverlayStyle::CutoutFull
+        );
+        assert_eq!(PipDto::from(*fake.pip.lock().unwrap()).style, "cutout-full");
+    }
+
+    #[tokio::test]
+    async fn pip_style_rejects_unknown() {
+        let fake = Arc::new(Fake::default());
+        let body = r#"{"visible":true,"x":0.5,"y":1.0,"width":0.3,"style":"sparkles"}"#;
+        assert_eq!(
+            post(fake.clone(), "/api/pip", body).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn cutout_engine_route() {
+        let fake = Arc::new(Fake::default());
+        assert_eq!(
+            post(fake.clone(), "/api/cutout", r#"{"engine":"fast"}"#).await,
+            StatusCode::OK
+        );
+        assert_eq!(*fake.engine.lock().unwrap(), "fast");
+        assert_eq!(
+            post(fake.clone(), "/api/cutout", r#"{"engine":"turbo"}"#).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn state_includes_cutout() {
+        let fake = Arc::new(Fake::default());
+        let r = app(fake)
+            .oneshot(req(
+                "GET",
+                "/api/state",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                None,
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["status"]["cutout"], "Fast · CPU · 30 masks/s");
+        assert_eq!(v["pip"]["style"], "box");
     }
 
     #[test]

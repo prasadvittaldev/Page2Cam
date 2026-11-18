@@ -19,6 +19,7 @@
     --font: "Bahnschrift", "DIN Alternate", "Barlow", "Segoe UI", system-ui, sans-serif;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { margin: 0; height: 100%; }
   body {
     background: var(--desk);
@@ -89,6 +90,22 @@
     background: rgba(255,255,255,.06); cursor: move; touch-action: none;
   }
   .pip.hidden { display: none; }
+  /* Full-size cut-out covers the picture: only the handle is draggable, so
+     clicks elsewhere still reach the page. */
+  .pip.full { border-color: rgba(255,255,255,.35); background: none; pointer-events: none; }
+  .pip.full .grip { display: none; }
+  .pip .handle { display: none; }
+  .pip.full .handle {
+    display: block; pointer-events: auto; position: absolute; left: 50%; bottom: 8px;
+    transform: translateX(-50%); padding: 3px 10px; border-radius: 12px; cursor: ew-resize;
+    background: rgba(0,0,0,.6); color: #fff; font-size: 12px; white-space: nowrap;
+  }
+  .seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 0; }
+  .seg .btn { border-radius: 0; font-size: 13px; padding: 5px 6px; }
+  .seg .btn:first-child { border-radius: 6px 0 0 6px; }
+  .seg .btn:last-child { border-radius: 0 6px 6px 0; }
+  .seg .btn[aria-pressed=true] { background: var(--text); color: var(--well); border-color: var(--text); }
+  .sub { font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
   .pip .grip {
     position: absolute; right: -7px; bottom: -7px; width: 14px; height: 14px;
     background: #fff; border-radius: 2px; cursor: nwse-resize;
@@ -143,10 +160,10 @@
       <div class="screen" id="screen" tabindex="0" aria-label="Live output. Click to control the page; keys are sent while focused.">
         <canvas id="canvas" width="960" height="540"></canvas>
         <div class="empty" id="empty">Waiting for the first frame…</div>
-        <div class="pip" id="pip" title="Drag to move your webcam, drag the corner to resize"><div class="grip" id="grip"></div></div>
+        <div class="pip" id="pip" title="Drag to move your webcam, drag the corner to resize"><div class="grip" id="grip"></div><div class="handle" id="handle" title="Drag sideways to move yourself">↔ Move</div></div>
       </div>
     </div>
-    <p class="hint">Click, scroll and type in the picture to use the page. Drag the dashed box to place your webcam.</p>
+    <p class="hint">Click, scroll and type in the picture to use the page. Drag the dashed box to place your webcam (in Cut-out full, drag the Move handle).</p>
     <div class="presets" id="presets"></div>
   </div>
 
@@ -157,13 +174,26 @@
         <label for="pipOn">Show webcam</label>
         <input type="checkbox" id="pipOn">
       </div>
-      <div class="corners">
+      <div class="seg" role="group" aria-label="Overlay style">
+        <button class="btn" data-style="box" aria-pressed="false">Box</button>
+        <button class="btn" data-style="cutout-small" aria-pressed="false">Cut-out small</button>
+        <button class="btn" data-style="cutout-full" aria-pressed="false">Cut-out full</button>
+      </div>
+      <div id="cutoutBox" hidden>
+        <p class="sub">Cut-out quality</p>
+        <div class="seg" role="group" aria-label="Cut-out engine">
+          <button class="btn" data-engine="quality" aria-pressed="false" title="Cleaner edges around hair; needs a faster PC">Quality</button>
+          <button class="btn" data-engine="fast" aria-pressed="false" title="Smooth on any PC; rougher edges">Fast</button>
+        </div>
+        <div class="state" id="cutoutState"></div>
+      </div>
+      <div class="corners" id="corners" style="margin-top:10px">
         <button class="btn" data-corner="0,0">Top left</button>
         <button class="btn" data-corner="1,0">Top right</button>
         <button class="btn" data-corner="0,1">Bottom left</button>
         <button class="btn" data-corner="1,1">Bottom right</button>
       </div>
-      <div class="row">
+      <div class="row" id="sizeRow">
         <label for="pipSize">Size</label>
         <input type="range" id="pipSize" min="5" max="50" step="1">
       </div>
@@ -314,19 +344,31 @@
   });
   screen.addEventListener("keyup", (e) => { e.preventDefault(); send({ t: "key", a: "up", code: e.keyCode, mods: mods(e) }); });
 
-  // ---------- PIP box (same geometry as the compositor: 2% margin, x/y in free space) ----------
+  // ---------- PIP box: mirrors p2c_compositor::pip_rect exactly ----------
+  // box: 2% margins, x/y in the free space. cutout-small: side margins only,
+  // standing on the bottom edge. cutout-full: full height (shrunk to fit the
+  // width), bottom edge, x slides it; no margins.
   const pipEl = $("pip");
   function aspect() { return (state && state.status.webcam_aspect) || 9 / 16; }
+  const clamp01 = (v) => Math.min(Math.max(v, 0), 1);
+  function pipGeom(W, H) {
+    const style = pip.style || "box";
+    const mx = style === "cutout-full" ? 0 : W * 0.02;
+    const my = style === "box" ? H * 0.02 : 0;
+    const aw = W - 2 * mx, ah = H - 2 * my;
+    let w = style === "cutout-full" ? H / aspect() : pip.width * W;
+    let h = style === "cutout-full" ? H : w * aspect();
+    if (w > aw || h > ah) { const s = Math.min(aw / w, ah / h); w *= s; h = Math.min(h * s, ah); }
+    const x = mx + clamp01(pip.x) * (aw - w);
+    const y = style === "box" ? my + clamp01(pip.y) * (ah - h) : H - h;
+    return { x, y, w, h, mx, my, style };
+  }
   function layoutPip() {
     const r = screen.getBoundingClientRect();
-    const W = r.width, H = r.height, mx = W * 0.02, my = H * 0.02;
-    let w = pip.width * W, h = w * aspect();
-    const aw = W - 2 * mx, ah = H - 2 * my;
-    if (w > aw || h > ah) { const s = Math.min(aw / w, ah / h); w *= s; h *= s; }
-    const x = mx + Math.min(Math.max(pip.x, 0), 1) * (aw - w);
-    const y = my + Math.min(Math.max(pip.y, 0), 1) * (ah - h);
-    Object.assign(pipEl.style, { left: x + "px", top: y + "px", width: w + "px", height: h + "px" });
+    const g = pipGeom(r.width, r.height);
+    Object.assign(pipEl.style, { left: g.x + "px", top: g.y + "px", width: g.w + "px", height: g.h + "px" });
     pipEl.classList.toggle("hidden", !pip.visible);
+    pipEl.classList.toggle("full", g.style === "cutout-full");
   }
   let pushTimer = 0;
   function pushPip(now) {
@@ -341,7 +383,7 @@
     const r = screen.getBoundingClientRect();
     const start = { x: e.clientX, y: e.clientY, pip: { ...pip }, box: pipEl.getBoundingClientRect() };
     const move = (ev) => {
-      const W = r.width, H = r.height, mx = W * 0.02, my = H * 0.02;
+      const W = r.width, H = r.height, g = pipGeom(W, H), mx = g.mx, my = g.my;
       if (resize) {
         const w = Math.max(start.box.width + (ev.clientX - start.x), W * 0.05);
         pip.width = Math.min(Math.max(w / W, 0.05), 0.5);
@@ -349,8 +391,9 @@
         const w = start.box.width, h = start.box.height;
         const left = start.box.left - r.left + (ev.clientX - start.x);
         const top = start.box.top - r.top + (ev.clientY - start.y);
-        pip.x = Math.min(Math.max((left - mx) / Math.max(W - 2 * mx - w, 1), 0), 1);
-        pip.y = Math.min(Math.max((top - my) / Math.max(H - 2 * my - h, 1), 0), 1);
+        pip.x = clamp01((left - mx) / Math.max(W - 2 * mx - w, 1));
+        // Cut-outs stand on the bottom edge: only sideways moves.
+        if (g.style === "box") pip.y = clamp01((top - my) / Math.max(H - 2 * my - h, 1));
       }
       layoutPip(); pushPip(false); syncControls();
     };
@@ -363,7 +406,10 @@
     pipEl.addEventListener("pointermove", move);
     pipEl.addEventListener("pointerup", up);
   }
-  pipEl.addEventListener("pointerdown", (e) => startDrag(e, e.target === $("grip")));
+  pipEl.addEventListener("pointerdown", (e) => {
+    if (pipEl.classList.contains("full") && e.target !== $("handle")) return;
+    startDrag(e, e.target === $("grip"));
+  });
   new ResizeObserver(layoutPip).observe(screen);
 
   $("pipOn").onchange = () => { pip.visible = $("pipOn").checked; layoutPip(); pushPip(true); };
@@ -372,9 +418,25 @@
     const [x, y] = b.dataset.corner.split(",").map(Number);
     pip.x = x; pip.y = y; pip.visible = true; layoutPip(); pushPip(true); syncControls();
   });
+  document.querySelectorAll("[data-style]").forEach((b) => b.onclick = () => {
+    pip.style = b.dataset.style; pip.visible = true;
+    if (pip.style !== "box") pip.y = 1;
+    if (pip.style === "cutout-full") pip.x = 0.5;
+    layoutPip(); pushPip(true); syncControls();
+  });
+  document.querySelectorAll("[data-engine]").forEach((b) => b.onclick = async () => {
+    document.querySelectorAll("[data-engine]").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    await api("/api/cutout", { engine: b.dataset.engine });
+    refresh();
+  });
   function syncControls() {
+    const style = pip.style || "box";
     $("pipOn").checked = pip.visible;
     $("pipSize").value = Math.round(pip.width * 100);
+    document.querySelectorAll("[data-style]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.style === style)));
+    $("cutoutBox").hidden = style === "box";
+    $("corners").hidden = style !== "box";
+    $("sizeRow").hidden = style === "cutout-full";
   }
 
   // ---------- stream ----------
@@ -429,6 +491,8 @@
       $("goLive").classList.toggle("live", live);
       setState("streamState", live ? "Live on " + s.stream_url : connecting ? "Connecting…" : s.stream === "idle" ? "" : s.stream);
       setState("webcamState", s.webcam === "none" ? "No webcam found. Plug one in and restart Page2Cam." : /^error/.test(s.webcam) ? s.webcam : "");
+      document.querySelectorAll("[data-engine]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.engine === s.cutout_engine)));
+      setState("cutoutState", s.cutout);
       setState("micState", /^error/.test(s.mic) ? s.mic : s.mic === "none" ? "No microphone found." : "");
       const camOn = /^ok/.test(s.vcam);
       const mon = $("monitor");
