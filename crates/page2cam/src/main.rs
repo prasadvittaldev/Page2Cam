@@ -150,6 +150,15 @@ fn run() -> anyhow::Result<()> {
     // Leftover instances (or their orphaned Chromium helpers) would hold the
     // camera, admin port and CEF profile: stop them before opening any.
     instances::stop_others(std::process::id(), cli.wait_for_pid);
+    // Only one engine at a time (two launches milliseconds apart). Held until
+    // `run` returns; a relaunch's new process waits for our exit anyway.
+    let _engine_lock = match instances::take_engine_lock(std::process::id(), cli.wait_for_pid) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("{e:#}; this one exits");
+            std::process::exit(1);
+        }
+    };
     let started = std::time::Instant::now();
     // CEF can kill the whole process (e.g. "GPU process isn't usable.
     // Goodbye."), and then the relaunch at the end of `run` never happens:
