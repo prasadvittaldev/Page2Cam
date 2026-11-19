@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use nokhwa::pixel_format::RgbFormat;
@@ -39,12 +39,135 @@ pub fn list_cameras() -> anyhow::Result<Vec<CameraInfo>> {
         .collect())
 }
 
+/// Live webcam status for the admin page ("ok: <name>", "reconnecting: <error>").
+/// Cheap to clone; the capture thread updates it.
+#[derive(Clone, Default)]
+pub struct WebcamStatus(Arc<Mutex<String>>);
+
+impl WebcamStatus {
+    pub fn new(s: &str) -> WebcamStatus {
+        WebcamStatus(Arc::new(Mutex::new(s.to_string())))
+    }
+
+    pub fn get(&self) -> String {
+        self.0.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    pub fn set(&self, s: String) {
+        if let Ok(mut g) = self.0.lock() {
+            *g = s;
+        }
+    }
+}
+
+/// Gap between attempts to reopen a failed webcam.
+const REOPEN_EVERY: Duration = Duration::from_secs(3);
+
+/// True when no reopen was tried yet, or the last one was at least 3 s ago.
+fn reopen_due(last_try: Option<Instant>, now: Instant) -> bool {
+    last_try.is_none_or(|t| now.saturating_duration_since(t) >= REOPEN_EVERY)
+}
+
+/// Where the capture loop gets frames (the nokhwa camera; fakes in tests).
+/// Dropping it closes the camera.
+trait FrameSource {
+    /// The next frame; `Ok(None)` skips one (e.g. undecodable), `Err` means
+    /// the camera failed and must be reopened.
+    fn next_frame(&mut self) -> anyhow::Result<Option<Frame>>;
+}
+
+/// Read frames until `stop`. When the source fails it is closed and reopened
+/// with `open` whenever `reopen_due` says so (every 3 s in the app) until that
+/// works (e.g. after Windows' Frame Server service crashed and restarted);
+/// `stop` is checked every 50 ms meanwhile. `on_status` gets
+/// "reconnecting: <error>" while the camera is down and "ok: <name>" once it
+/// is back.
+fn capture_loop<S: FrameSource>(
+    first: S,
+    mut open: impl FnMut() -> anyhow::Result<S>,
+    stop: &AtomicBool,
+    reopen_due: impl Fn(Option<Instant>, Instant) -> bool,
+    name: &str,
+    mut on_frame: impl FnMut(Frame),
+    mut on_status: impl FnMut(String),
+) {
+    let mut source = Some(first);
+    let mut last_try: Option<Instant> = None;
+    while !stop.load(Ordering::Relaxed) {
+        match &mut source {
+            Some(s) => match s.next_frame() {
+                Ok(Some(f)) => on_frame(f),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        camera = %name,
+                        error = %format!("{e:#}"),
+                        "webcam stopped; reopening it until it works"
+                    );
+                    source = None; // closes the camera
+                    last_try = Some(Instant::now());
+                    on_status(format!("reconnecting: {e:#}"));
+                }
+            },
+            None => {
+                let now = Instant::now();
+                if reopen_due(last_try, now) {
+                    last_try = Some(now);
+                    match open() {
+                        Ok(s) => {
+                            tracing::info!(camera = %name, "webcam reconnected");
+                            source = Some(s);
+                            on_status(format!("ok: {name}"));
+                        }
+                        Err(e) => {
+                            tracing::debug!(camera = %name, error = %format!("{e:#}"), "webcam reopen failed");
+                            on_status(format!("reconnecting: {e:#}"));
+                        }
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+}
+
+/// The real camera: nokhwa frames decoded to BGRA.
+struct NokhwaSource(Camera);
+
+impl FrameSource for NokhwaSource {
+    fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
+        let frame = self.0.frame()?;
+        let res = frame.resolution();
+        let Some(fmt) = raw_format(frame.source_frame_format()) else {
+            anyhow::bail!(
+                "unsupported webcam pixel format {:?}",
+                frame.source_frame_format()
+            );
+        };
+        match crate::decode::to_bgra(fmt, res.width(), res.height(), frame.buffer()) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) => {
+                tracing::debug!(error = %e, "dropping undecodable webcam frame");
+                Ok(None)
+            }
+        }
+    }
+}
+
+impl Drop for NokhwaSource {
+    fn drop(&mut self) {
+        let _ = self.0.stop_stream();
+    }
+}
+
 /// Captures a webcam on its own thread, writing BGRA frames into a slot.
 pub struct WebcamCapture {
     stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
     /// Disconnects when the capture thread exits.
     done: Receiver<()>,
+    status: WebcamStatus,
 }
 
 impl WebcamCapture {
@@ -56,6 +179,8 @@ impl WebcamCapture {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let cam = cam.clone();
+        let status = WebcamStatus::new(&format!("ok: {}", cam.name));
+        let status2 = status.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
         let (done_tx, done) = std::sync::mpsc::channel::<()>();
         // nokhwa's Camera is not Send, so it is opened and used entirely on this thread.
@@ -63,10 +188,10 @@ impl WebcamCapture {
             .name("p2c-webcam".into())
             .spawn(move || {
                 let _done = done_tx; // dropped (disconnecting `done`) when this thread exits
-                let mut camera = match open(&cam) {
+                let camera = match open(&cam) {
                     Ok(c) => {
                         let _ = ready_tx.send(Ok(()));
-                        c
+                        NokhwaSource(c)
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -75,48 +200,47 @@ impl WebcamCapture {
                 };
                 // First report after 5 s (start-up included), then every 30 s,
                 // so a camera slowing down (e.g. dim light) shows in the log.
-                let mut rate = p2c_core::RateWindow::new(Duration::from_secs(5), std::time::Instant::now());
+                let mut rate = p2c_core::RateWindow::new(Duration::from_secs(5), Instant::now());
                 let mut first = true;
-                while !stop2.load(Ordering::Relaxed) {
-                    let frame = match camera.frame() {
-                        Ok(f) => f,
-                        Err(e) => {
-                            // Unplugged or failed: stop updating; the PIP hides itself when stale.
-                            tracing::warn!(camera = %cam.name, error = %e, "webcam stopped");
-                            break;
-                        }
-                    };
-                    let res = frame.resolution();
-                    let Some(fmt) = raw_format(frame.source_frame_format()) else {
-                        tracing::warn!(format = ?frame.source_frame_format(), "unsupported webcam pixel format");
-                        break;
-                    };
-                    match crate::decode::to_bgra(fmt, res.width(), res.height(), frame.buffer()) {
-                        Ok(f) => {
-                            slot.put(crop_frame(f, &crop));
-                            let now = std::time::Instant::now();
-                            if let Some(fps) = rate.tick(now) {
-                                tracing::info!(camera = %cam.name, "webcam measured {fps:.1} fps");
-                                if first {
-                                    rate = p2c_core::RateWindow::new(Duration::from_secs(30), now);
-                                    first = false;
-                                }
+                capture_loop(
+                    camera,
+                    || open(&cam).map(NokhwaSource),
+                    &stop2,
+                    reopen_due,
+                    &cam.name,
+                    |f| {
+                        slot.put(crop_frame(f, &crop));
+                        let now = Instant::now();
+                        if let Some(fps) = rate.tick(now) {
+                            tracing::info!(camera = %cam.name, "webcam measured {fps:.1} fps");
+                            if first {
+                                rate = p2c_core::RateWindow::new(Duration::from_secs(30), now);
+                                first = false;
                             }
                         }
-                        Err(e) => tracing::debug!(error = %e, "dropping undecodable webcam frame"),
-                    }
-                }
-                let _ = camera.stop_stream();
+                    },
+                    |s| status2.set(s),
+                );
             })
             .context("spawning webcam thread")?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(WebcamCapture { stop, handle, done }),
+            Ok(Ok(())) => Ok(WebcamCapture {
+                stop,
+                handle,
+                done,
+                status,
+            }),
             Ok(Err(e)) => {
                 let _ = handle.join();
                 Err(e)
             }
             Err(_) => anyhow::bail!("webcam thread exited during startup"),
         }
+    }
+
+    /// Live status ("ok: <name>" or "reconnecting: <error>").
+    pub fn status(&self) -> WebcamStatus {
+        self.status.clone()
     }
 
     /// Ask the capture thread to stop. If it is stuck in a blocking read on a
@@ -197,7 +321,6 @@ fn open(cam: &CameraInfo) -> anyhow::Result<Camera> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn stop_does_not_hang_on_blocked_capture_thread() {
@@ -226,6 +349,107 @@ mod tests {
         };
         let out = crop_frame(Frame::new_black(8, 8), &shared);
         assert_eq!((out.width, out.height), (4, 4));
+    }
+
+    #[test]
+    fn reopen_due_every_3s() {
+        let t0 = Instant::now();
+        assert!(reopen_due(None, t0));
+        assert!(!reopen_due(Some(t0), t0 + Duration::from_millis(2999)));
+        assert!(reopen_due(Some(t0), t0 + Duration::from_secs(3)));
+    }
+
+    /// Plays back scripted results; `Err` once the script runs out is not
+    /// reached in these tests (the loop is stopped first).
+    struct Scripted(std::collections::VecDeque<anyhow::Result<Option<Frame>>>);
+
+    impl FrameSource for Scripted {
+        fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
+            self.0
+                .pop_front()
+                .unwrap_or_else(|| Ok(Some(Frame::new_black(4, 4))))
+        }
+    }
+
+    #[test]
+    fn capture_reconnects_after_frame_failure() {
+        use std::sync::atomic::AtomicUsize;
+        let first = Scripted(
+            vec![
+                Ok(Some(Frame::new_black(4, 4))),
+                Err(anyhow::anyhow!(
+                    "Could not capture frame: An exception occurred in the service when handling the control request. (0x80070428)"
+                )),
+            ]
+            .into(),
+        );
+        let opens = AtomicUsize::new(0);
+        let open = || -> anyhow::Result<Scripted> {
+            if opens.fetch_add(1, Ordering::SeqCst) < 2 {
+                anyhow::bail!("starting webcam Cam: service stopped")
+            }
+            Ok(Scripted(Default::default()))
+        };
+        let stop = AtomicBool::new(false);
+        let mut frames = 0;
+        let mut statuses = Vec::new();
+        capture_loop(
+            first,
+            open,
+            &stop,
+            |last: Option<Instant>, now: Instant| {
+                last.is_none_or(|t| now - t >= Duration::from_millis(10))
+            },
+            "Cam",
+            |_| {
+                frames += 1;
+                if frames == 4 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            },
+            |s| statuses.push(s),
+        );
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            3,
+            "two failed reopens, then one that works"
+        );
+        assert_eq!(frames, 4, "frames resume after reconnecting");
+        assert!(statuses[0].starts_with("reconnecting: "), "{statuses:?}");
+        assert!(statuses[0].contains("0x80070428"), "{statuses:?}");
+        assert!(statuses[1].contains("service stopped"), "{statuses:?}");
+        assert_eq!(statuses.last().unwrap(), "ok: Cam", "{statuses:?}");
+    }
+
+    #[test]
+    fn capture_stops_promptly_while_reconnecting() {
+        let first = Scripted(vec![Err(anyhow::anyhow!("gone"))].into());
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            s2.store(true, Ordering::Relaxed);
+        });
+        let start = Instant::now();
+        capture_loop(
+            first,
+            || -> anyhow::Result<Scripted> { anyhow::bail!("still gone") },
+            &stop,
+            reopen_due,
+            "Cam",
+            |_| {},
+            |_| {},
+        );
+        t.join().unwrap();
+        assert!(start.elapsed() < Duration::from_millis(600));
+    }
+
+    #[test]
+    fn status_is_shared() {
+        let s = WebcamStatus::new("ok: Cam");
+        let s2 = s.clone();
+        s2.set("reconnecting: x".into());
+        assert_eq!(s.get(), "reconnecting: x");
     }
 
     #[test]

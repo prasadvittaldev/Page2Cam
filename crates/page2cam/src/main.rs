@@ -22,7 +22,7 @@ use p2c_compositor::{
 use p2c_core::AudioRing;
 use p2c_core::FrameSlot;
 use p2c_stream::StreamController;
-use p2c_webcam::{list_cameras, pick_camera, WebcamCapture};
+use p2c_webcam::{list_cameras, pick_camera, WebcamCapture, WebcamStatus};
 use parking_lot::{Mutex, RwLock};
 
 use crate::app::App;
@@ -227,8 +227,9 @@ fn run() -> anyhow::Result<()> {
         None => start_webcam(&cfg, own_device.as_deref(), crop.clone()),
     };
     let webcam_status = match &webcam {
-        Some((_, _, name)) => format!("ok: {name}"),
-        None => "none".to_string(),
+        Some((_, WebcamSource::Real(cap), _)) => cap.status(),
+        Some((_, WebcamSource::Fake(..), name)) => WebcamStatus::new(&format!("ok: {name}")),
+        None => WebcamStatus::new("none"),
     };
     let webcam_slot = webcam.as_ref().map(|(slot, _, _)| slot.clone());
 

@@ -45,6 +45,94 @@ fn is_registered() -> bool {
 struct Owner {
     stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Frame Server's process id right after the camera was registered.
+    service_pid: Option<u32>,
+}
+
+/// Windows' camera Frame Server service, as the SCM reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceState {
+    Running {
+        pid: u32,
+    },
+    Stopped,
+    /// Starting or stopping.
+    Pending,
+    /// The query failed.
+    Unknown,
+}
+
+/// A service sample and when it was taken.
+type Observation = (Instant, ServiceState);
+
+/// How often the Frame Server service is checked.
+const HEALTH_EVERY: Duration = Duration::from_secs(5);
+
+/// Our camera lives inside the Frame Server process that registered it
+/// (`registered_pid`). Only a *different* running process means that one died
+/// (crash, watchdog) and our camera with it. A stopped service alone is no
+/// reason: Frame Server is demand-started and stops when idle, and starting
+/// the camera again would restart it in a loop.
+fn service_restarted(registered_pid: Option<u32>, now: ServiceState) -> bool {
+    matches!((registered_pid, now), (Some(p), ServiceState::Running { pid }) if pid != p)
+}
+
+/// Read-only SCM query of the "FrameServer" service (no admin rights needed).
+fn query_frame_server() -> ServiceState {
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
+        SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS_PROCESS,
+        SERVICE_STOPPED,
+    };
+    unsafe {
+        let Ok(scm) = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) else {
+            return ServiceState::Unknown;
+        };
+        let state = match OpenServiceW(scm, windows::core::w!("FrameServer"), SERVICE_QUERY_STATUS)
+        {
+            Ok(svc) => {
+                let mut buf = [0u8; std::mem::size_of::<SERVICE_STATUS_PROCESS>()];
+                let mut needed = 0u32;
+                let r =
+                    QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, Some(&mut buf), &mut needed);
+                let _ = CloseServiceHandle(svc);
+                if r.is_ok() {
+                    let s: SERVICE_STATUS_PROCESS =
+                        std::ptr::read_unaligned(buf.as_ptr() as *const SERVICE_STATUS_PROCESS);
+                    if s.dwCurrentState == SERVICE_RUNNING && s.dwProcessId != 0 {
+                        ServiceState::Running { pid: s.dwProcessId }
+                    } else if s.dwCurrentState == SERVICE_STOPPED {
+                        ServiceState::Stopped
+                    } else {
+                        ServiceState::Pending
+                    }
+                } else {
+                    ServiceState::Unknown
+                }
+            }
+            Err(_) => ServiceState::Unknown,
+        };
+        let _ = CloseServiceHandle(scm);
+        state
+    }
+}
+
+/// Sample the Frame Server every 5 s on its own thread (never the ticker's);
+/// ends once the sink is gone.
+fn spawn_service_watch() -> std::sync::mpsc::Receiver<Observation> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("p2c-wincam-health".into())
+        .spawn(move || loop {
+            if tx.send((Instant::now(), query_frame_server())).is_err() {
+                return;
+            }
+            std::thread::sleep(HEALTH_EVERY);
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("cannot watch the camera service: {e}");
+    }
+    rx
 }
 
 /// How the camera owner is started (replaced in tests).
@@ -65,6 +153,7 @@ impl Owner {
         Owner {
             stop: None,
             thread: None,
+            service_pid: None,
         }
     }
 
@@ -84,9 +173,13 @@ impl Owner {
                     None,
                 )
                 .context("creating the virtual camera (Windows 11 required)")?;
-                cam.Start(None).context(
-                    "starting the virtual camera. If this says access denied, re-run install-camera.cmd as administrator",
-                )?;
+                if let Err(e) = cam.Start(None) {
+                    // Don't leave a half-registered camera behind.
+                    let _ = cam.Remove();
+                    return Err(anyhow::Error::from(e).context(
+                        "starting the virtual camera. If this says access denied, re-run install-camera.cmd as administrator",
+                    ));
+                }
                 Ok(cam)
             })();
             match result {
@@ -104,9 +197,15 @@ impl Owner {
             CoUninitialize();
         })?;
         ready_rx.recv().context("camera thread exited")??;
+        let service_pid = match query_frame_server() {
+            ServiceState::Running { pid } => Some(pid),
+            _ => None,
+        };
+        tracing::info!(?service_pid, "virtual camera registered with Frame Server");
         Ok(Owner {
             stop: Some(stop_tx),
             thread: Some(thread),
+            service_pid,
         })
     }
 }
@@ -148,18 +247,33 @@ pub struct WinVcamSink {
     status: CameraStatus,
     /// Driver version last seen in the mapping (to log a change once).
     dll_version: Option<u32>,
+    /// Frame Server samples (every 5 s, from `spawn_service_watch`).
+    watch: std::sync::mpsc::Receiver<Observation>,
+    /// When the current owner was installed (older samples are ignored).
+    owner_since: Instant,
+    /// Frame Server's process id that holds our current registration.
+    service_pid: Option<u32>,
 }
+
+/// Status while the camera is registered again after Frame Server restarted.
+const SERVICE_RESTARTED: &str = "starting (retrying): camera service restarted";
 
 // The mapping pointer is only used from the ticker thread that owns the sink.
 unsafe impl Send for WinVcamSink {}
 
 impl WinVcamSink {
     pub fn open(spec: &OutputSpec, status: CameraStatus) -> anyhow::Result<WinVcamSink> {
+        let registered = is_registered();
         Self::open_with(
             spec,
             status,
-            is_registered(),
+            registered,
             std::sync::Arc::new(Owner::start),
+            if registered {
+                spawn_service_watch()
+            } else {
+                std::sync::mpsc::channel().1
+            },
         )
     }
 
@@ -170,6 +284,7 @@ impl WinVcamSink {
         status: CameraStatus,
         registered: bool,
         start: StartFn,
+        watch: std::sync::mpsc::Receiver<Observation>,
     ) -> anyhow::Result<WinVcamSink> {
         anyhow::ensure!(registered, NOT_INSTALLED);
         let mut sink = WinVcamSink {
@@ -181,12 +296,88 @@ impl WinVcamSink {
             last_try: None,
             status,
             dll_version: None,
+            watch,
+            owner_since: Instant::now(),
+            service_pid: None,
         };
         match (sink.start)() {
-            Ok(o) => sink.owner = Some(o),
+            Ok(o) => sink.set_owner(o),
             Err(e) => sink.start_failed(&e),
         }
         Ok(sink)
+    }
+
+    fn set_owner(&mut self, o: Owner) {
+        self.service_pid = o.service_pid;
+        self.owner_since = Instant::now();
+        self.owner = Some(o);
+    }
+
+    /// Cheap per-frame check of the Frame Server samples: when the process
+    /// that held our camera is gone, drop the owner and register again.
+    fn poll_health(&mut self) {
+        let mut lost = None;
+        while let Ok((at, state)) = self.watch.try_recv() {
+            if self.owner.is_none() || at < self.owner_since {
+                continue;
+            }
+            if service_restarted(self.service_pid, state) {
+                lost = Some(state);
+                break;
+            }
+            if let (None, ServiceState::Running { pid }) = (self.service_pid, state) {
+                self.service_pid = Some(pid);
+            }
+        }
+        if let Some(state) = lost {
+            tracing::warn!(
+                old_pid = ?self.service_pid,
+                now = ?state,
+                "camera service (Frame Server) restarted: our virtual camera went with it; registering it again"
+            );
+            let old = self.owner.take();
+            self.view = None;
+            self.last_try = None;
+            self.dll_version = None;
+            self.service_pid = None;
+            self.status.set(Some(SERVICE_RESTARTED.into()));
+            self.spawn_start(old, Instant::now());
+        }
+    }
+
+    /// Start the camera on a short-lived thread ("p2c-wincam-retry"), after
+    /// removing `old` (waiting at most 3 s for that, so a hung removal can't
+    /// stop the retries).
+    fn spawn_start(&mut self, old: Option<Owner>, now: Instant) {
+        self.last_start_try = Some(now);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = self.start.clone();
+        let spawned = std::thread::Builder::new()
+            .name("p2c-wincam-retry".into())
+            .spawn(move || {
+                if let Some(o) = old {
+                    let (dtx, drx) = std::sync::mpsc::channel::<()>();
+                    let _ = std::thread::Builder::new()
+                        .name("p2c-wincam-remove".into())
+                        .spawn(move || {
+                            drop(o);
+                            drop(dtx);
+                        });
+                    if drx
+                        .recv_timeout(Duration::from_secs(3))
+                        .is_err_and(|e| e == std::sync::mpsc::RecvTimeoutError::Timeout)
+                    {
+                        tracing::warn!(
+                            "removing the old virtual camera hangs; starting a new one anyway"
+                        );
+                    }
+                }
+                let _ = tx.send(start());
+            });
+        match spawned {
+            Ok(_) => self.pending = Some(rx),
+            Err(e) => tracing::warn!("cannot start a virtual camera attempt: {e}"),
+        }
     }
 
     fn start_failed(&self, e: &anyhow::Error) {
@@ -204,7 +395,7 @@ impl WinVcamSink {
             match rx.try_recv() {
                 Ok(Ok(o)) => {
                     tracing::info!("virtual camera started");
-                    self.owner = Some(o);
+                    self.set_owner(o);
                     self.pending = None;
                     self.status.set(None);
                 }
@@ -213,24 +404,17 @@ impl WinVcamSink {
                     self.start_failed(&e);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending = None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    tracing::warn!("virtual camera start attempt ended without a result (panicked?); will retry");
+                    self.pending = None;
+                }
             }
             return;
         }
         if !retry_due(self.last_start_try, now) {
             return;
         }
-        self.last_start_try = Some(now);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let start = self.start.clone();
-        let spawned = std::thread::Builder::new()
-            .name("p2c-wincam-retry".into())
-            .spawn(move || {
-                let _ = tx.send(start());
-            });
-        if spawned.is_ok() {
-            self.pending = Some(rx);
-        }
+        self.spawn_start(None, now);
     }
 
     fn try_map(&mut self) {
@@ -283,6 +467,7 @@ impl WinVcamSink {
 impl FrameSink for WinVcamSink {
     /// Writes `out.camera` (NV12, fitted into 1920x1080) into the shared memory.
     fn push(&mut self, out: &Output) -> anyhow::Result<()> {
+        self.poll_health();
         self.poll_start(Instant::now());
         if self.owner.is_none() {
             return Ok(());
@@ -339,6 +524,108 @@ mod tests {
         Arc::new(|| anyhow::bail!("The data is invalid. (0x8007000D)"))
     }
 
+    /// A service watch nobody feeds (the sender is dropped).
+    fn no_watch() -> std::sync::mpsc::Receiver<Observation> {
+        std::sync::mpsc::channel().1
+    }
+
+    fn counting_ok(calls: &Arc<AtomicUsize>) -> StartFn {
+        let c = calls.clone();
+        Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(Owner::dummy())
+        })
+    }
+
+    #[test]
+    fn only_a_new_service_process_means_our_camera_is_gone() {
+        use ServiceState::*;
+        // Frame Server is demand-started: stopping on its own is normal.
+        assert!(!service_restarted(Some(100), Stopped));
+        assert!(!service_restarted(Some(100), Pending));
+        assert!(!service_restarted(Some(100), Unknown));
+        assert!(!service_restarted(Some(100), Running { pid: 100 }));
+        // A different process: the one that held our registration died.
+        assert!(service_restarted(Some(100), Running { pid: 200 }));
+        // No baseline yet: nothing to compare with.
+        assert!(!service_restarted(None, Running { pid: 200 }));
+    }
+
+    /// Read-only query of the real service (`cargo test -p p2c-vcam -- --ignored`).
+    #[test]
+    #[ignore]
+    fn frame_server_query_reads_the_real_service() {
+        let s = query_frame_server();
+        eprintln!("FrameServer: {s:?}");
+        assert!(matches!(
+            s,
+            ServiceState::Running { .. } | ServiceState::Stopped | ServiceState::Pending
+        ));
+    }
+
+    #[test]
+    fn service_restart_drops_owner_and_retries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let status = CameraStatus::default();
+        let mut sink =
+            WinVcamSink::open_with(&spec(), status.clone(), true, counting_ok(&calls), rx).unwrap();
+        assert!(sink.owner.is_some());
+        let t = Instant::now() + Duration::from_millis(10);
+        tx.send((t, ServiceState::Running { pid: 100 })).unwrap();
+        sink.poll_health();
+        assert!(sink.owner.is_some(), "baseline only");
+        sink.dll_version = Some(2);
+        tx.send((t, ServiceState::Running { pid: 200 })).unwrap();
+        sink.poll_health();
+        assert!(sink.owner.is_none(), "owner dropped");
+        assert!(sink.view.is_none());
+        assert_eq!(sink.dll_version, None);
+        assert_eq!(
+            status.status().as_deref(),
+            Some("starting (retrying): camera service restarted")
+        );
+        // The start-retry loop runs again in the background.
+        for _ in 0..200 {
+            sink.poll_start(Instant::now());
+            if sink.owner.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(sink.owner.is_some(), "camera started again");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(status.status(), None);
+        // The new service process is the new baseline; stale samples from
+        // before the restart are ignored.
+        tx.send((t, ServiceState::Running { pid: 100 })).unwrap();
+        tx.send((Instant::now(), ServiceState::Running { pid: 200 }))
+            .unwrap();
+        sink.poll_health();
+        tx.send((Instant::now(), ServiceState::Running { pid: 200 }))
+            .unwrap();
+        sink.poll_health();
+        assert!(sink.owner.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn stopped_service_does_not_restart_the_camera() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let status = CameraStatus::default();
+        let mut sink =
+            WinVcamSink::open_with(&spec(), status.clone(), true, counting_ok(&calls), rx).unwrap();
+        let t = Instant::now() + Duration::from_millis(10);
+        tx.send((t, ServiceState::Running { pid: 100 })).unwrap();
+        tx.send((t, ServiceState::Stopped)).unwrap();
+        tx.send((t, ServiceState::Running { pid: 100 })).unwrap();
+        sink.poll_health();
+        assert!(sink.owner.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(status.status(), None);
+    }
+
     #[test]
     fn retry_due_every_5s() {
         let t0 = Instant::now();
@@ -349,16 +636,22 @@ mod tests {
 
     #[test]
     fn not_installed_is_not_retried() {
-        let err = WinVcamSink::open_with(&spec(), CameraStatus::default(), false, failing())
-            .err()
-            .expect("hard error");
+        let err = WinVcamSink::open_with(
+            &spec(),
+            CameraStatus::default(),
+            false,
+            failing(),
+            no_watch(),
+        )
+        .err()
+        .expect("hard error");
         assert!(err.to_string().contains("not installed"), "{err}");
     }
 
     #[test]
     fn start_failure_reports_retrying_status() {
         let status = CameraStatus::default();
-        let sink = WinVcamSink::open_with(&spec(), status.clone(), true, failing())
+        let sink = WinVcamSink::open_with(&spec(), status.clone(), true, failing(), no_watch())
             .expect("sink despite start failure");
         assert!(sink.owner.is_none());
         let s = status.status().expect("status set");
@@ -377,7 +670,8 @@ mod tests {
             Ok(Owner::dummy())
         });
         let status = CameraStatus::default();
-        let mut sink = WinVcamSink::open_with(&spec(), status.clone(), true, start).unwrap();
+        let mut sink =
+            WinVcamSink::open_with(&spec(), status.clone(), true, start, no_watch()).unwrap();
         let t0 = Instant::now();
         sink.poll_start(t0 + Duration::from_secs(1)); // not due: no attempt
         assert_eq!(calls.load(Ordering::SeqCst), 1);

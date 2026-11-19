@@ -763,7 +763,7 @@
       $("goLive").textContent = live ? "End stream" : connecting ? "Cancel" : "Go live";
       $("goLive").classList.toggle("live", live);
       setState("streamState", live ? "Live on " + s.stream_url : connecting ? "Connecting…" : s.stream === "idle" ? "" : s.stream);
-      setState("webcamState", s.webcam === "none" ? "No webcam found. Plug one in and restart Page2Cam." : /^error/.test(s.webcam) ? s.webcam : "");
+      setState("webcamState", s.webcam === "none" ? "No webcam found. Plug one in and restart Page2Cam." : /^error/.test(s.webcam) ? s.webcam : /^reconnecting/.test(s.webcam) ? "Webcam " + s.webcam : "");
       document.querySelectorAll("[data-engine]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.engine === s.cutout_engine)));
       setState("cutoutState", s.cutout);
       syncGpu();

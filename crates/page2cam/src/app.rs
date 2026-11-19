@@ -27,7 +27,8 @@ pub struct App {
     pub mic: Mutex<Option<MicCapture>>,
     pub mic_status: Mutex<String>,
     pub webcam_slot: Option<FrameSlot>,
-    pub webcam_status: String,
+    /// Live: "reconnecting: <error>" while the webcam is being reopened.
+    pub webcam_status: p2c_webcam::WebcamStatus,
     pub vcam_status: String,
     /// Problems the camera sink found while running (e.g. an old driver); wins over `vcam_status`.
     pub vcam_live: p2c_vcam::CameraStatus,
@@ -359,7 +360,7 @@ impl Controls for App {
                 .vcam_live
                 .status()
                 .unwrap_or_else(|| self.vcam_status.clone()),
-            webcam: self.webcam_status.clone(),
+            webcam: self.webcam_status.get(),
             webcam_aspect,
             stream,
             stream_url: self.stream_url.lock().clone(),
