@@ -49,9 +49,13 @@ fn ancestors(procs: &[Proc], pid: u32) -> Vec<u32> {
 }
 
 /// Pids of every Page2Cam process to stop: all named page2cam except `me`,
-/// descendants of `me` (our CEF helpers) and ancestors of `me`.
-pub fn to_stop(procs: &[Proc], me: u32) -> Vec<u32> {
-    let keep_up = ancestors(procs, me);
+/// descendants of `me` (our CEF helpers) and ancestors of `me`, except `force`
+/// (the old instance of a restart, which is our parent but must go if it hung).
+pub fn to_stop(procs: &[Proc], me: u32, force: Option<u32>) -> Vec<u32> {
+    let keep_up: Vec<u32> = ancestors(procs, me)
+        .into_iter()
+        .filter(|a| Some(*a) != force)
+        .collect();
     procs
         .iter()
         .filter(|p| is_page2cam(&p.name))
@@ -62,9 +66,9 @@ pub fn to_stop(procs: &[Proc], me: u32) -> Vec<u32> {
 }
 
 /// Stop all other Page2Cam processes; returns the pids that were targeted.
-pub fn stop_others(me: u32) -> Vec<u32> {
+pub fn stop_others(me: u32, force: Option<u32>) -> Vec<u32> {
     let procs = platform::list();
-    let pids = to_stop(&procs, me);
+    let pids = to_stop(&procs, me, force);
     for pid in &pids {
         let path = procs
             .iter()
@@ -256,32 +260,39 @@ mod tests {
     #[test]
     fn stops_other_main_instance() {
         let procs = [p(1, 0, "explorer"), p(10, 1, exe()), p(20, 1, exe())];
-        assert_eq!(to_stop(&procs, 20), vec![10]);
+        assert_eq!(to_stop(&procs, 20, None), vec![10]);
     }
 
     #[test]
     fn keeps_own_helpers() {
         let procs = [p(20, 1, exe()), p(21, 20, exe()), p(22, 21, exe())];
-        assert!(to_stop(&procs, 20).is_empty());
+        assert!(to_stop(&procs, 20, None).is_empty());
+    }
+
+    #[test]
+    fn force_pid_is_stopped_even_as_parent() {
+        let procs = [p(10, 1, exe()), p(20, 10, exe())];
+        assert_eq!(to_stop(&procs, 20, Some(10)), vec![10]);
+        assert!(to_stop(&procs, 20, None).is_empty());
     }
 
     #[test]
     fn keeps_own_ancestors() {
         let procs = [p(5, 1, exe()), p(6, 5, exe()), p(20, 6, exe())];
-        assert!(to_stop(&procs, 20).is_empty());
+        assert!(to_stop(&procs, 20, None).is_empty());
     }
 
     #[test]
     fn survives_parent_cycles() {
         let procs = [p(5, 6, exe()), p(6, 5, exe()), p(20, 5, exe())];
         // Must terminate; the cycle members are our ancestors, so kept.
-        assert!(to_stop(&procs, 20).is_empty());
+        assert!(to_stop(&procs, 20, None).is_empty());
     }
 
     #[test]
     fn stops_orphaned_helpers_of_dead_instance() {
         let procs = [p(20, 1, exe()), p(30, 999, exe())];
-        assert_eq!(to_stop(&procs, 20), vec![30]);
+        assert_eq!(to_stop(&procs, 20, None), vec![30]);
     }
 
     #[test]
@@ -291,13 +302,13 @@ mod tests {
             p(30, 1, "chrome.exe"),
             p(31, 1, "page2cam-tool"),
         ];
-        assert!(to_stop(&procs, 20).is_empty());
+        assert!(to_stop(&procs, 20, None).is_empty());
     }
 
     #[test]
     #[cfg(windows)]
     fn name_match_is_case_insensitive_on_windows() {
         let procs = [p(20, 1, "page2cam.exe"), p(30, 1, "Page2Cam.EXE")];
-        assert_eq!(to_stop(&procs, 20), vec![30]);
+        assert_eq!(to_stop(&procs, 20, None), vec![30]);
     }
 }
