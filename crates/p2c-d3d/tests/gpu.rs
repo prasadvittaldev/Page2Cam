@@ -862,8 +862,7 @@ fn producer_moves_to_the_adapter_chromium_renders_on() {
         while p.gpu().luid() != b.luid {
             assert!(start.elapsed() < Duration::from_secs(10), "never moved");
             // Every call succeeds: the ticker never falls back to the CPU.
-            if p
-                .produce(&no_inputs(), false)
+            if p.produce(&no_inputs(), false)
                 .unwrap_or_else(|e| panic!("{} -> {}: {e:#}", a.name, b.name))
                 .is_some()
             {

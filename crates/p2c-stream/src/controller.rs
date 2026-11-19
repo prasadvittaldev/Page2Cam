@@ -187,11 +187,7 @@ impl StreamController {
 
 impl Inner {
     /// Start ffmpeg and its writer threads (the caller stores the result).
-    fn launch(
-        inner: &Arc<Inner>,
-        mut cfg: StreamConfig,
-        ffmpeg: &Path,
-    ) -> anyhow::Result<Running> {
+    fn launch(inner: &Arc<Inner>, mut cfg: StreamConfig, ffmpeg: &Path) -> anyhow::Result<Running> {
         anyhow::ensure!(!cfg.url.trim().is_empty(), "enter the stream server URL");
         let listener = TcpListener::bind("127.0.0.1:0").context("opening the audio socket")?;
         listener.set_nonblocking(true)?;

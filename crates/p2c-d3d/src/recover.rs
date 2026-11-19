@@ -145,12 +145,7 @@ pub struct RecoveringProducer {
 /// `Gpu`, `PageInput` and `GpuProducer` on one new device (the page input and
 /// the producer must share the device); the page input is published if
 /// `generation` is still the holder's.
-fn build(
-    luid: u64,
-    spec: OutputSpec,
-    holder: &PageHolder,
-    generation: u64,
-) -> Result<GpuProducer> {
+fn build(luid: u64, spec: OutputSpec, holder: &PageHolder, generation: u64) -> Result<GpuProducer> {
     let gpu = Gpu::new(luid).context("D3D11 device")?;
     let page = PageInput::new(&gpu, spec.width, spec.height).context("page texture")?;
     let producer = GpuProducer::new(gpu, page.clone(), spec).context("GPU compositor")?;
@@ -319,14 +314,16 @@ impl RecoveringProducer {
 
 impl OutputProducer for RecoveringProducer {
     fn produce(&mut self, inputs: &TickInputs, preview_due: bool) -> Result<Option<Output>> {
-        if !self.finish_rebuild()? {
-            if matches!(
+        // Recovering from device loss: hold the output until the new device
+        // is ready. Moving adapters: the old device keeps going meanwhile.
+        let running = !self.finish_rebuild()?;
+        if running
+            && matches!(
                 self.rebuild.as_ref().map(|r| &r.purpose),
                 Some(Purpose::Recover)
-            ) {
-                return Ok(None);
-            }
-            // Moving adapters: the old device keeps going meanwhile.
+            )
+        {
+            return Ok(None);
         }
         self.check_adapter_mismatch()?;
         let held = self.rebuild.is_none().then(|| self.held_since.take());

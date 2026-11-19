@@ -181,7 +181,10 @@ mod gpu {
         h.navigate(&url);
         let start = Instant::now();
         loop {
-            let f = s.gpu.read_bgra(&s.page.texture()).map_err(|e| format!("{e:#}"))?;
+            let f = s
+                .gpu
+                .read_bgra(&s.page.texture())
+                .map_err(|e| format!("{e:#}"))?;
             if close(f.pixel(100, 180), GREEN) && h.current_url() == url {
                 break;
             }

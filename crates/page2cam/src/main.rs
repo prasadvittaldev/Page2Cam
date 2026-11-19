@@ -658,7 +658,7 @@ fn start_video(
             }));
             VideoStart {
                 producer: Box::new(p),
-            status: video::status_gpu(&a.name),
+                status: video::status_gpu(&a.name),
                 gpu: Some(GpuVideo {
                     adapter: a.clone(),
                     holder,

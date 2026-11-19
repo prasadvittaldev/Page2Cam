@@ -469,7 +469,10 @@ mod tests {
         );
         // Backslashes before a quote are doubled; a trailing one too when quoted.
         assert_eq!(command_line(&s(&[r#"a\"b"#])), r#""a\\\"b""#);
-        assert_eq!(command_line(&s(&[r"C:\dir with space\"])), r#""C:\dir with space\\""#);
+        assert_eq!(
+            command_line(&s(&[r"C:\dir with space\"])),
+            r#""C:\dir with space\\""#
+        );
         assert_eq!(command_line(&s(&[r"C:\plain\"])), r"C:\plain\");
     }
 

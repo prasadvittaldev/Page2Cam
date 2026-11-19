@@ -115,16 +115,9 @@ pub fn encoder_options(e: Encoder, fps: u32, video_kbps: u32) -> Vec<String> {
 /// the stream's options, to a null output. (Smaller frames gave false
 /// negatives on Quick Sync and AMF.)
 pub fn probe_args(e: Encoder, fps: u32, video_kbps: u32) -> Vec<String> {
-    let mut a: Vec<String> = [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-    ]
-    .map(String::from)
-    .to_vec();
+    let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"]
+        .map(String::from)
+        .to_vec();
     a.push(format!("color=c=black:s=640x360:r={}", fps.max(1)));
     a.extend(["-frames:v", "5", "-c:v", e.ffmpeg_name()].map(String::from));
     a.extend(encoder_options(e, fps, video_kbps));
@@ -139,9 +132,9 @@ pub fn probe_args(e: Encoder, fps: u32, video_kbps: u32) -> Vec<String> {
 pub fn probe(ffmpeg: &Path, e: Encoder, fps: u32, video_kbps: u32) -> bool {
     let mut cmd = Command::new(ffmpeg);
     cmd.args(probe_args(e, fps, video_kbps))
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -502,8 +495,12 @@ mod tests {
             "[h264_nvenc @ 000001] No capable devices found",
             "Error while opening encoder for output stream #0:0 - maybe incorrect parameters",
         ]);
-        let qsv_fail = lines(&["[h264_qsv @ 0001] Error initializing an internal MFX session: unsupported (-3)"]);
-        let amf_fail = lines(&["[h264_amf @ 0001] CreateComponent(AMFVideoEncoderVCE_AVC) failed with error 30"]);
+        let qsv_fail = lines(&[
+            "[h264_qsv @ 0001] Error initializing an internal MFX session: unsupported (-3)",
+        ]);
+        let amf_fail = lines(&[
+            "[h264_amf @ 0001] CreateComponent(AMFVideoEncoderVCE_AVC) failed with error 30",
+        ]);
         let amf_load = lines(&["[h264_amf @ 0001] Cannot load amfrt64.dll"]);
         let nv_init = lines(&["[h264_nvenc @ 0001] InitializeEncoder failed: invalid param (8)"]);
         let bframes = lines(&["[h264_nvenc @ 0001] B frames as references are not supported"]);
@@ -531,7 +528,10 @@ mod tests {
     fn probe_finds_working_encoder() {
         let ff = find_ffmpeg().expect("ffmpeg on PATH");
         assert!(probe(&ff, Encoder::X264, 30, 4500));
-        assert!(probe(&ff, Encoder::Nvenc, 30, 4500), "NVENC on the NVIDIA laptop");
+        assert!(
+            probe(&ff, Encoder::Nvenc, 30, 4500),
+            "NVENC on the NVIDIA laptop"
+        );
         assert!(!probe(&ff, Encoder::Amf, 30, 4500), "no AMD GPU here");
         eprintln!("qsv: {}", probe(&ff, Encoder::Qsv, 30, 4500));
     }

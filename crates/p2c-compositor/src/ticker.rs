@@ -1240,7 +1240,10 @@ mod tests {
                     ..Output::default()
                 }));
             }
-            let since = *self.since.lock().get_or_insert_with(std::time::Instant::now);
+            let since = *self
+                .since
+                .lock()
+                .get_or_insert_with(std::time::Instant::now);
             if since.elapsed() < Duration::from_secs(1) {
                 return Ok(None);
             }
