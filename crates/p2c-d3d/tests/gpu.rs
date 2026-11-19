@@ -1250,6 +1250,24 @@ fn adapters_or_skip(test: &str) -> Vec<AdapterInfo> {
     l
 }
 
+/// Panics, naming where and how many, if any output pixel isn't opaque.
+fn assert_opaque(f: &Frame, what: &str) {
+    let px = f.data.as_chunks::<4>().0;
+    let bad: Vec<usize> = (0..px.len()).filter(|&i| px[i][3] != 255).collect();
+    if let Some(&i) = bad.first() {
+        let (x, y) = (i as u32 % f.width, i as u32 / f.width);
+        let last = *bad.last().unwrap() as u32;
+        panic!(
+            "{what}: {} of {} pixels not opaque; first ({x},{y}) {:?}, last ({},{})",
+            bad.len(),
+            px.len(),
+            px[i],
+            last % f.width,
+            last / f.width
+        );
+    }
+}
+
 fn fnv(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in data {
@@ -1455,10 +1473,7 @@ fn gpu_refined_off_matches_previous_gpu_output() {
                 }
             };
             let out = p.render_bgra_for_test(&inputs).unwrap();
-            assert!(
-                out.data.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
-                "{label}: opaque"
-            );
+            assert_opaque(&out, &format!("{label} on {}", a.name));
             got.push((label, fnv(&out.data)));
         }
         let hashes: Vec<u64> = got.iter().map(|(_, h)| *h).collect();
@@ -1618,11 +1633,7 @@ fn backdrop_parity(test: &str, cases: &[Case]) {
                 a.name
             );
             println!("{line}");
-            assert!(
-                got.data.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
-                "{label} on {}: not opaque",
-                a.name
-            );
+            assert_opaque(&got, &format!("{label} on {}", a.name));
             if mean > BACKDROP_MEAN || d > BACKDROP_MAX {
                 failures.push(format!(
                     "{line}: cpu {:?} gpu {:?}",
@@ -2194,5 +2205,41 @@ fn gpu_resize_drag_matches_cpu() {
             }
         }
         println!("resize drag ok on {}", a.name);
+    }
+}
+
+/// The test pages reach `PageInput` intact: a shared texture made by
+/// `create_shared_bgra`, opened from its handle and copied (as CEF pages
+/// are), equals the frame, also with other textures created right after.
+/// With the frame given as the shared texture's initial data, NVIDIA (RTX
+/// 2000 Ada, 32.0.15.9658) intermittently showed zeros or stale memory
+/// (alpha 0) through the opened handle; this loop failed on every run.
+#[test]
+fn shared_test_pages_reach_the_page_input_intact() {
+    let src = noise(640, 360, 101);
+    let other = Frame::from_bgra(640, 360, [7u8, 7, 7, 0].repeat(640 * 360)).unwrap();
+    for a in adapters_or_skip("shared_test_pages_reach_the_page_input_intact") {
+        let gpu = Gpu::new(a.luid).unwrap();
+        for i in 0..40 {
+            let page = PageInput::new(&gpu, 640, 360).unwrap();
+            let shared = gpu.create_shared_bgra(&src).unwrap();
+            page.on_shared_texture(shared.handle()).unwrap();
+            drop(shared);
+            let more: Vec<_> = (0..4).map(|_| gpu.upload_bgra(&other).unwrap()).collect();
+            let back = gpu.read_bgra(&page.texture()).unwrap();
+            drop(more);
+            let bad = back
+                .data
+                .iter()
+                .zip(&src.data)
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                bad, 0,
+                "{} run {i}: {bad} bytes differ from the page",
+                a.name
+            );
+        }
+        println!("page copy kept on {}", a.name);
     }
 }

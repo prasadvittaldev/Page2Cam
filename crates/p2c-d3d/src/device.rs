@@ -319,6 +319,20 @@ impl Gpu {
         self.wrap(tex.context("CreateTexture2D returned nothing")?)
     }
 
+    /// Flush and wait until the GPU has run everything queued so far.
+    /// Only for rare events (tests, diagnostics), never per frame.
+    pub(crate) fn wait_idle(&self) -> Result<()> {
+        let ev = crate::profile::query(self, D3D11_QUERY_EVENT)?;
+        // SAFETY: plain context calls on this device.
+        unsafe {
+            self.inner.ctx.Flush();
+            self.inner.ctx.End(&ev);
+            self.inner.ctx.Flush();
+        }
+        let _done: windows::core::BOOL = crate::profile::wait_data(self, &ev)?;
+        Ok(())
+    }
+
     /// Wrap an existing texture of this device, creating the views its bind
     /// flags allow.
     pub fn wrap(&self, tex: ID3D11Texture2D) -> Result<Texture> {
@@ -425,8 +439,22 @@ impl Gpu {
             DXGI_FORMAT_B8G8R8A8_UNORM,
             (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
             (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32,
-            Some(&f.data),
+            None,
         )?;
+        // Written through the context like Chromium renders into its
+        // texture, not as initial data: on NVIDIA (RTX 2000 Ada,
+        // 32.0.15.9658) a shared texture's initial data was intermittently
+        // not seen through a second resource object opened from its handle
+        // (zeros or stale memory, alpha 0, from some row to the end) until
+        // the texture had been used through its own object.
+        // SAFETY: the buffer holds height rows of width*4 bytes.
+        unsafe {
+            self.inner
+                .ctx
+                .UpdateSubresource(&t.tex, 0, None, f.data.as_ptr() as _, f.width * 4, 0);
+        }
+        // Then wait until it is on the GPU before anyone opens the handle.
+        self.wait_idle()?;
         let res: IDXGIResource1 = t.tex.cast().context("IDXGIResource1")?;
         // SAFETY: plain COM calls.
         unsafe {
@@ -437,15 +465,6 @@ impl Gpu {
                     PCWSTR::null(),
                 )
                 .context("CreateSharedHandle")?;
-            self.inner.ctx.Flush();
-            // Wait until the initial data is on the GPU: a device opening the
-            // handle reads through another resource object, which the driver
-            // doesn't order after this upload (NVIDIA intermittently showed
-            // an empty page in the parity tests).
-            let ev = crate::profile::query(self, D3D11_QUERY_EVENT)?;
-            self.inner.ctx.End(&ev);
-            self.inner.ctx.Flush();
-            let _done: windows::core::BOOL = crate::profile::wait_data(self, &ev)?;
             Ok(SharedTexture {
                 handle,
                 _tex: t.tex,
