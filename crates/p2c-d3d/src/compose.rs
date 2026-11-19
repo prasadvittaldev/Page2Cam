@@ -797,6 +797,12 @@ impl OutputProducer for GpuProducer {
     fn pipeline_frames(&self) -> u32 {
         2
     }
+
+    /// The page comes from the shared texture, not the CPU slot: present once
+    /// Chromium delivered its first frame.
+    fn has_page(&self, _inputs: &TickInputs) -> bool {
+        self.page.seq() > 0
+    }
 }
 
 impl GpuProducer {

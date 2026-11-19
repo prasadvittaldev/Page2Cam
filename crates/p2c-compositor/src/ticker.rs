@@ -115,6 +115,12 @@ pub trait OutputProducer: Send {
     fn holding_since(&self) -> Option<Instant> {
         None
     }
+    /// Whether this tick's composite contains a real page frame (not the
+    /// black stand-in before the first paint). Default: the CPU page slot
+    /// has a frame; a producer with its own page source overrides it.
+    fn has_page(&self, inputs: &TickInputs) -> bool {
+        inputs.page.is_some()
+    }
 }
 
 /// How many ticks of the last `PIPELINE_WINDOW` ticks are looked at for the
@@ -322,6 +328,70 @@ impl OutputProducer for CpuProducer {
     }
 }
 
+/// A page that never paints still hands the camera over after this long.
+pub(crate) const READY_FALLBACK: Duration = Duration::from_secs(10);
+
+/// Why the output became ready.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadyWhy {
+    /// An output carrying a real page frame went to the sinks.
+    Page,
+    /// [`READY_FALLBACK`] passed without one.
+    Timeout,
+}
+
+/// When `output_ready` is reported (the tray hands the camera to the engine
+/// then): once an output that carries a real page frame (a Chromium paint,
+/// or a test-pattern frame) went to the sinks, not the black frames before
+/// the first paint; or after [`READY_FALLBACK`] anyway.
+#[derive(Debug)]
+pub(crate) struct ReadyGate {
+    since: Instant,
+    /// Tick on which the producer first had a page.
+    page_tick: Option<u64>,
+    done: bool,
+}
+
+impl ReadyGate {
+    pub(crate) fn new(since: Instant) -> ReadyGate {
+        ReadyGate {
+            since,
+            page_tick: None,
+            done: false,
+        }
+    }
+
+    /// An output was pushed on `tick`; `has_page`: the producer had a page
+    /// this tick; `pipeline`: ticks between composing and pushing a frame.
+    /// `Some` the first time the output counts as ready.
+    pub(crate) fn pushed(
+        &mut self,
+        tick: u64,
+        has_page: bool,
+        pipeline: u32,
+        now: Instant,
+    ) -> Option<ReadyWhy> {
+        if self.done {
+            return None;
+        }
+        if has_page && self.page_tick.is_none() {
+            self.page_tick = Some(tick);
+        }
+        let why = if self
+            .page_tick
+            .is_some_and(|t| tick >= t + u64::from(pipeline))
+        {
+            ReadyWhy::Page
+        } else if now.saturating_duration_since(self.since) >= READY_FALLBACK {
+            ReadyWhy::Timeout
+        } else {
+            return None;
+        };
+        self.done = true;
+        Some(why)
+    }
+}
+
 /// Running totals for health views (readers take differences over time).
 #[derive(Default, Debug)]
 pub struct TickerStats {
@@ -492,6 +562,8 @@ impl Ticker {
                 let mut prev: Option<Output> = None;
                 let mut last_warn: Vec<Option<Instant>> = vec![None; sinks.len()];
                 let start = Instant::now();
+                let mut ready = ReadyGate::new(start);
+                let mut tick_no: u64 = 0;
                 let mut n: u32 = 0;
                 let mut k: u32 = 0;
                 let mut cam_fresh = Freshness::default();
@@ -504,6 +576,7 @@ impl Ticker {
                 let mut last_log = Instant::now();
                 while !stop2.load(Ordering::Relaxed) {
                     let t0 = Instant::now();
+                    tick_no += 1;
                     let inputs = TickInputs {
                         page: page.as_ref().and_then(|p| p.latest()),
                         cam: webcam.as_ref().and_then(|s| cam_fresh.latest(s)),
@@ -558,8 +631,22 @@ impl Ticker {
                                 }
                             }
                         }
-                        if !stats_out.output_ready.load(Ordering::Relaxed) {
-                            stats_out.output_ready.store(true, Ordering::Release);
+                        let has_page = slot.producer.has_page(&inputs);
+                        let pipeline = slot.producer.pipeline_frames();
+                        match ready.pushed(tick_no, has_page, pipeline, Instant::now()) {
+                            Some(ReadyWhy::Page) => {
+                                tracing::info!(
+                                    "first output with the page went out (output ready)"
+                                );
+                                stats_out.output_ready.store(true, Ordering::Release);
+                            }
+                            Some(ReadyWhy::Timeout) => {
+                                tracing::warn!(
+                                    "no page frame after 10 s; reporting the output ready anyway"
+                                );
+                                stats_out.output_ready.store(true, Ordering::Release);
+                            }
+                            None => {}
                         }
                     }
                     // Absolute deadlines avoid drift; if we fell behind, skip missed ticks.
@@ -1047,11 +1134,12 @@ mod tests {
     }
 
     #[test]
-    fn stats_count_ticks_and_mark_output_ready() {
+    fn stats_count_ticks_and_mark_output_ready_once_the_page_painted() {
         let n = Arc::new(AtomicUsize::new(0));
+        let page = FrameSlot::new();
         let t = spawn(
             SPEC,
-            FrameSlot::new(),
+            page.clone(),
             None,
             None,
             layout(),
@@ -1059,13 +1147,40 @@ mod tests {
         );
         let stats = t.stats();
         std::thread::sleep(Duration::from_millis(500));
-        assert!(stats.output_ready(), "first output pushed");
+        // Frames go out (black, no page yet) but the tray must not switch to them.
+        assert!(n.load(Ordering::SeqCst) > 0, "outputs pushed");
+        assert!(!stats.output_ready(), "black frames are not ready");
         let (ticks, skipped) = (stats.ticks(), stats.skipped());
-        t.stop();
         assert!((10..=20).contains(&ticks), "ticks {ticks}");
         assert!(skipped <= 2, "skipped {skipped}");
+        // The first paint (or test-pattern frame) makes it ready.
+        page.put(Frame::new_black(64, 36));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(stats.output_ready(), "ready after the first page frame");
+        t.stop();
         // A fresh stats object is not ready.
         assert!(!TickerStats::default().output_ready());
+    }
+
+    #[test]
+    fn ready_gate_waits_for_the_page_through_the_pipeline_or_10s() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // CPU (no pipeline): ready on the tick the page is pushed.
+        let mut g = ReadyGate::new(t0);
+        assert_eq!(g.pushed(1, false, 0, ms(33)), None);
+        assert_eq!(g.pushed(2, true, 0, ms(66)), Some(ReadyWhy::Page));
+        assert_eq!(g.pushed(3, true, 0, ms(99)), None, "only once");
+        // GPU readback ring (2 ticks): the page's frame leaves 2 ticks later.
+        let mut g = ReadyGate::new(t0);
+        assert_eq!(g.pushed(5, true, 2, ms(165)), None);
+        assert_eq!(g.pushed(6, false, 2, ms(198)), None);
+        assert_eq!(g.pushed(7, false, 2, ms(231)), Some(ReadyWhy::Page));
+        // A page that never paints: ready after 10 s anyway.
+        let mut g = ReadyGate::new(t0);
+        assert_eq!(g.pushed(1, false, 0, ms(9_999)), None);
+        assert_eq!(g.pushed(2, false, 0, ms(10_000)), Some(ReadyWhy::Timeout));
+        assert_eq!(g.pushed(3, true, 0, ms(10_033)), None);
     }
 
     #[test]

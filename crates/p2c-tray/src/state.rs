@@ -343,6 +343,32 @@ impl Supervisor {
     }
 }
 
+/// What the shell does with an engine's exit before the supervisor sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitHandling {
+    /// Pass it to [`Supervisor::on_event`].
+    Feed,
+    /// An engine the tray killed itself: it only completes a Stop, never a
+    /// crash, so it is dropped unless Stopping.
+    IgnoreKilled,
+    /// Windows is ending the session (the engine got WM_ENDSESSION too):
+    /// no restart, no crash balloon.
+    IgnoreSignOut,
+}
+
+/// Decide [`ExitHandling`] for an exit: `killed` = the tray ended that
+/// engine, `stopping` = the state is Stopping, `session_ending` = Windows
+/// asked to end the session (WM_QUERYENDSESSION).
+pub fn exit_handling(killed: bool, stopping: bool, session_ending: bool) -> ExitHandling {
+    if session_ending {
+        ExitHandling::IgnoreSignOut
+    } else if killed && !stopping {
+        ExitHandling::IgnoreKilled
+    } else {
+        ExitHandling::Feed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,5 +783,17 @@ mod tests {
         assert!(sup.on_event(Event::StopClicked, now).is_empty());
         assert!(sup.on_event(Event::Tick, now).is_empty());
         assert!(ready(&mut sup, now).is_empty());
+    }
+
+    #[test]
+    fn exits_during_sign_out_or_of_killed_engines_are_not_crashes() {
+        use ExitHandling::*;
+        assert_eq!(exit_handling(false, false, false), Feed);
+        assert_eq!(exit_handling(true, true, false), Feed, "completes a Stop");
+        assert_eq!(exit_handling(true, false, false), IgnoreKilled);
+        // Sign-out wins over everything: never a restart.
+        for (k, s) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(exit_handling(k, s, true), IgnoreSignOut, "{k} {s}");
+        }
     }
 }

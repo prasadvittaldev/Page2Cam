@@ -342,10 +342,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         // Sign-out or shutdown: agree, then close gracefully when it happens.
-        WM_QUERYENDSESSION => LRESULT(1),
+        WM_QUERYENDSESSION => {
+            // From now on an engine exit is part of the sign-out (the engine
+            // gets these messages too), never a crash to restart.
+            send(Cmd::SessionEnding(true));
+            LRESULT(1)
+        }
         WM_ENDSESSION => {
             if wp.0 != 0 {
                 end_session();
+            } else {
+                // Another app vetoed the sign-out: back to normal.
+                send(Cmd::SessionEnding(false));
             }
             LRESULT(0)
         }

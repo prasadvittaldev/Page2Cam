@@ -21,7 +21,7 @@ mod win;
 pub use health::{classify, effective_level, tooltip, Hysteresis, Level, SysLoad};
 pub use launch::{engine_command, pick_free_port, valid_token, EngineCommand};
 pub use standby::{standby_nv12, StandbyKind};
-pub use state::{Action, Event, Supervisor, TrayState};
+pub use state::{exit_handling, Action, Event, ExitHandling, Supervisor, TrayState};
 
 /// Run the Windows tray until the user quits it. A second launch only asks
 /// the running tray to show itself and returns `Ok(())`.

@@ -24,7 +24,7 @@ use super::sysload::Sampler;
 use crate::health::{classify, display, Hysteresis, Level, SysLoad};
 use crate::menu::{Entry, MenuId, UpdateOffer};
 use crate::standby::StandbyKind;
-use crate::state::{Action, Event, Supervisor, TrayState};
+use crate::state::{exit_handling, Action, Event, ExitHandling, Supervisor, TrayState};
 use crate::update::Updater;
 
 /// Commands for the controller (from the UI and the engine threads).
@@ -45,6 +45,8 @@ pub enum Cmd {
     /// Windows is ending the session: stop the engine gracefully (short
     /// bounded wait), remove the camera, then signal the sender.
     EndSession(Sender<()>),
+    /// WM_QUERYENDSESSION (true), or the sign-out was cancelled (false).
+    SessionEnding(bool),
 }
 
 pub use crate::notify::Balloon;
@@ -141,6 +143,10 @@ struct Controller {
     quitting: Option<Instant>,
     /// Sign-out: told when everything is closed.
     end_session: Option<Sender<()>>,
+    /// Windows asked to end the session: engine exits are not crashes.
+    session_ending: bool,
+    /// An engine exit held back during a sign-out (fed if it is cancelled).
+    exit_during_sign_out: Option<(u64, i32)>,
     done: bool,
     level: Level,
 }
@@ -190,6 +196,8 @@ pub fn run(rx: Receiver<Cmd>, tx: Sender<Cmd>, ui: Arc<Ui>) {
         ui,
         quitting: None,
         end_session: None,
+        session_ending: false,
+        exit_during_sign_out: None,
         done: false,
         level: Level::Grey,
     };
@@ -258,12 +266,30 @@ impl Controller {
                 }
                 let killed = self.killed.contains(&gen);
                 self.killed.retain(|g| *g != gen);
-                // An engine we killed ourselves: its exit only completes a
-                // Stop; it never counts as a crash.
-                if killed && !matches!(self.sup.state(), TrayState::Stopping { .. }) {
-                    tracing::info!(gen, code, "exit of an engine the tray ended; ignored");
-                } else {
-                    self.feed(Event::EngineExited { gen, code }, now);
+                let stopping = matches!(self.sup.state(), TrayState::Stopping { .. });
+                match exit_handling(killed, stopping, self.session_ending) {
+                    ExitHandling::Feed => self.feed(Event::EngineExited { gen, code }, now),
+                    // An engine we killed ourselves: its exit only completes
+                    // a Stop; it never counts as a crash.
+                    ExitHandling::IgnoreKilled => {
+                        tracing::info!(gen, code, "exit of an engine the tray ended; ignored")
+                    }
+                    // The engine got WM_ENDSESSION too: no restart, no balloon.
+                    // Kept in case Windows cancels the sign-out.
+                    ExitHandling::IgnoreSignOut => {
+                        tracing::info!(gen, code, "engine exited during sign-out");
+                        self.exit_during_sign_out = Some((gen, code));
+                    }
+                }
+            }
+            Cmd::SessionEnding(ending) => {
+                tracing::info!(ending, "session end query");
+                self.session_ending = ending;
+                if !ending {
+                    // Sign-out cancelled: an exit held back meanwhile counts now.
+                    if let Some((gen, code)) = self.exit_during_sign_out.take() {
+                        self.feed(Event::EngineExited { gen, code }, now);
+                    }
                 }
             }
             Cmd::Poll { gen, result } => self.poll_result(gen, result, now),

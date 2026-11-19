@@ -357,4 +357,8 @@ impl OutputProducer for RecoveringProducer {
     fn holding_since(&self) -> Option<Instant> {
         self.held_since
     }
+
+    fn has_page(&self, inputs: &TickInputs) -> bool {
+        self.producer.has_page(inputs)
+    }
 }
