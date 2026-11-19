@@ -11,7 +11,7 @@ use p2c_core::{DurationStats, FrameSlot, MaskSlot};
 use parking_lot::Mutex;
 
 use crate::engine::{Engine, EngineChoice};
-use crate::policy::FallbackPolicy;
+use crate::policy::{too_slow_note, FallbackPolicy, PolicyTimes};
 use crate::post::{profile, to_mask, Smoother};
 use crate::Device;
 
@@ -59,6 +59,17 @@ impl Segmenter {
         out: MaskSlot,
         choice: EngineChoice,
     ) -> Segmenter {
+        Self::spawn_with(opener, webcam, out, choice, PolicyTimes::default())
+    }
+
+    /// [`Segmenter::spawn`] with other fallback/retry times (tests).
+    fn spawn_with(
+        opener: Opener,
+        webcam: FrameSlot,
+        out: MaskSlot,
+        choice: EngineChoice,
+        times: PolicyTimes,
+    ) -> Segmenter {
         let shared = Arc::new(Shared {
             ctl: Mutex::new(Ctl {
                 enabled: false,
@@ -78,7 +89,7 @@ impl Segmenter {
         let sh = shared.clone();
         let handle = std::thread::Builder::new()
             .name("p2c-segment".into())
-            .spawn(move || Worker::new(opener, webcam, out, choice).run(&sh))
+            .spawn(move || Worker::new(opener, webcam, out, choice, times).run(&sh))
             .expect("spawn segmenter thread");
         Segmenter {
             shared,
@@ -118,7 +129,6 @@ impl Segmenter {
 const RETRY_OPEN: Duration = Duration::from_secs(5);
 const IDLE: Duration = Duration::from_millis(50);
 const POLL: Duration = Duration::from_millis(3);
-const TOO_SLOW: &str = "Quality was too slow on this PC, switched to Fast";
 /// A webcam gap longer than this starts the engine's memory afresh.
 const STALL: Duration = Duration::from_secs(1);
 /// After this many failed inferences in a row, reopen the engine.
@@ -162,7 +172,13 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(opener: Opener, webcam: FrameSlot, out: MaskSlot, choice: EngineChoice) -> Worker {
+    fn new(
+        opener: Opener,
+        webcam: FrameSlot,
+        out: MaskSlot,
+        choice: EngineChoice,
+        times: PolicyTimes,
+    ) -> Worker {
         Worker {
             opener,
             webcam,
@@ -178,7 +194,7 @@ impl Worker {
             device: None,
             generation: 0,
             open_failed_at: None,
-            policy: FallbackPolicy::new(),
+            policy: FallbackPolicy::with_times(times),
             last_seq: 0,
             last_seq_at: None,
             cam_interval: Duration::from_millis(33),
@@ -236,8 +252,27 @@ impl Worker {
         self.last_size = None;
     }
 
+    /// On the automatic Fast: retry Quality when its wait is over (R42),
+    /// else keep the countdown in the note.
+    fn auto_retry(&mut self) {
+        let now = Instant::now();
+        if self.policy.retry_due(now) {
+            tracing::info!("retrying the Quality cut-out after an automatic switch to Fast");
+            self.policy.retrying(now);
+            self.target = EngineChoice::Quality;
+            self.drop_engine();
+            self.open_failed_at = None;
+            self.note.clear();
+        } else if let Some(left) = self.policy.retry_in(now) {
+            if self.note.is_empty() || self.note.starts_with("Quality was too slow") {
+                self.note = too_slow_note(left);
+            }
+        }
+    }
+
     /// One unit of work. Returns how long to sleep, if anything.
     fn step(&mut self) -> Option<Duration> {
+        self.auto_retry();
         if self.engine.is_none() {
             if self
                 .open_failed_at
@@ -349,14 +384,17 @@ impl Worker {
         if self.active == Some(EngineChoice::Quality)
             && self.policy.observe(took, self.cam_interval, Instant::now())
         {
+            let wait = self.policy.fell_back(Instant::now());
             tracing::warn!(
                 infer_ms = took.as_millis() as u64,
                 cam_ms = self.cam_interval.as_millis() as u64,
-                "{TOO_SLOW}"
+                retry_in_s = wait.as_secs(),
+                "Quality was too slow (busy GPU?), switched to Fast; trying Quality again later"
             );
+            // Not saved to the settings: the operator's choice stays Quality.
             self.target = EngineChoice::Fast;
             self.drop_engine();
-            self.note = TOO_SLOW.to_string();
+            self.note = too_slow_note(wait);
         }
         None
     }
@@ -404,6 +442,7 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::PolicyTimes;
     use p2c_core::{Frame, MaskSlot};
     use std::sync::atomic::AtomicUsize;
 
@@ -505,29 +544,100 @@ mod tests {
         s.stop();
     }
 
+    /// Policy times scaled down so the fallback/retry cycle fits in a test.
+    fn short_times() -> PolicyTimes {
+        PolicyTimes {
+            window: Duration::from_millis(300),
+            first_retry: Duration::from_millis(1000),
+            max_retry: Duration::from_millis(4000),
+        }
+    }
+
+    /// Poll the status until `f` holds (panics after `timeout`).
+    fn wait_for(s: &Segmenter, timeout: Duration, f: impl Fn(&SegStatus) -> bool) -> SegStatus {
+        let t = Instant::now();
+        loop {
+            let st = s.status();
+            if f(&st) {
+                return st;
+            }
+            assert!(t.elapsed() < timeout, "timed out, last status {st:?}");
+            ms(5);
+        }
+    }
+
     #[test]
     fn segmenter_auto_falls_back_and_notes_it() {
         let (cam, out) = (FrameSlot::new(), MaskSlot::new());
         let _f = Feeder::start(cam.clone(), 64, 36);
-        let s = Segmenter::spawn(
+        let s = Segmenter::spawn_with(
             opener(120, 1, Counts::default()),
             cam,
             out,
             EngineChoice::Quality,
+            short_times(),
         );
         s.set_enabled(true);
-        ms(4500);
-        let st = s.status();
+        let st = wait_for(&s, Duration::from_secs(3), |st| {
+            st.active == Some(EngineChoice::Fast)
+        });
         assert_eq!(st.requested, EngineChoice::Quality);
-        assert_eq!(st.active, Some(EngineChoice::Fast), "{st:?}");
         assert!(st.note.contains("too slow"), "{}", st.note);
         // A manual switch back to Quality is honoured (and re-armed).
         s.set_choice(EngineChoice::Quality);
-        ms(300);
-        assert_eq!(s.status().active, Some(EngineChoice::Quality));
+        let st = wait_for(&s, Duration::from_secs(1), |st| {
+            st.active == Some(EngineChoice::Quality)
+        });
+        assert_eq!(st.note, "", "a manual choice clears the note");
         s.stop();
     }
 
+    #[test]
+    fn segmenter_retries_quality_with_backoff() {
+        let counts = Counts::default();
+        let (cam, out) = (FrameSlot::new(), MaskSlot::new());
+        let _f = Feeder::start(cam.clone(), 64, 36);
+        let s = Segmenter::spawn_with(
+            opener(120, 1, counts.clone()),
+            cam,
+            out,
+            EngineChoice::Quality,
+            short_times(),
+        );
+        s.set_enabled(true);
+        let fast = |st: &SegStatus| st.active == Some(EngineChoice::Fast);
+        let quality = |st: &SegStatus| st.active == Some(EngineChoice::Quality);
+        let st = wait_for(&s, Duration::from_secs(3), fast);
+        let fell_back = Instant::now();
+        assert_eq!(
+            st.note,
+            "Quality was too slow (busy GPU) \u{2014} trying Quality again in 1 s"
+        );
+        // Quality again after the wait, not before.
+        let st = wait_for(&s, Duration::from_secs(3), quality);
+        let waited = fell_back.elapsed();
+        assert!(
+            waited >= Duration::from_millis(850),
+            "retried after {waited:?}"
+        );
+        assert_eq!(st.requested, EngineChoice::Quality);
+        assert_eq!(st.note, "", "no note while retrying Quality");
+        // Still too slow: back to Fast, now waiting twice as long.
+        let st = wait_for(&s, Duration::from_secs(3), fast);
+        assert_eq!(
+            st.note,
+            "Quality was too slow (busy GPU) \u{2014} trying Quality again in 2 s"
+        );
+        // The note counts down.
+        let st = wait_for(&s, Duration::from_secs(2), |st| st.note.ends_with(" 1 s"));
+        assert!(fast(&st), "{st:?}");
+        // A manual choice re-arms: Quality now, the next wait is 1 s again.
+        s.set_choice(EngineChoice::Quality);
+        wait_for(&s, Duration::from_secs(1), quality);
+        let st = wait_for(&s, Duration::from_secs(3), fast);
+        assert!(st.note.ends_with("again in 1 s"), "{}", st.note);
+        s.stop();
+    }
     #[test]
     fn segmenter_disabled_runs_no_inference() {
         let counts = Counts::default();
