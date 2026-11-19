@@ -117,6 +117,111 @@ fn query_frame_server() -> ServiceState {
     }
 }
 
+/// KSCATEGORY_VIDEO_CAMERA (ks.h), the interface class camera apps enumerate.
+const KSCATEGORY_VIDEO_CAMERA: windows::core::GUID =
+    windows::core::GUID::from_u128(0xe5323777_f976_4f5b_9b55_b94699c46e44);
+
+/// Present camera interfaces (path, friendly name) from Plug and Play.
+/// Read-only and does not start Frame Server.
+fn camera_interfaces() -> anyhow::Result<Vec<(String, Option<String>)>> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_Device_Interface_ListW, CM_Get_Device_Interface_List_SizeW,
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CR_BUFFER_SMALL, CR_SUCCESS,
+    };
+    // The list can grow between the size query and the read: retry a few times.
+    for _ in 0..5 {
+        let mut len = 0u32;
+        let cr = unsafe {
+            CM_Get_Device_Interface_List_SizeW(
+                &mut len,
+                &KSCATEGORY_VIDEO_CAMERA,
+                PCWSTR::null(),
+                CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+            )
+        };
+        anyhow::ensure!(
+            cr == CR_SUCCESS,
+            "CM_Get_Device_Interface_List_SizeW: {}",
+            cr.0
+        );
+        let mut buf = vec![0u16; len.max(1) as usize];
+        let cr = unsafe {
+            CM_Get_Device_Interface_ListW(
+                &KSCATEGORY_VIDEO_CAMERA,
+                PCWSTR::null(),
+                &mut buf,
+                CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+            )
+        };
+        if cr == CR_BUFFER_SMALL {
+            continue;
+        }
+        anyhow::ensure!(cr == CR_SUCCESS, "CM_Get_Device_Interface_ListW: {}", cr.0);
+        return Ok(buf
+            .split(|&c| c == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let path = String::from_utf16_lossy(s);
+                let name = interface_name(&path);
+                (path, name)
+            })
+            .collect());
+    }
+    anyhow::bail!("camera interface list kept changing")
+}
+
+/// The interface's friendly name, else its device's name.
+fn interface_name(path: &str) -> Option<String> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_Device_Interface_PropertyW, CR_SUCCESS,
+    };
+    use windows::Win32::Devices::Properties::{
+        DEVPKEY_DeviceInterface_FriendlyName, DEVPKEY_NAME, DEVPROPTYPE, DEVPROP_TYPE_STRING,
+    };
+    let wpath = HSTRING::from(path);
+    for key in [DEVPKEY_DeviceInterface_FriendlyName, DEVPKEY_NAME] {
+        let mut buf = [0u16; 256];
+        let mut size = std::mem::size_of_val(&buf) as u32;
+        let mut ty = DEVPROPTYPE(0);
+        let cr = unsafe {
+            CM_Get_Device_Interface_PropertyW(
+                &wpath,
+                &key,
+                &mut ty,
+                Some(buf.as_mut_ptr() as *mut u8),
+                &mut size,
+                0,
+            )
+        };
+        if cr == CR_SUCCESS && ty == DEVPROP_TYPE_STRING {
+            let n = (size as usize / 2).min(buf.len());
+            let s = String::from_utf16_lossy(&buf[..n]);
+            let s = s.trim_end_matches('\0').to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Is a "Page2Cam" camera device present? `None` when PnP can't be asked.
+fn our_camera_present() -> Option<bool> {
+    match camera_interfaces() {
+        Ok(list) => Some(list.iter().any(|(_, n)| {
+            n.as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(p2c_shm::CAMERA_NAME))
+        })),
+        Err(e) => {
+            tracing::warn!("cannot list camera devices: {e:#}");
+            None
+        }
+    }
+}
+
+/// How the sink asks whether our camera device still exists (replaced in tests).
+type PresentFn = std::sync::Arc<dyn Fn() -> Option<bool> + Send + Sync>;
+
 /// Sample the Frame Server every 5 s on its own thread (never the ticker's);
 /// ends once the sink is gone.
 fn spawn_service_watch() -> std::sync::mpsc::Receiver<Observation> {
@@ -201,7 +306,13 @@ impl Owner {
             ServiceState::Running { pid } => Some(pid),
             _ => None,
         };
-        tracing::info!(?service_pid, "virtual camera registered with Frame Server");
+        // Logged so a real run shows whether the device check (used after a
+        // Frame Server restart) finds our camera.
+        tracing::info!(
+            ?service_pid,
+            device_present = ?our_camera_present(),
+            "virtual camera registered with Frame Server"
+        );
         Ok(Owner {
             stop: Some(stop_tx),
             thread: Some(thread),
@@ -253,6 +364,8 @@ pub struct WinVcamSink {
     owner_since: Instant,
     /// Frame Server's process id that holds our current registration.
     service_pid: Option<u32>,
+    /// Asked after a service restart: is our camera device still there?
+    present: PresentFn,
 }
 
 /// Status while the camera is registered again after Frame Server restarted.
@@ -274,6 +387,7 @@ impl WinVcamSink {
             } else {
                 std::sync::mpsc::channel().1
             },
+            std::sync::Arc::new(our_camera_present),
         )
     }
 
@@ -285,6 +399,7 @@ impl WinVcamSink {
         registered: bool,
         start: StartFn,
         watch: std::sync::mpsc::Receiver<Observation>,
+        present: PresentFn,
     ) -> anyhow::Result<WinVcamSink> {
         anyhow::ensure!(registered, NOT_INSTALLED);
         let mut sink = WinVcamSink {
@@ -299,6 +414,7 @@ impl WinVcamSink {
             watch,
             owner_since: Instant::now(),
             service_pid: None,
+            present,
         };
         match (sink.start)() {
             Ok(o) => sink.set_owner(o),
@@ -313,8 +429,12 @@ impl WinVcamSink {
         self.owner = Some(o);
     }
 
-    /// Cheap per-frame check of the Frame Server samples: when the process
-    /// that held our camera is gone, drop the owner and register again.
+    /// Cheap per-frame check of the Frame Server samples. When the process
+    /// that held our camera was replaced, ask Plug and Play whether our camera
+    /// device is still there (it can be, e.g. after an idle stop and a new
+    /// start by an app that is opening our camera right now: rebuilding then
+    /// would cut that app off). Only a missing device (or one PnP can't
+    /// confirm) drops the owner and registers the camera again.
     fn poll_health(&mut self) {
         let mut lost = None;
         while let Ok((at, state)) = self.watch.try_recv() {
@@ -322,6 +442,24 @@ impl WinVcamSink {
                 continue;
             }
             if service_restarted(self.service_pid, state) {
+                let present = (self.present)();
+                if present == Some(true) {
+                    tracing::info!(
+                        old_pid = ?self.service_pid,
+                        now = ?state,
+                        "camera service (Frame Server) restarted; our virtual camera is still present, keeping it"
+                    );
+                    if let ServiceState::Running { pid } = state {
+                        self.service_pid = Some(pid);
+                    }
+                    continue;
+                }
+                tracing::info!(
+                    old_pid = ?self.service_pid,
+                    now = ?state,
+                    ?present,
+                    "camera service (Frame Server) restarted; our virtual camera is gone, registering it again"
+                );
                 lost = Some(state);
                 break;
             }
@@ -329,12 +467,7 @@ impl WinVcamSink {
                 self.service_pid = Some(pid);
             }
         }
-        if let Some(state) = lost {
-            tracing::warn!(
-                old_pid = ?self.service_pid,
-                now = ?state,
-                "camera service (Frame Server) restarted: our virtual camera went with it; registering it again"
-            );
+        if lost.is_some() {
             let old = self.owner.take();
             self.view = None;
             self.last_try = None;
@@ -352,9 +485,14 @@ impl WinVcamSink {
         self.last_start_try = Some(now);
         let (tx, rx) = std::sync::mpsc::channel();
         let start = self.start.clone();
+        // Shared so a failed spawn hands `old` back instead of dropping it
+        // here (Owner::drop joins a thread that may hang in Remove()).
+        let old = std::sync::Arc::new(std::sync::Mutex::new(old));
+        let old2 = old.clone();
         let spawned = std::thread::Builder::new()
             .name("p2c-wincam-retry".into())
             .spawn(move || {
+                let old = old2.lock().ok().and_then(|mut g| g.take());
                 if let Some(o) = old {
                     let (dtx, drx) = std::sync::mpsc::channel::<()>();
                     let _ = std::thread::Builder::new()
@@ -376,7 +514,13 @@ impl WinVcamSink {
             });
         match spawned {
             Ok(_) => self.pending = Some(rx),
-            Err(e) => tracing::warn!("cannot start a virtual camera attempt: {e}"),
+            Err(e) => {
+                tracing::warn!("cannot start a virtual camera attempt: {e}");
+                if let Some(o) = old.lock().ok().and_then(|mut g| g.take()) {
+                    tracing::warn!("leaking the old virtual camera rather than blocking the ticker on its removal");
+                    std::mem::forget(o);
+                }
+            }
         }
     }
 
@@ -529,6 +673,68 @@ mod tests {
         std::sync::mpsc::channel().1
     }
 
+    /// Our camera device is missing (after a service restart: rebuild).
+    fn gone() -> PresentFn {
+        Arc::new(|| Some(false))
+    }
+
+    #[test]
+    fn service_restart_keeps_a_camera_that_is_still_present() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let a = asked.clone();
+        let present: PresentFn = Arc::new(move || {
+            a.fetch_add(1, Ordering::SeqCst);
+            Some(true)
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let status = CameraStatus::default();
+        let mut sink = WinVcamSink::open_with(
+            &spec(),
+            status.clone(),
+            true,
+            counting_ok(&calls),
+            rx,
+            present,
+        )
+        .unwrap();
+        let t = Instant::now() + Duration::from_millis(10);
+        tx.send((t, ServiceState::Running { pid: 100 })).unwrap();
+        tx.send((t, ServiceState::Running { pid: 200 })).unwrap();
+        sink.poll_health();
+        assert!(sink.owner.is_some(), "camera kept");
+        assert!(sink.pending.is_none(), "no restart attempt");
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.service_pid, Some(200), "new baseline");
+        assert_eq!(status.status(), None);
+        // The same process again: no new device check.
+        tx.send((t, ServiceState::Running { pid: 200 })).unwrap();
+        sink.poll_health();
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn service_restart_rebuilds_when_the_device_check_fails() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let unknown: PresentFn = Arc::new(|| None);
+        let mut sink = WinVcamSink::open_with(
+            &spec(),
+            CameraStatus::default(),
+            true,
+            counting_ok(&calls),
+            rx,
+            unknown,
+        )
+        .unwrap();
+        let t = Instant::now() + Duration::from_millis(10);
+        tx.send((t, ServiceState::Running { pid: 100 })).unwrap();
+        tx.send((t, ServiceState::Running { pid: 200 })).unwrap();
+        sink.poll_health();
+        assert!(sink.owner.is_none(), "unconfirmed device: rebuild");
+    }
+
     fn counting_ok(calls: &Arc<AtomicUsize>) -> StartFn {
         let c = calls.clone();
         Arc::new(move || {
@@ -563,13 +769,31 @@ mod tests {
         ));
     }
 
+    /// Read-only Plug and Play listing (`cargo test -p p2c-vcam -- --ignored`).
+    #[test]
+    #[ignore]
+    fn camera_interfaces_lists_the_real_devices() {
+        let list = camera_interfaces().expect("listing cameras");
+        for (path, name) in &list {
+            eprintln!("camera interface: {name:?} {path}");
+        }
+        eprintln!("Page2Cam present: {:?}", our_camera_present());
+    }
+
     #[test]
     fn service_restart_drops_owner_and_retries() {
         let calls = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = std::sync::mpsc::channel();
         let status = CameraStatus::default();
-        let mut sink =
-            WinVcamSink::open_with(&spec(), status.clone(), true, counting_ok(&calls), rx).unwrap();
+        let mut sink = WinVcamSink::open_with(
+            &spec(),
+            status.clone(),
+            true,
+            counting_ok(&calls),
+            rx,
+            gone(),
+        )
+        .unwrap();
         assert!(sink.owner.is_some());
         let t = Instant::now() + Duration::from_millis(10);
         tx.send((t, ServiceState::Running { pid: 100 })).unwrap();
@@ -614,8 +838,15 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = std::sync::mpsc::channel();
         let status = CameraStatus::default();
-        let mut sink =
-            WinVcamSink::open_with(&spec(), status.clone(), true, counting_ok(&calls), rx).unwrap();
+        let mut sink = WinVcamSink::open_with(
+            &spec(),
+            status.clone(),
+            true,
+            counting_ok(&calls),
+            rx,
+            gone(),
+        )
+        .unwrap();
         let t = Instant::now() + Duration::from_millis(10);
         tx.send((t, ServiceState::Running { pid: 100 })).unwrap();
         tx.send((t, ServiceState::Stopped)).unwrap();
@@ -642,6 +873,7 @@ mod tests {
             false,
             failing(),
             no_watch(),
+            gone(),
         )
         .err()
         .expect("hard error");
@@ -651,8 +883,9 @@ mod tests {
     #[test]
     fn start_failure_reports_retrying_status() {
         let status = CameraStatus::default();
-        let sink = WinVcamSink::open_with(&spec(), status.clone(), true, failing(), no_watch())
-            .expect("sink despite start failure");
+        let sink =
+            WinVcamSink::open_with(&spec(), status.clone(), true, failing(), no_watch(), gone())
+                .expect("sink despite start failure");
         assert!(sink.owner.is_none());
         let s = status.status().expect("status set");
         assert!(s.starts_with("starting (retrying)"), "{s}");
@@ -671,7 +904,8 @@ mod tests {
         });
         let status = CameraStatus::default();
         let mut sink =
-            WinVcamSink::open_with(&spec(), status.clone(), true, start, no_watch()).unwrap();
+            WinVcamSink::open_with(&spec(), status.clone(), true, start, no_watch(), gone())
+                .unwrap();
         let t0 = Instant::now();
         sink.poll_start(t0 + Duration::from_secs(1)); // not due: no attempt
         assert_eq!(calls.load(Ordering::SeqCst), 1);

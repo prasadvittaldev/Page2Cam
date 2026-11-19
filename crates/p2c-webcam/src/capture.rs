@@ -72,8 +72,28 @@ fn reopen_due(last_try: Option<Instant>, now: Instant) -> bool {
 /// Dropping it closes the camera.
 trait FrameSource {
     /// The next frame; `Ok(None)` skips one (e.g. undecodable), `Err` means
-    /// the camera failed and must be reopened.
+    /// the camera failed and must be reopened, unless it wraps [`Permanent`].
     fn next_frame(&mut self) -> anyhow::Result<Option<Frame>>;
+}
+
+/// A failure reopening won't fix (e.g. a pixel format we can't decode):
+/// capture ends with status "error: ...".
+#[derive(Debug)]
+struct Permanent(String);
+
+impl std::fmt::Display for Permanent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Permanent {}
+
+/// Warn about a frame failure only the first time, or when the camera had
+/// delivered frames since it was last opened; a camera that reopens but keeps
+/// failing at once would otherwise warn every 3 s.
+fn warn_on_failure(first_failure: bool, frames_since_open: bool) -> bool {
+    first_failure || frames_since_open
 }
 
 /// Read frames until `stop`. When the source fails it is closed and reopened
@@ -93,17 +113,33 @@ fn capture_loop<S: FrameSource>(
 ) {
     let mut source = Some(first);
     let mut last_try: Option<Instant> = None;
+    let mut failed_before = false;
+    let mut frames_since_open = false;
     while !stop.load(Ordering::Relaxed) {
         match &mut source {
             Some(s) => match s.next_frame() {
-                Ok(Some(f)) => on_frame(f),
+                Ok(Some(f)) => {
+                    frames_since_open = true;
+                    on_frame(f);
+                }
                 Ok(None) => {}
+                Err(e) if e.downcast_ref::<Permanent>().is_some() => {
+                    tracing::warn!(camera = %name, error = %format!("{e:#}"), "webcam unusable; capture stopped");
+                    on_status(format!("error: {e:#}"));
+                    return;
+                }
                 Err(e) => {
-                    tracing::warn!(
-                        camera = %name,
-                        error = %format!("{e:#}"),
-                        "webcam stopped; reopening it until it works"
-                    );
+                    if warn_on_failure(!failed_before, frames_since_open) {
+                        tracing::warn!(
+                            camera = %name,
+                            error = %format!("{e:#}"),
+                            "webcam stopped; reopening it until it works"
+                        );
+                    } else {
+                        tracing::debug!(camera = %name, error = %format!("{e:#}"), "reopened webcam failed again");
+                    }
+                    failed_before = true;
+                    frames_since_open = false;
                     source = None; // closes the camera
                     last_try = Some(Instant::now());
                     on_status(format!("reconnecting: {e:#}"));
@@ -140,10 +176,11 @@ impl FrameSource for NokhwaSource {
         let frame = self.0.frame()?;
         let res = frame.resolution();
         let Some(fmt) = raw_format(frame.source_frame_format()) else {
-            anyhow::bail!(
+            return Err(Permanent(format!(
                 "unsupported webcam pixel format {:?}",
                 frame.source_frame_format()
-            );
+            ))
+            .into());
         };
         match crate::decode::to_bgra(fmt, res.width(), res.height(), frame.buffer()) {
             Ok(f) => Ok(Some(f)),
@@ -442,6 +479,48 @@ mod tests {
         );
         t.join().unwrap();
         assert!(start.elapsed() < Duration::from_millis(600));
+    }
+
+    #[test]
+    fn unsupported_format_ends_capture_with_error_status() {
+        let first = Scripted(
+            vec![Err(anyhow::Error::new(Permanent(
+                "unsupported webcam pixel format RAWRGB".into(),
+            )))]
+            .into(),
+        );
+        let opens = std::sync::atomic::AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let mut statuses = Vec::new();
+        capture_loop(
+            first,
+            || -> anyhow::Result<Scripted> {
+                opens.fetch_add(1, Ordering::SeqCst);
+                Ok(Scripted(Default::default()))
+            },
+            &stop,
+            |_: Option<Instant>, _: Instant| true,
+            "Cam",
+            |_| {},
+            |s| statuses.push(s),
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 0, "not reopened");
+        assert_eq!(statuses.len(), 1, "{statuses:?}");
+        assert!(statuses[0].starts_with("error: "), "{statuses:?}");
+        assert!(statuses[0].contains("RAWRGB"), "{statuses:?}");
+    }
+
+    #[test]
+    fn warns_only_on_first_failure_or_after_frames() {
+        assert!(warn_on_failure(true, false), "first failure ever");
+        assert!(
+            warn_on_failure(false, true),
+            "a frame arrived since the last open"
+        );
+        assert!(
+            !warn_on_failure(false, false),
+            "reopened camera that never delivered"
+        );
     }
 
     #[test]
