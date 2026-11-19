@@ -333,10 +333,6 @@ impl App {
     }
 }
 
-/// How long our own navigation may take before a `/bg/` URL counts as
-/// reached through history.
-const NAV_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
-
 /// Note shown when a full-frame background switched the style to a cut-out.
 const NOTE_TO_CUTOUT: &str =
     "Style set to full-height cut-out: a full-frame background needs the person cut out";
@@ -359,7 +355,7 @@ struct BgChange {
 impl App {
     /// Load `url` in Chromium (or remember it until the browser exists).
     fn load_url(&self, url: &str) {
-        self.bg.lock().nav_at = Some(std::time::Instant::now());
+        self.bg.lock().history_moved = false;
         *self.fallback_url.lock() = url.to_string();
         self.with_browser(|b| b.navigate(url));
     }
@@ -371,17 +367,17 @@ impl App {
     }
 
     /// If Chromium shows one of our background pages while none is chosen
-    /// (Back/Forward through history), load the user's page instead. Our
-    /// own navigations get [`NAV_SETTLE`] to finish first. Called every
+    /// (Back/Forward through history), load the user's page instead. Acts
+    /// only after a Back/Forward since our last [`App::load_url`]: while our
+    /// own load is still pending Chromium reports the old URL. Called every
     /// ~250 ms.
     pub fn keep_page_off_background(&self) {
         let _apply = self.apply_lock.lock();
         let shown = self.shown_url();
         let url = {
             let s = self.bg.lock();
-            let settling = s.nav_at.is_some_and(|t| t.elapsed() < NAV_SETTLE);
             let on_bg = !crate::background::is_user_page_url(&shown) && shown.contains("/bg/");
-            (on_bg && !settling && !s.full.is_generated()).then(|| s.last_page_url.clone())
+            (on_bg && s.history_moved && !s.full.is_generated()).then(|| s.last_page_url.clone())
         };
         if let Some(u) = url.filter(|u| !u.is_empty()) {
             tracing::info!(url = %u, "history reached a background page: back to the user's page");
@@ -632,6 +628,9 @@ impl Controls for App {
         if !self.nav_allowed(a) {
             tracing::info!(action = ?a, "ignored while a background shows");
             return;
+        }
+        if a != NavAction::Reload {
+            self.bg.lock().history_moved = true;
         }
         self.with_browser(|b| match a {
             NavAction::Back => b.back(),
@@ -1868,10 +1867,10 @@ mod tests {
         assert!(app.nav_allowed(NavAction::Back));
         let back_landed = format!("{BG_BASE}current.html?v=2");
         *app.fallback_url.lock() = back_landed.clone();
-        // Just after our own navigation: give it time to finish.
+        // Our own navigation may still be loading: left alone.
         app.keep_page_off_background();
         assert_eq!(shown(&app), back_landed);
-        app.bg.lock().nav_at = None;
+        app.nav(NavAction::Back);
         app.keep_page_off_background();
         assert_eq!(shown(&app), "https://user.test/a");
         // A user page is left alone, and so is a generated page while chosen.
@@ -1879,9 +1878,42 @@ mod tests {
         app.keep_page_off_background();
         assert_eq!(shown(&app), "https://user.test/b");
         app.set_background(bg("blurred-room", "room")).unwrap();
-        app.bg.lock().nav_at = None;
+        app.nav(NavAction::Back);
         app.keep_page_off_background();
         assert_eq!(shown(&app), "https://user.test/b");
+    }
+
+    #[test]
+    fn background_watchdog_acts_only_after_back_or_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bg_app(dir.path());
+        app.navigate("https://user.test/a");
+        app.set_background(bg("colour", "room")).unwrap();
+        // Back to Page: our load of the user's page is slow (VPN), so
+        // Chromium still shows the background page well past any grace.
+        app.set_background(bg("page", "room")).unwrap();
+        let still_bg = format!("{BG_BASE}current.html?v=1");
+        *app.fallback_url.lock() = still_bg.clone();
+        for _ in 0..5 {
+            app.keep_page_off_background();
+        }
+        assert_eq!(
+            shown(&app),
+            still_bg,
+            "a slow load must not be re-navigated"
+        );
+        // Back/Forward after our load lands on a background page while the
+        // full frame is not one: the user's page is loaded.
+        for a in [NavAction::Back, NavAction::Forward] {
+            app.nav(a);
+            *app.fallback_url.lock() = still_bg.clone();
+            app.keep_page_off_background();
+            assert_eq!(shown(&app), "https://user.test/a", "{a:?}");
+            // That load is ours again: no loop while it is slow.
+            *app.fallback_url.lock() = still_bg.clone();
+            app.keep_page_off_background();
+            assert_eq!(shown(&app), still_bg, "{a:?}: reload loop");
+        }
     }
 
     #[test]

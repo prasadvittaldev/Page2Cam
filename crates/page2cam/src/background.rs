@@ -462,8 +462,10 @@ pub struct BgState {
     pub note: Option<(String, Instant)>,
     /// Bumped whenever the generated page changes (`current.html?v=<n>`).
     pub version: u64,
-    /// When we last navigated Chromium (its URL may still show the old page).
-    pub nav_at: Option<Instant>,
+    /// Back/Forward ran since our last navigation. Only then may a `/bg/`
+    /// URL count as reached through history: until our own load commits
+    /// (slow pages, VPN) Chromium still reports the old URL.
+    pub history_moved: bool,
 }
 
 impl BgState {
@@ -546,7 +548,7 @@ impl BgState {
             last_page_url,
             note: None,
             version: 1,
-            nav_at: None,
+            history_moved: false,
         };
         (st, warn)
     }
