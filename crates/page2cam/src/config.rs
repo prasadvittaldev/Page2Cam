@@ -35,6 +35,9 @@ pub struct Config {
     pub check_updates: bool,
     /// GPU for the cut-out and video: auto | cpu | exact adapter name.
     pub gpu: String,
+    /// Webcam crop as [x, y, width, height], fractions of the camera frame.
+    /// A list of the wrong length or with NaN means no crop.
+    pub webcam_crop: Vec<f32>,
 }
 
 impl Default for Config {
@@ -56,6 +59,7 @@ impl Default for Config {
             cutout_engine: "quality".into(),
             check_updates: true,
             gpu: "auto".into(),
+            webcam_crop: vec![0.0, 0.0, 1.0, 1.0],
         }
     }
 }
@@ -128,6 +132,14 @@ impl Config {
         Ok(())
     }
 
+    /// The webcam crop from `webcam_crop`, made valid (see [`p2c_core::Crop::clamp`]).
+    pub fn crop(&self) -> p2c_core::Crop {
+        match self.webcam_crop[..] {
+            [x, y, w, h] => p2c_core::Crop { x, y, w, h }.clamp(),
+            _ => p2c_core::Crop::FULL,
+        }
+    }
+
     /// The webcam overlay layout described by `pip` and `pip_size`.
     pub fn pip_layout(&self) -> anyhow::Result<PipLayout> {
         let width = self.pip_size as f32 / 100.0;
@@ -192,6 +204,29 @@ pub fn save_choice(path: &Path, key: &str, value: &str) -> anyhow::Result<()> {
     std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
 }
 
+/// Save the webcam crop as `webcam_crop = [x, y, w, h]`, keeping comments.
+#[allow(dead_code)] // called by the admin crop controls (next task)
+pub fn save_crop(path: &Path, crop: p2c_core::Crop) -> anyhow::Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let mut arr = toml_edit::Array::new();
+    for v in [crop.x, crop.y, crop.w, crop.h] {
+        // f32 -> f64 would print 0.10000000149; round-trip through the short decimal form.
+        arr.push(v.to_string().parse::<f64>().unwrap_or(0.0));
+    }
+    doc["webcam_crop"] = toml_edit::value(arr);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+}
+
 /// Where operator choices are saved: the settings file in use, else the
 /// user's config file.
 pub fn save_path(explicit: Option<&Path>) -> Option<PathBuf> {
@@ -241,6 +276,45 @@ mod tests {
             ..Config::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn crop_defaults_to_full() {
+        let c = Config::default();
+        assert_eq!(c.webcam_crop, vec![0.0, 0.0, 1.0, 1.0]);
+        assert!(c.crop().is_full());
+    }
+
+    #[test]
+    fn config_crop_bad_values_are_clamped_or_default() {
+        let c: Config = toml::from_str("webcam_crop = [0.95, 0.0, 0.5, 0.01]").unwrap();
+        let k = c.crop();
+        assert_eq!((k.x, k.w, k.h), (0.5, 0.5, 0.10));
+        let c: Config = toml::from_str("webcam_crop = [0.1, 0.2]").unwrap();
+        assert!(c.crop().is_full());
+        let c = Config {
+            webcam_crop: vec![f32::NAN, 0.0, 1.0, 1.0],
+            ..Config::default()
+        };
+        assert!(c.crop().is_full());
+    }
+
+    #[test]
+    fn save_crop_keeps_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("page2cam.toml");
+        std::fs::write(&p, "# my comment\nfps = 25\n").unwrap();
+        let k = p2c_core::Crop {
+            x: 0.25,
+            y: 0.5,
+            w: 0.5,
+            h: 0.5,
+        };
+        save_crop(&p, k).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# my comment"), "{text}");
+        let c: Config = toml::from_str(&text).unwrap();
+        assert_eq!((c.fps, c.crop()), (25, k));
     }
 
     #[test]

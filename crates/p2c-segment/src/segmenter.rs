@@ -694,6 +694,42 @@ mod tests {
     }
 
     #[test]
+    fn segmenter_survives_crop_size_change() {
+        use p2c_core::{apply_crop, Crop};
+        let counts = Counts::default();
+        let (cam, out) = (FrameSlot::new(), MaskSlot::new());
+        let s = Segmenter::spawn(
+            opener(1, 1, counts.clone()),
+            cam.clone(),
+            out.clone(),
+            EngineChoice::Quality,
+        );
+        s.set_enabled(true);
+        let crop = Crop {
+            x: 0.0,
+            y: 0.0,
+            w: 0.5,
+            h: 0.5,
+        };
+        let full = || Frame::from_bgra(64, 36, [9, 9, 9, 0].repeat(64 * 36)).unwrap();
+        for i in 0..12 {
+            let f = full();
+            cam.put(if i % 4 < 2 { f } else { apply_crop(f, &crop) });
+            ms(40);
+        }
+        assert!(out.seq() > 0, "no mask published");
+        assert!(
+            counts.resets.load(Ordering::SeqCst) >= 1,
+            "no reset on crop size change"
+        );
+        let seq = out.seq();
+        cam.put(apply_crop(full(), &crop));
+        ms(200);
+        assert!(out.seq() > seq, "masks stopped after the size change");
+        s.stop();
+    }
+
+    #[test]
     fn segmenter_resets_when_reenabled_or_after_stall() {
         let counts = Counts::default();
         let (cam, out) = (FrameSlot::new(), MaskSlot::new());

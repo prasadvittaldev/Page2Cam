@@ -2585,6 +2585,7 @@ dependencies = [
  "jpeg-encoder",
  "nokhwa",
  "p2c-core",
+ "parking_lot",
  "tempfile",
  "tracing",
  "zune-jpeg 0.4.21",

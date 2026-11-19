@@ -13,6 +13,8 @@ zune-jpeg = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies.jpeg-encoder]
 version = "0.6"
+

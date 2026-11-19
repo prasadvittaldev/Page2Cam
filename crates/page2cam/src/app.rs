@@ -19,6 +19,9 @@ const KEYRING_USER: &str = "stream-key";
 pub struct App {
     pub browser: OnceLock<BrowserHandle>,
     pub layout: Arc<RwLock<PipLayout>>,
+    /// Webcam crop, read by the capture thread for every frame.
+    #[allow(dead_code)] // read by the admin crop controls (next task)
+    pub crop: p2c_core::SharedCrop,
     pub stream: StreamController,
     pub mixer: Mixer,
     pub mic_ring: AudioRing,

@@ -217,9 +217,10 @@ fn run() -> anyhow::Result<()> {
     sinks.push(Box::new(stream.sink()));
 
     let layout = Arc::new(RwLock::new(cfg.pip_layout()?));
+    let crop: p2c_core::SharedCrop = Arc::new(RwLock::new(cfg.crop()));
     let webcam = match &cli.fake_webcam {
-        Some(img) => start_fake_webcam(img),
-        None => start_webcam(&cfg, own_device.as_deref()),
+        Some(img) => start_fake_webcam(img, crop.clone()),
+        None => start_webcam(&cfg, own_device.as_deref(), crop.clone()),
     };
     let webcam_status = match &webcam {
         Some((_, _, name)) => format!("ok: {name}"),
@@ -322,6 +323,7 @@ fn run() -> anyhow::Result<()> {
     let encoder_status = Arc::new(Mutex::new("probing…".to_string()));
     let app = Arc::new(App {
         browser: OnceLock::new(),
+        crop,
         layout,
         stream,
         mixer,
@@ -778,6 +780,7 @@ static PAGE: std::sync::LazyLock<FrameSlot> = std::sync::LazyLock::new(FrameSlot
 fn start_webcam(
     cfg: &Config,
     own_device: Option<&Path>,
+    crop: p2c_core::SharedCrop,
 ) -> Option<(FrameSlot, WebcamSource, String)> {
     if !cfg.pip_layout().ok()?.visible {
         return None;
@@ -790,7 +793,7 @@ fn start_webcam(
         return None;
     };
     let slot = FrameSlot::new();
-    match WebcamCapture::start(&cam, slot.clone()) {
+    match WebcamCapture::start(&cam, slot.clone(), crop) {
         Ok(cap) => {
             tracing::info!(webcam = %cam.name, "webcam on");
             Some((slot, WebcamSource::Real(cap), cam.name.clone()))
@@ -824,7 +827,10 @@ fn stop_webcam(webcam: Option<(FrameSlot, WebcamSource, String)>) {
 }
 
 /// `--fake-webcam`: decode `img` once and publish it like a 30 fps camera.
-fn start_fake_webcam(img: &Path) -> Option<(FrameSlot, WebcamSource, String)> {
+fn start_fake_webcam(
+    img: &Path,
+    crop: p2c_core::SharedCrop,
+) -> Option<(FrameSlot, WebcamSource, String)> {
     let rgba = match image::open(img) {
         Ok(i) => i.to_rgba8(),
         Err(e) => {
@@ -843,7 +849,8 @@ fn start_fake_webcam(img: &Path) -> Option<(FrameSlot, WebcamSource, String)> {
     let (s2, stop2) = (slot.clone(), stop.clone());
     let handle = std::thread::spawn(move || {
         while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
-            s2.put(frame.clone());
+            let c = *crop.read();
+            s2.put(p2c_core::apply_crop(frame.clone(), &c));
             std::thread::sleep(std::time::Duration::from_millis(33));
         }
     });

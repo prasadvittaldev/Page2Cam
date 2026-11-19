@@ -12,7 +12,7 @@ use nokhwa::utils::{
     Resolution,
 };
 use nokhwa::Camera;
-use p2c_core::FrameSlot;
+use p2c_core::{apply_crop, Frame, FrameSlot, SharedCrop};
 
 use crate::CameraInfo;
 
@@ -48,7 +48,11 @@ pub struct WebcamCapture {
 }
 
 impl WebcamCapture {
-    pub fn start(cam: &CameraInfo, slot: FrameSlot) -> anyhow::Result<WebcamCapture> {
+    pub fn start(
+        cam: &CameraInfo,
+        slot: FrameSlot,
+        crop: SharedCrop,
+    ) -> anyhow::Result<WebcamCapture> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let cam = cam.clone();
@@ -89,7 +93,7 @@ impl WebcamCapture {
                     };
                     match crate::decode::to_bgra(fmt, res.width(), res.height(), frame.buffer()) {
                         Ok(f) => {
-                            slot.put(f);
+                            slot.put(crop_frame(f, &crop));
                             let now = std::time::Instant::now();
                             if let Some(fps) = rate.tick(now) {
                                 tracing::info!(camera = %cam.name, "webcam measured {fps:.1} fps");
@@ -124,6 +128,12 @@ impl WebcamCapture {
             tracing::warn!("webcam thread did not stop in time; detaching it");
         }
     }
+}
+
+/// Apply the current crop (the lock is read once per frame).
+fn crop_frame(frame: Frame, crop: &SharedCrop) -> Frame {
+    let c = *crop.read();
+    apply_crop(frame, &c)
 }
 
 fn raw_format(f: FrameFormat) -> Option<crate::decode::RawFormat> {
@@ -200,6 +210,22 @@ mod tests {
         let start = Instant::now();
         assert!(!join_within(handle, &done_rx, Duration::from_millis(200)));
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn crop_is_read_per_frame() {
+        use p2c_core::{Crop, Frame};
+        let shared: SharedCrop = Arc::new(parking_lot::RwLock::new(Crop::FULL));
+        let out = crop_frame(Frame::new_black(8, 8), &shared);
+        assert_eq!((out.width, out.height), (8, 8));
+        *shared.write() = Crop {
+            x: 0.0,
+            y: 0.0,
+            w: 0.5,
+            h: 0.5,
+        };
+        let out = crop_frame(Frame::new_black(8, 8), &shared);
+        assert_eq!((out.width, out.height), (4, 4));
     }
 
     #[test]
