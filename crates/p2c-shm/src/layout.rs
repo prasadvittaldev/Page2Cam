@@ -1,4 +1,4 @@
-use std::sync::atomic::{fence, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 
 pub const MAX_WIDTH: u32 = 1920;
 pub const MAX_HEIGHT: u32 = 1080;
@@ -50,8 +50,12 @@ pub(crate) struct Header {
     /// Written once by the DLL when it creates the mapping; 0 = old DLL.
     dll_version: u32,
     /// Who may write frames (`Writer`); set only by the tray. Old DLLs ignore it.
-    writer: u32,
-    _pad: [u8; 20],
+    writer: AtomicU32,
+    _pad: [u8; 4],
+    /// Wall clock (ms) when the current writer took the lock (odd `seq`); 0
+    /// when not writing. Lets another writer reclaim a lock a dead one left.
+    lock_since_ms: AtomicU64,
+    _pad2: [u8; 8],
 }
 
 const _: () = assert!(std::mem::size_of::<Header>() == HEADER_SIZE);
@@ -93,6 +97,19 @@ pub unsafe fn write_frame(
     data: &[u8],
     time_ms: u64,
 ) -> bool {
+    write_frame_at(base, fmt, width, height, data, time_ms, wall_ms())
+}
+
+/// `write_frame` with an injected clock (for the stale-lock test).
+unsafe fn write_frame_at(
+    base: *mut u8,
+    fmt: PixelFormat,
+    width: u32,
+    height: u32,
+    data: &[u8],
+    time_ms: u64,
+    now_ms: u64,
+) -> bool {
     let len = fmt.frame_len(width, height);
     if width == 0
         || height == 0
@@ -103,21 +120,59 @@ pub unsafe fn write_frame(
     {
         return false;
     }
-    let h = &mut *(base as *mut Header);
-    let s = h.seq.load(Ordering::Relaxed);
-    let s = if s % 2 == 1 { s + 1 } else { s };
-    h.seq.store(s + 1, Ordering::Relaxed);
-    fence(Ordering::Release);
-    h.magic = MAGIC;
-    h.version = VERSION;
-    h.width = width;
-    h.height = height;
-    h.format = fmt as u32;
+    let hp = base as *mut Header;
+    let h = &*hp;
+    // Try-lock: seq even -> odd. Another writer mid-write (odd) or a lost race
+    // means skip this frame, so two writers never overlap.
+    let s = h.seq.load(Ordering::Acquire);
+    let s = if s.is_multiple_of(2) {
+        if h.seq
+            .compare_exchange(s, s + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        s
+    } else {
+        // Odd: a writer is busy, or died mid-write (e.g. killed). Reclaim only
+        // after the lock has been held for more than STALE_LOCK_MS.
+        let since = h.lock_since_ms.load(Ordering::Acquire);
+        if since == 0
+            || now_ms.saturating_sub(since) <= STALE_LOCK_MS
+            || h.seq
+                .compare_exchange(s, s + 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        s + 1
+    };
+    h.lock_since_ms.store(now_ms, Ordering::Release);
+    // Fields are only touched while holding the lock; readers re-check seq.
+    std::ptr::write_volatile(std::ptr::addr_of_mut!((*hp).magic), MAGIC);
+    std::ptr::write_volatile(std::ptr::addr_of_mut!((*hp).version), VERSION);
+    std::ptr::write_volatile(std::ptr::addr_of_mut!((*hp).width), width);
+    std::ptr::write_volatile(std::ptr::addr_of_mut!((*hp).height), height);
+    std::ptr::write_volatile(std::ptr::addr_of_mut!((*hp).format), fmt as u32);
     std::ptr::copy_nonoverlapping(data.as_ptr(), base.add(HEADER_SIZE), len);
     h.time_ms.store(time_ms, Ordering::Relaxed);
+    h.lock_since_ms.store(0, Ordering::Relaxed);
     fence(Ordering::Release);
     h.seq.store(s + 2, Ordering::Release);
     true
+}
+
+/// A held write lock (odd `seq`) older than this is taken to belong to a dead
+/// writer and may be reclaimed. `Header::lock_since_ms` (wall clock, ms) is set
+/// right after taking the lock and cleared at the end; 0 while odd (the tiny
+/// window right after the CAS) is never reclaimed.
+const STALE_LOCK_MS: u64 = 500;
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Copy the newest complete frame into `out`.
@@ -180,8 +235,8 @@ pub unsafe fn read_frame(base: *const u8, out: &mut Vec<u8>) -> Result<FrameInfo
 /// # Safety
 /// `base` must point to a writable, 8-byte aligned mapping of `MAPPING_SIZE` bytes.
 pub unsafe fn set_dll_version(base: *mut u8) {
-    let h = &mut *(base as *mut Header);
-    std::ptr::write_volatile(&mut h.dll_version, VERSION);
+    let hp = base as *mut Header;
+    std::ptr::write_volatile(std::ptr::addr_of_mut!((*hp).dll_version), VERSION);
 }
 
 /// Protocol version the DLL stamped into the mapping (0 = old DLL).
@@ -208,8 +263,9 @@ pub enum Writer {
 /// # Safety
 /// `base` must point to a writable, 8-byte aligned mapping of `MAPPING_SIZE` bytes.
 pub unsafe fn set_writer(base: *mut u8, w: Writer) {
-    let h = &mut *(base as *mut Header);
-    std::ptr::write_volatile(&mut h.writer, w as u32);
+    (*(base as *const Header))
+        .writer
+        .store(w as u32, Ordering::Release);
 }
 
 /// Who may write frames (unknown values read as `Writer::None`).
@@ -218,7 +274,7 @@ pub unsafe fn set_writer(base: *mut u8, w: Writer) {
 /// `base` must point to a readable, 8-byte aligned mapping of `MAPPING_SIZE` bytes.
 pub unsafe fn writer(base: *const u8) -> Writer {
     let h = &*(base as *const Header);
-    match std::ptr::read_volatile(&h.writer) {
+    match h.writer.load(Ordering::Acquire) {
         1 => Writer::Tray,
         2 => Writer::Engine,
         _ => Writer::None,
@@ -364,7 +420,7 @@ mod tests {
         unsafe { write_frame(base, PixelFormat::Bgra, 2, 2, &[7; 16], 1) };
         assert_eq!(unsafe { writer(base) }, Writer::Engine);
         // An unknown value reads as None.
-        unsafe { (*(base as *mut Header)).writer = 9 };
+        unsafe { (*(base as *const Header)).writer.store(9, Ordering::SeqCst) };
         assert_eq!(unsafe { writer(base) }, Writer::None);
     }
 
@@ -385,6 +441,76 @@ mod tests {
         assert_eq!(VERSION, 2);
         unsafe { set_writer(base, Writer::Engine) };
         assert!(unsafe { read_frame(base, &mut out) }.is_ok());
+    }
+
+    #[test]
+    fn concurrent_writers_never_overlap() {
+        let mut m = mem();
+        let base = m.as_mut_ptr() as usize;
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let wrote = [AtomicU64::new(0), AtomicU64::new(0)];
+        std::thread::scope(|sc| {
+            for (i, fill) in [0xAAu8, 0x55u8].into_iter().enumerate() {
+                let (stop, wrote) = (&stop, &wrote);
+                sc.spawn(move || {
+                    let px = vec![fill; 64 * 64 * 4];
+                    while !stop.load(Ordering::Relaxed) {
+                        if unsafe {
+                            write_frame(base as *mut u8, PixelFormat::Bgra, 64, 64, &px, 1)
+                        } {
+                            wrote[i].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+            let mut out = Vec::new();
+            let mut good = 0;
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < std::time::Duration::from_millis(500) {
+                if unsafe { read_frame(base as *const u8, &mut out) }.is_ok() {
+                    assert!(
+                        out.iter().all(|&b| b == out[0]) && (out[0] == 0xAA || out[0] == 0x55),
+                        "mixed frame"
+                    );
+                    good += 1;
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            assert!(good > 0);
+        });
+        assert!(wrote[0].load(Ordering::Relaxed) + wrote[1].load(Ordering::Relaxed) > 0);
+        let h = unsafe { &*(base as *const Header) };
+        assert_eq!(h.seq.load(Ordering::Relaxed) % 2, 0, "seq left odd");
+    }
+
+    #[test]
+    fn stale_odd_seq_is_reclaimed_after_500ms() {
+        let mut m = mem();
+        let base = m.as_mut_ptr() as *mut u8;
+        let px = [7u8; 16];
+        let h = unsafe { &*(base as *const Header) };
+        // A writer that began at t=1000 and died: odd seq.
+        h.seq.store(3, Ordering::SeqCst);
+        h.lock_since_ms.store(1000, Ordering::SeqCst);
+        // Within 500 ms the other writer is assumed alive: skip.
+        assert!(!unsafe { write_frame_at(base, PixelFormat::Bgra, 2, 2, &px, 1, 1400) });
+        assert_eq!(h.seq.load(Ordering::SeqCst), 3);
+        // Past 500 ms it is reclaimed and the frame is written.
+        assert!(unsafe { write_frame_at(base, PixelFormat::Bgra, 2, 2, &px, 1, 1501) });
+        assert_eq!(h.seq.load(Ordering::SeqCst) % 2, 0);
+        let mut out = Vec::new();
+        assert!(unsafe { read_frame(base, &mut out) }.is_ok());
+        assert_eq!(out, px);
+        // Normal writes work again.
+        assert!(unsafe { write_frame(base, PixelFormat::Bgra, 2, 2, &px, 2) });
+    }
+
+    #[test]
+    fn writer_is_atomic_and_stays_in_64_bytes() {
+        assert_eq!(std::mem::size_of::<Header>(), 64);
+        let w = AtomicU32::new(0);
+        w.store(2, Ordering::Release);
+        assert_eq!(w.load(Ordering::Acquire), 2);
     }
 
     #[test]

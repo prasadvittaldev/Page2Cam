@@ -773,8 +773,16 @@ impl FrameSink for WinVcamSink {
             return Ok(());
         };
         let ok = writer.write_nv12(f, now_ms());
+        // `false` is also "another writer is mid-write": skip that frame
+        // quietly; only a frame that can never fit is an error.
+        let fits = f.width > 0
+            && f.height > 0
+            && f.width <= p2c_shm::MAX_WIDTH
+            && f.height <= p2c_shm::MAX_HEIGHT
+            && f.width.is_multiple_of(2)
+            && f.height.is_multiple_of(2);
         anyhow::ensure!(
-            ok,
+            ok || fits,
             "camera frame {}x{} does not fit the shared memory",
             f.width,
             f.height
