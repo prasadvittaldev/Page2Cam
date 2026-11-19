@@ -355,7 +355,12 @@ struct BgChange {
 impl App {
     /// Load `url` in Chromium (or remember it until the browser exists).
     fn load_url(&self, url: &str) {
-        self.bg.lock().history_moved = false;
+        let from = self.shown_url();
+        {
+            let mut s = self.bg.lock();
+            s.history_moved = false;
+            s.load_from = from;
+        }
         *self.fallback_url.lock() = url.to_string();
         self.with_browser(|b| b.navigate(url));
     }
@@ -367,15 +372,19 @@ impl App {
     }
 
     /// If Chromium shows one of our background pages while none is chosen
-    /// (Back/Forward through history), load the user's page instead. Acts
-    /// only after a Back/Forward since our last [`App::load_url`]: while our
-    /// own load is still pending Chromium reports the old URL. Called every
-    /// ~250 ms.
+    /// (Back/Forward, or the page's own `history.back()`), load the user's
+    /// page instead. Acts only once history moved since our last
+    /// [`App::load_url`] (see `BgState::history_moved`): while our own load
+    /// is still pending Chromium reports the old URL, so a slow load is
+    /// never reloaded. Called every ~250 ms.
     pub fn keep_page_off_background(&self) {
         let _apply = self.apply_lock.lock();
         let shown = self.shown_url();
         let url = {
-            let s = self.bg.lock();
+            let mut s = self.bg.lock();
+            if shown != s.load_from {
+                s.history_moved = true;
+            }
             let on_bg = !crate::background::is_user_page_url(&shown) && shown.contains("/bg/");
             (on_bg && s.history_moved && !s.full.is_generated()).then(|| s.last_page_url.clone())
         };
@@ -625,6 +634,8 @@ impl Controls for App {
     }
 
     fn nav(&self, a: NavAction) {
+        // In order with background changes (and the watchdog).
+        let _apply = self.apply_lock.lock();
         if !self.nav_allowed(a) {
             tracing::info!(action = ?a, "ignored while a background shows");
             return;
@@ -1884,15 +1895,16 @@ mod tests {
     }
 
     #[test]
-    fn background_watchdog_acts_only_after_back_or_forward() {
+    fn background_watchdog_acts_only_after_history_moves() {
         let dir = tempfile::tempdir().unwrap();
         let app = bg_app(dir.path());
         app.navigate("https://user.test/a");
         app.set_background(bg("colour", "room")).unwrap();
         // Back to Page: our load of the user's page is slow (VPN), so
         // Chromium still shows the background page well past any grace.
+        let still_bg = shown(&app);
+        assert!(still_bg.starts_with(BG_BASE), "{still_bg}");
         app.set_background(bg("page", "room")).unwrap();
-        let still_bg = format!("{BG_BASE}current.html?v=1");
         *app.fallback_url.lock() = still_bg.clone();
         for _ in 0..5 {
             app.keep_page_off_background();
@@ -1902,6 +1914,10 @@ mod tests {
             still_bg,
             "a slow load must not be re-navigated"
         );
+        // Reload doesn't move through history: still left alone.
+        app.nav(NavAction::Reload);
+        app.keep_page_off_background();
+        assert_eq!(shown(&app), still_bg, "Reload must not arm the watchdog");
         // Back/Forward after our load lands on a background page while the
         // full frame is not one: the user's page is loaded.
         for a in [NavAction::Back, NavAction::Forward] {
@@ -1914,6 +1930,20 @@ mod tests {
             app.keep_page_off_background();
             assert_eq!(shown(&app), still_bg, "{a:?}: reload loop");
         }
+        // The page moves through history by itself (history.back()): the
+        // load committed (the URL changed), then a /bg/ URL shows.
+        *app.fallback_url.lock() = "https://user.test/a".into();
+        app.keep_page_off_background();
+        *app.fallback_url.lock() = still_bg.clone();
+        app.keep_page_off_background();
+        assert_eq!(shown(&app), "https://user.test/a", "page-driven history");
+        // ... and from another user page onto a different /bg/ URL.
+        *app.fallback_url.lock() = "https://user.test/b".into();
+        app.keep_page_off_background();
+        let other_bg = format!("{BG_BASE}current.html?v=99");
+        *app.fallback_url.lock() = other_bg;
+        app.keep_page_off_background();
+        assert_eq!(shown(&app), "https://user.test/a", "page-driven history 2");
     }
 
     #[test]

@@ -664,7 +664,8 @@ fn run() -> anyhow::Result<i32> {
                 let mut round = 0u32;
                 while !quit.load(std::sync::atomic::Ordering::Relaxed) {
                     app.update_mic_delay();
-                    // Back/Forward must not leave one of our background pages up.
+                    // History moves (Back/Forward, the page itself) must not leave one
+                    // of our background pages up.
                     app.keep_page_off_background();
                     if round.is_multiple_of(4) {
                         app.sample_health();
