@@ -790,11 +790,17 @@
   }
   function showPicture(id, has, row) {
     const img = $(id);
-    img.hidden = !has;
-    if (!has) return;
+    if (!has) { img.hidden = true; return; }
     const src = withToken("/api/background/image?row=" + row + "&v=" + picVersion);
-    if (img.dataset.src !== src) { img.dataset.src = src; img.src = src; }
+    if (img.dataset.src !== src) { img.dataset.src = src; img.dataset.failed = ""; img.src = src; }
+    // A picture that failed to load stays hidden: the "+" placeholder shows.
+    img.hidden = img.dataset.failed === src;
   }
+  ["bgFullImagePrev", "bgBoxImagePrev"].forEach((id) => $(id).onerror = () => {
+    const img = $(id);
+    img.dataset.failed = img.dataset.src || "";
+    img.hidden = true;
+  });
   function showThumb() {
     const img = $("bgYoutubeThumb"), id = bg.full_youtube;
     if (!id) { img.hidden = true; img.dataset.src = ""; return; }

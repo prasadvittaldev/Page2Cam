@@ -1192,6 +1192,10 @@ mod tests {
             assert!(html.contains(route), "route {route}");
         }
         assert!(html.contains("(paused — background showing)"));
+        // Broken previews (picture gone, thumbnail failed) fall back to the
+        // placeholder: the thumbnail and both pictures have error handlers.
+        assert!(html.contains("$(\"bgYoutubeThumb\").onerror"));
+        assert!(html.contains("[\"bgFullImagePrev\", \"bgBoxImagePrev\"].forEach"));
         assert!(!html.contains("img.youtube.com"));
         assert!(!html.contains("src=\"http"));
         assert!(!html.contains("href=\"http"));
