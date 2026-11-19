@@ -2509,6 +2509,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2c-proc"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "p2c-segment"
 version = "0.3.0"
 dependencies = [
@@ -2544,11 +2554,22 @@ dependencies = [
 name = "p2c-tray"
 version = "0.3.0"
 dependencies = [
+ "anyhow",
+ "directories",
  "image",
  "p2c-admin",
  "p2c-core",
+ "p2c-proc",
  "p2c-shm",
+ "p2c-update",
+ "p2c-vcam",
+ "parking_lot",
+ "rand 0.9.5",
  "serde_json",
+ "tempfile",
+ "toml",
+ "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -2619,8 +2640,10 @@ dependencies = [
  "p2c-compositor",
  "p2c-core",
  "p2c-d3d",
+ "p2c-proc",
  "p2c-segment",
  "p2c-stream",
+ "p2c-tray",
  "p2c-update",
  "p2c-vcam",
  "p2c-webcam",

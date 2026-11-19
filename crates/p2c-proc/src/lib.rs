@@ -1,4 +1,9 @@
-//! Stop leftover Page2Cam processes at start.
+//! Page2Cam process housekeeping, shared by the engine/standalone app and
+//! the tray: stop leftover Page2Cam processes, and named locks
+//! (`Local\Page2Cam.Engine` for the engine, `Local\Page2Cam.Tray` for the
+//! tray).
+//!
+//! # Stop leftover Page2Cam processes at start
 //!
 //! A previous instance (or its orphaned Chromium helpers) can keep the
 //! virtual camera, the admin port or the CEF profile locked. Before opening
@@ -39,8 +44,26 @@ const RACE_WINDOW: u64 = 10 * platform::TICKS_PER_SEC;
 /// other instances once more.
 const LOCK_WAIT: Duration = Duration::from_secs(3);
 
-/// Name of the engine lock (a tray process will use `Page2Cam.Tray`).
+/// Name of the engine lock. Only the engine (or standalone app) takes it.
 const ENGINE_LOCK: &str = "Page2Cam.Engine";
+
+/// Name of the tray's single-instance lock (`Local\Page2Cam.Tray` on
+/// Windows). Only the tray takes it; `--standalone` refuses to start while
+/// it is held.
+pub const TRAY_LOCK: &str = "Page2Cam.Tray";
+
+pub use platform::Lock;
+
+/// Take the named lock `name` (`Local\<name>` on Windows, a flock'd file on
+/// Linux). `Ok(None)` when another process (or handle) already holds it.
+pub fn try_lock(name: &str) -> anyhow::Result<Option<Lock>> {
+    platform::try_lock(name)
+}
+
+/// Is the named lock held by some process right now? Does not take it.
+pub fn lock_held(name: &str) -> bool {
+    platform::lock_held(name)
+}
 
 /// Next step while taking the engine lock.
 #[derive(Debug, PartialEq, Eq)]
@@ -132,7 +155,6 @@ fn ancestors(procs: &[Proc], pid: u32) -> Vec<u32> {
 /// Pids of every Page2Cam process to stop: all named page2cam except `me`,
 /// descendants of `me` (our CEF helpers) and ancestors of `me`, except `force`
 /// (the old instance of a restart, which is our parent but must go if it hung).
-#[cfg(test)]
 pub fn to_stop(procs: &[Proc], me: u32, force: Option<u32>) -> Vec<u32> {
     to_stop_keeping(procs, me, force, &[])
 }
@@ -158,6 +180,12 @@ pub fn to_stop_keeping(procs: &[Proc], me: u32, force: Option<u32>, keep: &[u32]
         .filter(|p| Some(p.pid) == force || !racing(p))
         .map(|p| p.pid)
         .collect()
+}
+
+/// Every running process (pid, parent, name; path and start time for
+/// page2cam processes).
+pub fn list_processes() -> Vec<Proc> {
+    platform::list()
 }
 
 /// Stop all other Page2Cam processes except those in `keep`; returns the
@@ -248,6 +276,21 @@ mod platform {
                 return Ok(None);
             }
             Ok(Some(Lock(h)))
+        }
+    }
+
+    /// Does a mutex `Local\<name>` exist (someone holds a handle to it)?
+    pub fn lock_held(name: &str) -> bool {
+        use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+        let full = HSTRING::from(format!("Local\\{name}"));
+        match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &full) } {
+            Ok(h) => {
+                unsafe {
+                    let _ = CloseHandle(h);
+                }
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -368,6 +411,10 @@ mod platform {
                 Err(anyhow::anyhow!("locking {}: {e}", path.display()))
             }
         }
+    }
+
+    pub fn lock_held(name: &str) -> bool {
+        matches!(try_lock(name), Ok(None))
     }
 
     pub fn list() -> Vec<Proc> {
@@ -517,11 +564,13 @@ mod tests {
         let name = format!("Page2Cam.Test.{}", std::process::id());
         let a = platform::try_lock(&name).unwrap();
         assert!(a.is_some(), "first lock must succeed");
+        assert!(lock_held(&name), "seen as held");
         assert!(
             platform::try_lock(&name).unwrap().is_none(),
             "second must see it held"
         );
         drop(a);
+        assert!(!lock_held(&name), "not held after drop");
         assert!(
             platform::try_lock(&name).unwrap().is_some(),
             "released on drop"

@@ -15,15 +15,20 @@ pub fn current_path() -> Option<PathBuf> {
 /// Log to the console (if `console`) and to `page2cam.log`: next to the exe if writable
 /// (Windows zip folder), else in the app data dir. Returns the file in use.
 pub fn init(console: bool) -> Option<PathBuf> {
-    let p = init_inner(console);
+    init_named(console, "page2cam.log")
+}
+
+/// [`init`] with another file name (the tray writes `page2cam-tray.log`).
+pub fn init_named(console: bool, name: &str) -> Option<PathBuf> {
+    let p = init_inner(console, name);
     let _ = PATH.set(p.clone());
     p
 }
 
-fn init_inner(console: bool) -> Option<PathBuf> {
+fn init_inner(console: bool, name: &str) -> Option<PathBuf> {
     // ONNX Runtime logs ~300 info lines per model load; keep its warnings only.
     let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,ort=warn".into());
-    let path = log_path();
+    let path = log_path(name);
     let file = path.as_ref().and_then(|p| {
         std::fs::OpenOptions::new()
             .create(true)
@@ -53,8 +58,8 @@ fn init_inner(console: bool) -> Option<PathBuf> {
     }
 }
 
-fn log_path() -> Option<PathBuf> {
-    let beside = std::env::current_exe().ok()?.parent()?.join("page2cam.log");
+fn log_path(name: &str) -> Option<PathBuf> {
+    let beside = std::env::current_exe().ok()?.parent()?.join(name);
     if cfg!(windows)
         && std::fs::OpenOptions::new()
             .create(true)
@@ -68,5 +73,5 @@ fn log_path() -> Option<PathBuf> {
         .data_dir()
         .to_path_buf();
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("page2cam.log"))
+    Some(dir.join(name))
 }

@@ -4,7 +4,6 @@ mod app;
 mod config;
 mod engine;
 mod health;
-mod instances;
 mod logging;
 mod pattern;
 mod restart;
@@ -154,10 +153,24 @@ fn main() {
         std::process::exit(code);
     }
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // Windows without a role flag: the tray (no console; its own log file).
+    if is_tray_args(&args, cfg!(windows)) {
+        run_tray(&args);
+    }
     let engine = is_engine_args(&args);
     // GUI subsystem: started from a console, standalone still prints there
     // (before any output). Double-clicked: no console, the log file only.
     let console = !engine && attach_parent_console();
+    // Standalone next to a tray would fight it for the camera (and stop it
+    // as a leftover): refuse, always with a message box. Before logging,
+    // which would truncate the log of the engine the tray runs.
+    if !engine && cfg!(windows) && p2c_tray::tray_running() {
+        let msg = "Page2Cam is already running in the tray. Use the tray icon to \
+                   start or stop it, or quit the tray before using --standalone.";
+        eprintln!("\n{msg}");
+        show_error(msg);
+        std::process::exit(engine::EXIT_CRASH);
+    }
     logging::init(!engine);
     match run() {
         Ok(code) => std::process::exit(code),
@@ -178,6 +191,45 @@ fn main() {
 /// decide about the console and logging).
 fn is_engine_args(args: &[std::ffi::OsString]) -> bool {
     args.iter().skip(1).any(|a| a == "--engine")
+}
+
+/// The tray role: Windows and neither `--engine` nor `--standalone`.
+fn is_tray_args(args: &[std::ffi::OsString], windows: bool) -> bool {
+    windows
+        && !args
+            .iter()
+            .skip(1)
+            .any(|a| a == "--engine" || a == "--standalone")
+}
+
+/// Run the Windows tray and exit. Errors go to a message box (the GUI
+/// subsystem has no console).
+#[cfg(windows)]
+fn run_tray(args: &[std::ffi::OsString]) -> ! {
+    // A second launch only signals the running tray: leave its log alone
+    // (opening it truncates).
+    if !p2c_tray::tray_running() {
+        logging::init_named(false, "page2cam-tray.log");
+    }
+    if args.len() > 1 {
+        tracing::warn!(
+            ?args,
+            "the tray ignores these arguments; use --standalone to run Page2Cam without the tray"
+        );
+    }
+    match p2c_tray::run() {
+        Ok(()) => std::process::exit(engine::EXIT_OK),
+        Err(e) => {
+            tracing::error!("tray: {e:#}");
+            show_error(&format!("Page2Cam stopped: {e:#}"));
+            std::process::exit(engine::EXIT_CRASH);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn run_tray(_args: &[std::ffi::OsString]) -> ! {
+    unreachable!("the tray exists on Windows only")
 }
 
 /// Attach to the console of the process that started us, if it has one.
@@ -266,21 +318,21 @@ fn run() -> anyhow::Result<i32> {
     // Leftover instances (or their orphaned Chromium helpers) would hold the
     // camera, admin port and CEF profile: stop them before opening any.
     // In engine mode the tray (`keep`; also an ancestor) is spared.
-    instances::stop_others(std::process::id(), cli.wait_for_pid, &keep);
+    p2c_proc::stop_others(std::process::id(), cli.wait_for_pid, &keep);
     // Only one engine at a time (two launches milliseconds apart). Held until
     // `run` returns; a relaunch's new process waits for our exit anyway.
-    let _engine_lock =
-        match instances::take_engine_lock(std::process::id(), cli.wait_for_pid, &keep) {
-            Ok(l) => l,
-            // Standalone: an error from `run`, so a double-click shows why.
-            Err(e) if role == engine::Role::Standalone => {
-                return Err(e.context("Page2Cam is already starting; this one exits"));
-            }
-            Err(e) => {
-                tracing::error!("{e:#}; this one exits");
-                return Ok(engine::EXIT_CRASH);
-            }
-        };
+    let _engine_lock = match p2c_proc::take_engine_lock(std::process::id(), cli.wait_for_pid, &keep)
+    {
+        Ok(l) => l,
+        // Standalone: an error from `run`, so a double-click shows why.
+        Err(e) if role == engine::Role::Standalone => {
+            return Err(e.context("Page2Cam is already starting; this one exits"));
+        }
+        Err(e) => {
+            tracing::error!("{e:#}; this one exits");
+            return Ok(engine::EXIT_CRASH);
+        }
+    };
     let started = std::time::Instant::now();
     // CEF can kill the whole process (e.g. "GPU process isn't usable.
     // Goodbye."), and then the relaunch at the end of `run` never happens:
@@ -1121,7 +1173,8 @@ mod tests {
         assert_eq!(c.role(), engine::Role::Engine);
         assert_eq!(c.camera_mode(), p2c_vcam::CameraMode::FromTray);
 
-        // No role flag: standalone, as before (until the tray is the default).
+        // No role flag: the Windows tray (dispatched in `main` before
+        // parsing, see `is_tray_args`); everywhere else standalone.
         let c = Cli::try_parse_from(["page2cam", "--no-open"]).unwrap();
         assert_eq!(c.role(), engine::Role::Standalone);
         assert_eq!(c.camera_mode(), p2c_vcam::CameraMode::Own);
@@ -1148,5 +1201,20 @@ mod tests {
         assert!(!is_engine_args(&a(&["page2cam"])));
         // Only the program's own args count, not a value that looks like it.
         assert!(!is_engine_args(&a(&["--engine"])));
+    }
+
+    #[test]
+    fn tray_is_the_default_on_windows_only() {
+        let a = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(is_tray_args(&a(&["page2cam"]), true));
+        // Other flags without a role still mean the tray (ignored there).
+        assert!(is_tray_args(&a(&["page2cam", "--no-open"]), true));
+        assert!(!is_tray_args(&a(&["page2cam", "--standalone"]), true));
+        assert!(!is_tray_args(
+            &a(&["page2cam", "--engine", "--parent-pid", "1"]),
+            true
+        ));
+        // Linux (and any non-Windows build): never the tray.
+        assert!(!is_tray_args(&a(&["page2cam"]), false));
     }
 }

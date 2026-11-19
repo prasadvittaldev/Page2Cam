@@ -10,7 +10,31 @@ license.workspace = true
 p2c-admin.workspace = true
 p2c-shm = { path = "../p2c-shm" }
 p2c-core.workspace = true
-image = { version = "0.25", default-features = false, features = ["png"] }
+p2c-update.workspace = true
+p2c-proc = { path = "../p2c-proc" }
+anyhow.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+serde_json = "1"
+toml = "0.8"
+directories = "5"
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+
+[target.'cfg(windows)'.dependencies]
+p2c-vcam.workspace = true
+rand = "0.9"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
-serde_json = "1"
+tempfile.workspace = true

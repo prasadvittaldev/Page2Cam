@@ -227,11 +227,38 @@ pub fn tooltip(state: &TrayState, unresponsive: bool, level: Level, reasons: &[S
             s.push_str(&format!(" · {label}: {}", all.join(", ")));
         }
     }
+    clip(s)
+}
+
+fn clip(mut s: String) -> String {
     if s.chars().count() > TOOLTIP_MAX {
         s = s.chars().take(TOOLTIP_MAX - 1).collect();
         s.push('…');
     }
     s
+}
+
+/// What the icon and tooltip show: [`effective_level`] and [`tooltip`],
+/// except that a camera problem the tray found itself (driver not installed
+/// or out of date) makes the icon red in every state and leads the tooltip.
+pub fn display(
+    state: &TrayState,
+    unresponsive: bool,
+    hysteresis: Level,
+    reasons: &[String],
+    camera_problem: Option<&str>,
+) -> (Level, String) {
+    let level = effective_level(state, unresponsive, hysteresis);
+    let Some(p) = camera_problem else {
+        return (level, tooltip(state, unresponsive, level, reasons));
+    };
+    if matches!(state, TrayState::Running) {
+        let mut all = vec![p.to_string()];
+        all.extend(reasons.iter().filter(|r| r.as_str() != p).cloned());
+        return (Level::Red, tooltip(state, unresponsive, Level::Red, &all));
+    }
+    let s = format!("{} · problem: {p}", tooltip(state, false, Level::Red, &[]));
+    (Level::Red, clip(s))
 }
 
 #[cfg(test)]
@@ -521,5 +548,24 @@ mod tests {
         );
         assert!(t.chars().count() <= 127);
         assert!(tooltip(&crate::TrayState::Stopped, false, Level::Grey, &[]).contains("stopped"));
+    }
+
+    #[test]
+    fn camera_problem_is_red_in_every_state() {
+        use crate::TrayState::*;
+        let p = Some("camera driver not installed");
+        let (l, t) = display(&Stopped, false, Level::Green, &[], p);
+        assert_eq!(l, Level::Red);
+        assert!(t.contains("stopped") && t.contains("not installed"), "{t}");
+        let (l, t) = display(&Running, false, Level::Green, &["webcam 9 fps".into()], p);
+        assert_eq!(l, Level::Red);
+        assert!(
+            t.contains("problem: camera driver not installed, webcam 9 fps"),
+            "{t}"
+        );
+        // No problem: same as effective_level + tooltip.
+        let (l, t) = display(&Stopped, false, Level::Amber, &[], None);
+        assert_eq!(l, Level::Grey);
+        assert_eq!(t, tooltip(&Stopped, false, Level::Grey, &[]));
     }
 }
