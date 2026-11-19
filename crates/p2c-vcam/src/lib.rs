@@ -14,7 +14,7 @@ pub use convert::bgra_to_yuyv;
 #[cfg(target_os = "linux")]
 pub use linux::{find_loopback_device, resolve_device, V4l2Sink};
 #[cfg(windows)]
-pub use windows_cam::FrameWriter;
+pub use windows_cam::{now_ms, CameraOwner, FrameWriter};
 
 /// Admin status for a camera driver that wrote `dll_version` into the shared
 /// memory (0 = a DLL from before the version field): `Some(error)` when it is
