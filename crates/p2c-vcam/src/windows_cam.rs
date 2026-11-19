@@ -494,16 +494,31 @@ impl WinVcamSink {
             .spawn(move || {
                 let old = old2.lock().ok().and_then(|mut g| g.take());
                 if let Some(o) = old {
+                    use std::sync::atomic::{AtomicU8, Ordering};
+                    // 0 = removing, 1 = removed, 2 = gave up waiting (new camera started).
+                    let removal = std::sync::Arc::new(AtomicU8::new(0));
+                    let removal2 = removal.clone();
+                    let begun = Instant::now();
                     let (dtx, drx) = std::sync::mpsc::channel::<()>();
                     let _ = std::thread::Builder::new()
                         .name("p2c-wincam-remove".into())
                         .spawn(move || {
                             drop(o);
+                            if removal2.swap(1, Ordering::AcqRel) == 2 {
+                                // A new camera with the same name/CLSID already runs.
+                                tracing::warn!(
+                                    took_ms = begun.elapsed().as_millis() as u64,
+                                    "the hung removal of the old virtual camera finished late, after a new one was started"
+                                );
+                            }
                             drop(dtx);
                         });
                     if drx
                         .recv_timeout(Duration::from_secs(3))
                         .is_err_and(|e| e == std::sync::mpsc::RecvTimeoutError::Timeout)
+                        && removal
+                            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
                     {
                         tracing::warn!(
                             "removing the old virtual camera hangs; starting a new one anyway"
