@@ -158,6 +158,17 @@ fn random_token() -> String {
 pub fn run(rx: Receiver<Cmd>, tx: Sender<Cmd>, ui: Arc<Ui>) {
     let me = std::process::id();
     let exe = std::env::current_exe().unwrap_or_default();
+    // First start after an install: apply the installer's sign-in choice to
+    // the Run key once (the elevated installer can't write the user's HKCU).
+    let first_run = !crate::settings::tray_seen();
+    if let Some(on) = crate::settings::first_run_autostart(
+        first_run,
+        crate::settings::installer_autostart_default(),
+    ) {
+        if let Err(e) = super::autostart::set_enabled(&exe, on) {
+            tracing::warn!("cannot apply the installer's sign-in choice: {e:#}");
+        }
+    }
     let mut c = Controller {
         sup: Supervisor::new(),
         hy: Hysteresis::new(),
@@ -194,7 +205,7 @@ pub fn run(rx: Receiver<Cmd>, tx: Sender<Cmd>, ui: Arc<Ui>) {
     // Registers in the background: a wedged Frame Server can't block the
     // menu, Start/Stop or Quit.
     c.cam = Camera::open();
-    if !crate::settings::tray_seen() {
+    if first_run {
         c.ui.balloon(FIRST_RUN, false);
         if let Err(e) = crate::settings::set_tray_seen() {
             tracing::warn!("cannot save tray.toml: {e:#}");

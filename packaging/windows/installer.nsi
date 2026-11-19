@@ -45,18 +45,22 @@ VIAddVersionKey "FileDescription" "${APP} installer"
 !define MUI_HEADERIMAGE_RIGHT
 !define MUI_HEADERIMAGE_BITMAP "${BRAND}\installer-header.bmp"
 !define MUI_HEADERIMAGE_UNBITMAP "${BRAND}\installer-header.bmp"
-!define MUI_WELCOMEPAGE_TEXT "This will install ${APP} ${VERSION}.$\r$\n$\r$\n${APP} shows any website as a camera in Teams, Zoom or Google Meet, and can stream it to YouTube Live, with you on top of the page.$\r$\n$\r$\nPlease close ${APP} and any app that is using a camera before you continue."
+!define MUI_WELCOMEPAGE_TEXT "This will install ${APP} ${VERSION}.$\r$\n$\r$\n${APP} shows any website as a camera in Teams, Zoom or Google Meet, and can stream it to YouTube Live, with you on top of the page.$\r$\n$\r$\nPage2Cam waits in the tray until you click Start.$\r$\n$\r$\nPlease close ${APP} and any app that is using a camera before you continue."
 !define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_TEXT "Start ${APP} now"
 !define MUI_FINISHPAGE_RUN_FUNCTION StartAppAsUser
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "${SRC}\LICENSE.txt"
+!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
+
+LangString DESC_Install ${LANG_ENGLISH} "${APP} and its virtual camera. ${APP} waits in the tray until you click Start."
+LangString DESC_Autostart ${LANG_ENGLISH} "Put ${APP} in the tray when you sign in to Windows. It stays stopped until you click Start. You can change this later in the tray menu."
 
 ; Start Page2Cam as the signed-in user, not as administrator (via Explorer).
 Function StartAppAsUser
@@ -93,7 +97,8 @@ FunctionEnd
   nsExec::Exec 'net stop FrameServer /y'
 !macroend
 
-Section "Install"
+Section "!${APP}" SecInstall
+  SectionIn RO
   SetShellVarContext all
   InitPluginsDir
   SetOutPath "$INSTDIR"
@@ -169,6 +174,27 @@ Section "Install"
   ${EndIf}
 SectionEnd
 
+; Selected by default (and so on for silent installs). This installer runs
+; elevated and can't reliably write the signed-in user's HKCU Run key, so it
+; only records the choice; the tray applies it to the Run key on its first
+; start, after which the Run key is the only source of truth.
+Section "Start ${APP} (stopped) when I sign in" SecAutostart
+  ${If} ${SectionIsSelected} ${SecAutostart}
+    FileOpen $0 "$INSTDIR\autostart.default" w
+    FileWrite $0 "1"
+    FileClose $0
+  ${Else}
+    FileOpen $0 "$INSTDIR\autostart.default" w
+    FileWrite $0 "0"
+    FileClose $0
+  ${EndIf}
+SectionEnd
+
+!insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecInstall} $(DESC_Install)
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecAutostart} $(DESC_Autostart)
+!insertmacro MUI_FUNCTION_DESCRIPTION_END
+
 Section "Uninstall"
   SetShellVarContext all
   ; Refuse to touch a folder that isn't a Page2Cam install.
@@ -186,6 +212,10 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\${APP}.lnk"
   Delete "$DESKTOP\${APP}.lnk"
   DeleteRegKey HKLM "${UNINST_KEY}"
+  ; Sign-in start: only the Run value of the (elevated) uninstalling user can be
+  ; reached from here, usually the same user. Other users' values are left; a
+  ; Run value pointing at a missing exe does nothing.
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APP}"
   nsExec::Exec 'net start FrameServer'
   ; Your settings (%APPDATA%\page2cam) are kept in case you reinstall.
 SectionEnd

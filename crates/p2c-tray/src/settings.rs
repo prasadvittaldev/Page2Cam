@@ -59,6 +59,34 @@ pub fn check_updates() -> bool {
         .is_none_or(|t| check_updates_in(&t))
 }
 
+/// The installer's sign-in choice from `autostart.default` (text `1` or `0`);
+/// anything else (or no file, as in the portable zip) is "no choice".
+pub fn parse_autostart_default(text: &str) -> Option<bool> {
+    match text.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// What to do with the HKCU Run value on this start: `Some(on)` only on the
+/// tray's first start with an installer choice; afterwards the Run key is the
+/// only source of truth and this never touches it.
+pub fn first_run_autostart(first_run: bool, installer_choice: Option<bool>) -> Option<bool> {
+    if first_run {
+        installer_choice
+    } else {
+        None
+    }
+}
+
+/// The installer's choice, read from `autostart.default` next to the exe.
+pub fn installer_autostart_default() -> Option<bool> {
+    let exe = std::env::current_exe().ok()?;
+    let text = std::fs::read_to_string(exe.parent()?.join("autostart.default")).ok()?;
+    parse_autostart_default(&text)
+}
+
 /// Was the first-run balloon shown already?
 pub fn tray_seen() -> bool {
     user_dir()
@@ -88,6 +116,19 @@ mod tests {
         assert!(tray_seen_in(&t));
         assert!(t.contains("other = 3"), "{t}");
         assert!(tray_seen_in(&with_tray_seen("tray_seen = false")));
+    }
+
+    #[test]
+    fn first_run_applies_the_installer_choice_once() {
+        assert_eq!(first_run_autostart(true, Some(true)), Some(true));
+        assert_eq!(first_run_autostart(true, Some(false)), Some(false));
+        assert_eq!(first_run_autostart(true, None), None);
+        assert_eq!(first_run_autostart(false, Some(true)), None);
+        assert_eq!(first_run_autostart(false, Some(false)), None);
+        assert_eq!(parse_autostart_default("1\r\n"), Some(true));
+        assert_eq!(parse_autostart_default("0"), Some(false));
+        assert_eq!(parse_autostart_default("yes"), None);
+        assert_eq!(parse_autostart_default(""), None);
     }
 
     #[test]

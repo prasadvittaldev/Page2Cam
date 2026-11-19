@@ -23,8 +23,14 @@ EVERY TIME
 1. Double-click page2cam.exe.
    - If Windows says "Windows protected your PC": click "More info",
      then "Run anyway". (This test build is not code-signed.)
-   - A black console window opens; leave it open. Closing it quits Page2Cam.
-   - Your browser opens the Page2Cam control page.
+   - Page2Cam waits in the tray (bottom right, maybe under the ^ arrow)
+     until you click Start. Right-click the icon: Start, Stop, Open control
+     page, Force restart, Start with Windows, Quit. While stopped, the
+     "Page2Cam" camera shows a "stopped" picture in Teams/Zoom.
+   - Click Start; your browser opens the Page2Cam control page.
+   - Icon colour: grey = stopped, green = running, amber = the PC is
+     struggling (hover for the reason), red = needs attention.
+   - To run without the tray (old console window): page2cam.exe --standalone
 2. On the control page:
    - Type a website address at the top and press Go.
    - Click, scroll and type directly in the big picture to use the page.
@@ -95,7 +101,7 @@ Common messages:
 
 SETTINGS
 --------
-Edit page2cam.toml in this folder (Notepad is fine), then restart Page2Cam.
+Edit page2cam.toml in this folder (Notepad is fine), then Stop and Start Page2Cam from the tray.
 
 
 UNINSTALL
