@@ -24,11 +24,11 @@ function New-Standby([string]$text, [string]$file) {
     $g.FillPath([System.Drawing.Brushes]::White, $path)
     $g.DrawImage($logo, [int]((1920 - $lw) / 2), 220, $lw, $lh)
     $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
-    $font = New-Object System.Drawing.Font('Segoe UI', 44, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    $font = New-Object System.Drawing.Font('Segoe UI', 64, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
     $fmt = New-Object System.Drawing.StringFormat
     $fmt.Alignment = 'Center'
     $fmt.LineAlignment = 'Center'
-    $rect = New-Object System.Drawing.RectangleF 0, 760, 1920, 120
+    $rect = New-Object System.Drawing.RectangleF 0, 600, 1920, 120
     $g.DrawString($text, $font, [System.Drawing.Brushes]::White, $rect, $fmt)
     $g.Dispose()
     $bmp.Save((Join-Path $outDir $file), [System.Drawing.Imaging.ImageFormat]::Png)

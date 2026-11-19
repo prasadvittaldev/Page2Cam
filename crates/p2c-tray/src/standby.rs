@@ -51,7 +51,10 @@ mod tests {
             let y = &f.data[..1920 * 1080];
             assert!(y.iter().all(|v| (16..=235).contains(v)));
             let mean = y.iter().map(|&v| v as u64).sum::<u64>() / y.len() as u64;
-            assert!(mean < 100, "mean luma {mean} should be dark");
+            assert!((40..100).contains(&mean), "mean luma {mean} should be dark");
+            // Navy corner: U > 128, V < 128 (catches an RGBA/BGRA swap).
+            let (u, v) = (f.data[1920 * 1080], f.data[1920 * 1080 + 1]);
+            assert!(u > 128 && v < 128, "navy chroma u={u} v={v}");
             assert!(
                 *y.iter().max().unwrap() > 200,
                 "expected bright text pixels"
