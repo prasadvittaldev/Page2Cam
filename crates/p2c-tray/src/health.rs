@@ -26,6 +26,9 @@ pub struct SysLoad {
 
 pub const SHOW_AFTER: Duration = Duration::from_secs(6);
 pub const CLEAR_AFTER: Duration = Duration::from_secs(10);
+/// Samples are about 2 s apart; a longer silence means polling stopped or
+/// failed, so running timers no longer describe a continuous reading.
+pub const SAMPLE_GAP: Duration = Duration::from_secs(15);
 
 /// Level and reasons for a running engine: Green, Amber (strain) or Red.
 pub fn classify(h: &Health, sys: &SysLoad) -> (Level, Vec<String>) {
@@ -73,14 +76,26 @@ pub fn classify(h: &Health, sys: &SysLoad) -> (Level, Vec<String>) {
     (level, r)
 }
 
-/// Smooths the raw level: a worse level must hold 6 s to show, a better one
-/// 10 s to take over. Reasons follow the shown level live.
+/// Smooths the raw level.
+///
+/// - A worse level shows only after that same level held continuously for
+///   6 s (the timer restarts whenever the raw level differs).
+/// - A better level takes over after 10 s of continuous readings that were
+///   all better than the shown level; it becomes the worst raw level seen
+///   during those 10 s (Red -> Amber -> Green takes two steps if Amber was
+///   in the window).
+/// - Reasons follow the shown level live.
+/// - `no_sample()` (polling failed/stopped) or a gap of 15 s drops running
+///   timers; `reset()` also goes back to Green.
 #[derive(Debug)]
 pub struct Hysteresis {
     shown: Level,
     reasons: Vec<String>,
-    worse_since: Option<Instant>,
-    better_since: Option<Instant>,
+    /// Worse level being waited for, and since when it held.
+    pending: Option<(Level, Instant)>,
+    /// Run of better-than-shown readings: start, worst level, its reasons.
+    better: Option<(Instant, Level, Vec<String>)>,
+    last_sample: Option<Instant>,
 }
 
 impl Default for Hysteresis {
@@ -94,8 +109,9 @@ impl Hysteresis {
         Self {
             shown: Level::Green,
             reasons: Vec::new(),
-            worse_since: None,
-            better_since: None,
+            pending: None,
+            better: None,
+            last_sample: None,
         }
     }
 
@@ -108,6 +124,14 @@ impl Hysteresis {
         *self = Self::new();
     }
 
+    /// No usable reading (poll failed, engine stopped answering): forget the
+    /// running timers, keep what is shown.
+    pub fn no_sample(&mut self) {
+        self.pending = None;
+        self.better = None;
+        self.last_sample = None;
+    }
+
     pub fn update(
         &mut self,
         raw: Level,
@@ -115,28 +139,44 @@ impl Hysteresis {
         now: Instant,
     ) -> (Level, Vec<String>) {
         use std::cmp::Ordering::*;
+        if self
+            .last_sample
+            .is_some_and(|t| now.duration_since(t) > SAMPLE_GAP)
+        {
+            self.no_sample();
+        }
+        self.last_sample = Some(now);
         match raw.cmp(&self.shown) {
             Equal => {
-                self.worse_since = None;
-                self.better_since = None;
+                self.pending = None;
+                self.better = None;
                 self.reasons = reasons;
             }
             Greater => {
-                self.better_since = None;
-                let since = *self.worse_since.get_or_insert(now);
+                self.better = None;
+                let since = match self.pending {
+                    Some((l, t)) if l == raw => t,
+                    _ => now,
+                };
+                self.pending = Some((raw, since));
                 if now.duration_since(since) >= SHOW_AFTER {
                     self.shown = raw;
                     self.reasons = reasons;
-                    self.worse_since = None;
+                    self.pending = None;
                 }
             }
             Less => {
-                self.worse_since = None;
-                let since = *self.better_since.get_or_insert(now);
-                if now.duration_since(since) >= CLEAR_AFTER {
-                    self.shown = raw;
-                    self.reasons = reasons;
-                    self.better_since = None;
+                self.pending = None;
+                let (start, worst, wr) = match self.better.take() {
+                    Some((t, l, _)) if raw >= l => (t, raw, reasons),
+                    Some((t, l, r)) => (t, l, r),
+                    None => (now, raw, reasons),
+                };
+                if now.duration_since(start) >= CLEAR_AFTER {
+                    self.shown = worst;
+                    self.reasons = wr;
+                } else {
+                    self.better = Some((start, worst, wr));
                 }
             }
         }
@@ -144,10 +184,26 @@ impl Hysteresis {
     }
 }
 
+/// The level the icon shows. State-driven reds bypass hysteresis (immediate):
+/// - Stopped, Starting, Stopping: Grey (not live yet / no more).
+/// - Error: Red.
+/// - Running and unresponsive: Red.
+/// - Running otherwise: the hysteresis output.
+pub fn effective_level(state: &TrayState, unresponsive: bool, hysteresis: Level) -> Level {
+    match state {
+        TrayState::Stopped | TrayState::Starting { .. } | TrayState::Stopping { .. } => Level::Grey,
+        TrayState::Error(_) => Level::Red,
+        TrayState::Running if unresponsive => Level::Red,
+        TrayState::Running => hysteresis,
+    }
+}
+
 /// Windows' tray tooltip holds 127 UTF-16 units; we stay within 127 chars.
 pub const TOOLTIP_MAX: usize = 127;
 
-pub fn tooltip(state: &TrayState, level: Level, reasons: &[String]) -> String {
+/// `level` is the `effective_level`; `unresponsive` adds "not responding" as
+/// the first reason while Running.
+pub fn tooltip(state: &TrayState, unresponsive: bool, level: Level, reasons: &[String]) -> String {
     let word = match state {
         TrayState::Stopped => "stopped".to_string(),
         TrayState::Starting { .. } => "starting…".to_string(),
@@ -156,13 +212,20 @@ pub fn tooltip(state: &TrayState, level: Level, reasons: &[String]) -> String {
         TrayState::Error(m) => format!("error: {m}"),
     };
     let mut s = format!("Page2Cam — {word}");
-    if !reasons.is_empty() && matches!(state, TrayState::Running) {
-        let label = if level == Level::Red {
-            "problem"
-        } else {
-            "strain"
-        };
-        s.push_str(&format!(" · {label}: {}", reasons.join(", ")));
+    if matches!(state, TrayState::Running) {
+        let mut all: Vec<&str> = Vec::new();
+        if unresponsive {
+            all.push("not responding");
+        }
+        all.extend(reasons.iter().map(String::as_str));
+        if !all.is_empty() {
+            let label = if level == Level::Red {
+                "problem"
+            } else {
+                "strain"
+            };
+            s.push_str(&format!(" · {label}: {}", all.join(", ")));
+        }
     }
     if s.chars().count() > TOOLTIP_MAX {
         s = s.chars().take(TOOLTIP_MAX - 1).collect();
@@ -298,6 +361,97 @@ mod tests {
         assert!(r.is_empty());
     }
 
+    fn up(hy: &mut Hysteresis, l: Level, n: u64, t: Instant) -> Level {
+        hy.update(l, vec![format!("{l:?}")], t + Duration::from_secs(n))
+            .0
+    }
+
+    #[test]
+    fn red_timer_restarts_when_level_changes() {
+        let t = Instant::now();
+        let mut hy = Hysteresis::new();
+        assert_eq!(up(&mut hy, Level::Amber, 0, t), Level::Green);
+        // red appears at 3: must hold 6 s itself (until 9), not 3 s (6)
+        assert_eq!(up(&mut hy, Level::Red, 3, t), Level::Green);
+        assert_eq!(up(&mut hy, Level::Red, 6, t), Level::Green);
+        assert_eq!(up(&mut hy, Level::Red, 8, t), Level::Green);
+        assert_eq!(up(&mut hy, Level::Red, 9, t), Level::Red);
+    }
+
+    #[test]
+    fn red_clears_to_worst_of_last_10s_not_green() {
+        let t = Instant::now();
+        let mut hy = Hysteresis::new();
+        up(&mut hy, Level::Red, 0, t);
+        assert_eq!(up(&mut hy, Level::Red, 6, t), Level::Red);
+        // amber for 9 s, then one green sample
+        for n in [7, 9, 11, 13, 15] {
+            assert_eq!(up(&mut hy, Level::Amber, n, t), Level::Red);
+        }
+        assert_eq!(up(&mut hy, Level::Green, 16, t), Level::Red);
+        // 10 s after the first better reading (7): Amber, not Green
+        let (l, r) = hy.update(Level::Green, vec![], t + Duration::from_secs(17));
+        assert_eq!(l, Level::Amber);
+        assert_eq!(r, vec!["Amber".to_string()]);
+        // and Amber needs its own 10 s of good to clear
+        assert_eq!(up(&mut hy, Level::Green, 26, t), Level::Amber);
+        assert_eq!(up(&mut hy, Level::Green, 35, t), Level::Amber);
+        assert_eq!(up(&mut hy, Level::Green, 36, t), Level::Green);
+    }
+
+    #[test]
+    fn long_gap_drops_stale_timers() {
+        let t = Instant::now();
+        let mut hy = Hysteresis::new();
+        up(&mut hy, Level::Amber, 0, t);
+        up(&mut hy, Level::Amber, 4, t);
+        // 100 s without samples, then one amber: must not show at once
+        assert_eq!(up(&mut hy, Level::Amber, 104, t), Level::Green);
+        assert_eq!(up(&mut hy, Level::Amber, 110, t), Level::Amber);
+        // same on the clear side
+        up(&mut hy, Level::Green, 111, t);
+        assert_eq!(up(&mut hy, Level::Green, 200, t), Level::Amber);
+        assert_eq!(up(&mut hy, Level::Green, 209, t), Level::Amber);
+        assert_eq!(up(&mut hy, Level::Green, 210, t), Level::Green);
+    }
+
+    #[test]
+    fn no_sample_drops_timers() {
+        let t = Instant::now();
+        let mut hy = Hysteresis::new();
+        up(&mut hy, Level::Amber, 0, t);
+        up(&mut hy, Level::Amber, 4, t);
+        hy.no_sample();
+        assert_eq!(up(&mut hy, Level::Amber, 6, t), Level::Green);
+        assert_eq!(up(&mut hy, Level::Amber, 12, t), Level::Amber);
+        up(&mut hy, Level::Green, 13, t);
+        hy.no_sample();
+        assert_eq!(up(&mut hy, Level::Green, 23, t), Level::Amber);
+    }
+
+    #[test]
+    fn effective_level_state_driven() {
+        use crate::TrayState::*;
+        let t = Instant::now();
+        assert_eq!(effective_level(&Stopped, false, Level::Amber), Level::Grey);
+        assert_eq!(
+            effective_level(&Starting { since: t }, false, Level::Green),
+            Level::Grey
+        );
+        assert_eq!(
+            effective_level(&Error("x".into()), false, Level::Green),
+            Level::Red
+        );
+        assert_eq!(effective_level(&Running, true, Level::Green), Level::Red);
+        assert_eq!(effective_level(&Running, false, Level::Amber), Level::Amber);
+    }
+
+    #[test]
+    fn tooltip_shows_unresponsive_as_problem() {
+        let t = tooltip(&crate::TrayState::Running, true, Level::Red, &[]);
+        assert_eq!(t, "Page2Cam — running · problem: not responding");
+    }
+
     #[test]
     fn flapping_never_shows() {
         let t = Instant::now();
@@ -341,10 +495,11 @@ mod tests {
 
     #[test]
     fn tooltip_truncates() {
-        let t = tooltip(&crate::TrayState::Running, Level::Green, &[]);
+        let t = tooltip(&crate::TrayState::Running, false, Level::Green, &[]);
         assert_eq!(t, "Page2Cam — running");
         let t = tooltip(
             &crate::TrayState::Running,
+            false,
             Level::Amber,
             &["CPU throttled".into(), "webcam 9 fps".into()],
         );
@@ -355,11 +510,16 @@ mod tests {
         let long: Vec<String> = (0..20)
             .map(|i| format!("a very long reason number {i}"))
             .collect();
-        let t = tooltip(&crate::TrayState::Running, Level::Amber, &long);
+        let t = tooltip(&crate::TrayState::Running, false, Level::Amber, &long);
         assert!(t.chars().count() <= 127, "{}", t.chars().count());
         assert!(t.chars().count() > 100);
-        let t = tooltip(&crate::TrayState::Error("é".repeat(300)), Level::Red, &[]);
+        let t = tooltip(
+            &crate::TrayState::Error("é".repeat(300)),
+            false,
+            Level::Red,
+            &[],
+        );
         assert!(t.chars().count() <= 127);
-        assert!(tooltip(&crate::TrayState::Stopped, Level::Grey, &[]).contains("stopped"));
+        assert!(tooltip(&crate::TrayState::Stopped, false, Level::Grey, &[]).contains("stopped"));
     }
 }
