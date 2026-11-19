@@ -28,6 +28,24 @@ pub fn fetch_latest() -> anyhow::Result<Option<Release>> {
     parse_release(&String::from_utf8_lossy(&out))
 }
 
+/// A small HTTPS download (at most 2 MB) into memory, given up after
+/// `max_secs` (e.g. a video thumbnail for the admin page).
+pub fn fetch_small(url: &str, max_secs: u32) -> anyhow::Result<Vec<u8>> {
+    let secs = max_secs.to_string();
+    curl_as(
+        "download failed",
+        &[
+            "-fsSL",
+            "--max-time",
+            &secs,
+            "--max-filesize",
+            "2000000",
+            "--url",
+            url,
+        ],
+    )
+}
+
 /// Download `url` to `dest`.
 pub fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
     let dest = dest.to_string_lossy();
@@ -139,6 +157,11 @@ mod win {
 }
 
 fn curl(args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    curl_as("update check failed", args)
+}
+
+/// Run curl (HTTPS only); a failure reads "<what>: <curl's message>".
+fn curl_as(what: &str, args: &[&str]) -> anyhow::Result<Vec<u8>> {
     let mut cmd = std::process::Command::new("curl");
     // HTTPS only, including redirects (GitHub sends downloads to its CDN).
     cmd.args(["--proto", "=https", "--proto-redir", "=https"]);
@@ -154,7 +177,7 @@ fn curl(args: &[&str]) -> anyhow::Result<Vec<u8>> {
         .map_err(|e| anyhow::anyhow!("could not run curl: {e}"))?;
     anyhow::ensure!(
         out.status.success(),
-        "update check failed: {}",
+        "{what}: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
     Ok(out.stdout)

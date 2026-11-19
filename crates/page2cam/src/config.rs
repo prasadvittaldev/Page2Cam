@@ -38,6 +38,22 @@ pub struct Config {
     /// Webcam crop as [x, y, width, height], fractions of the camera frame.
     /// A list of the wrong length or with NaN means no crop.
     pub webcam_crop: Vec<f32>,
+    /// Full-frame background: page | image | colour | youtube | blurred-room
+    pub background: String,
+    /// The full-frame picture (re-encoded copy in the data folder).
+    pub background_image: String,
+    /// Full-frame colour, `#rrggbb`.
+    pub background_colour: String,
+    /// Full-frame YouTube video (link or 11-character id).
+    pub background_youtube: String,
+    /// In-box background (Box style): room | blur | image | colour
+    pub box_background: String,
+    pub box_background_image: String,
+    pub box_background_colour: String,
+    /// Guided-filter cut-out edges.
+    pub refined_edges: bool,
+    /// The operator's page, restored when the full-frame background goes back to Page.
+    pub last_page_url: String,
 }
 
 impl Default for Config {
@@ -60,6 +76,15 @@ impl Default for Config {
             check_updates: true,
             gpu: "auto".into(),
             webcam_crop: vec![0.0, 0.0, 1.0, 1.0],
+            background: "page".into(),
+            background_image: String::new(),
+            background_colour: "#0b63f0".into(),
+            background_youtube: String::new(),
+            box_background: "room".into(),
+            box_background_image: String::new(),
+            box_background_colour: "#0b63f0".into(),
+            refined_edges: false,
+            last_page_url: String::new(),
         }
     }
 }
@@ -129,6 +154,17 @@ impl Config {
             "video_kbps must be 500..=20000 (got {})",
             self.video_kbps
         );
+        anyhow::ensure!(
+            ["page", "image", "colour", "youtube", "blurred-room"]
+                .contains(&self.background.as_str()),
+            "unknown background {:?} (use page, image, colour, youtube or blurred-room)",
+            self.background
+        );
+        anyhow::ensure!(
+            ["room", "blur", "image", "colour"].contains(&self.box_background.as_str()),
+            "unknown box_background {:?} (use room, blur, image or colour)",
+            self.box_background
+        );
         Ok(())
     }
 
@@ -190,6 +226,15 @@ fn config_path(
 /// comments and other settings. Creates the file (and folder) if missing.
 pub fn save_choice(path: &Path, key: &str, value: &str) -> anyhow::Result<()> {
     edit_settings(path, |doc| doc[key] = toml_edit::value(value))
+}
+
+/// Set several top-level keys at once (one write), keeping comments.
+pub fn save_values(path: &Path, values: &[(&str, toml_edit::Value)]) -> anyhow::Result<()> {
+    edit_settings(path, |doc| {
+        for (k, v) in values {
+            doc[*k] = toml_edit::value(v.clone());
+        }
+    })
 }
 
 /// Save the webcam crop as `webcam_crop = [x, y, w, h]`, keeping comments.
@@ -254,6 +299,54 @@ mod tests {
         assert!(text.contains("# my comment"), "{text}");
         let c: Config = toml::from_str(&text).unwrap();
         assert_eq!((c.overlay_style.as_str(), c.fps), ("cutout-full", 25));
+    }
+
+    #[test]
+    fn settings_roundtrip_keeps_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("page2cam.toml");
+        std::fs::write(&p, "# my comment\nfps = 25 # inline\n").unwrap();
+        // Defaults when the keys are missing.
+        let c: Config = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(c.background, "page");
+        assert_eq!(c.box_background, "room");
+        assert!(!c.refined_edges);
+        assert_eq!(c.last_page_url, "");
+        save_values(
+            &p,
+            &[
+                ("background", "youtube".into()),
+                ("background_youtube", "dQw4w9WgXcQ".into()),
+                ("background_colour", "#0b63f0".into()),
+                ("background_image", r"C:\data\backgrounds\full.jpg".into()),
+                ("box_background", "colour".into()),
+                ("box_background_colour", "#112233".into()),
+                ("box_background_image", "/data/backgrounds/box.png".into()),
+                ("refined_edges", true.into()),
+                ("last_page_url", "https://example.com/a?b=1".into()),
+            ],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# my comment"), "{text}");
+        assert!(text.contains("# inline"), "{text}");
+        let c: Config = toml::from_str(&text).unwrap();
+        assert!(c.validate().is_ok());
+        assert_eq!(c.fps, 25);
+        assert_eq!(c.background, "youtube");
+        assert_eq!(c.background_youtube, "dQw4w9WgXcQ");
+        assert_eq!(c.background_colour, "#0b63f0");
+        assert_eq!(c.background_image, r"C:\data\backgrounds\full.jpg");
+        assert_eq!(c.box_background, "colour");
+        assert_eq!(c.box_background_colour, "#112233");
+        assert_eq!(c.box_background_image, "/data/backgrounds/box.png");
+        assert!(c.refined_edges);
+        assert_eq!(c.last_page_url, "https://example.com/a?b=1");
+        // Unknown background names are refused like other choices.
+        for (k, v) in [("background", "aquarium"), ("box_background", "fog")] {
+            let c: Config = toml::from_str(&format!("{k} = \"{v}\"")).unwrap();
+            assert!(c.validate().is_err(), "{k}");
+        }
     }
 
     #[test]

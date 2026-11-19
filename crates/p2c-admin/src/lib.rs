@@ -9,8 +9,8 @@ mod server;
 mod tray;
 
 pub use api::{
-    AudioSettings, Controls, CropDto, GpuInfo, Health, InputEvent, KeyAction, MouseBtn, NavAction,
-    Status, StreamRequest, UpdateInfo,
+    AudioSettings, BackgroundDto, Controls, CropDto, GpuInfo, Health, ImageRow, InputEvent,
+    KeyAction, MouseBtn, NavAction, Status, StreamRequest, UpdateInfo,
 };
 pub use input::{map_preview, normalize_url};
 pub use preview::{encode_snapshot, PreviewSink};

@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 mod app;
+mod background;
 mod config;
 mod engine;
 mod health;
@@ -20,7 +21,8 @@ use p2c_admin::{AdminConfig, PreviewSink};
 use p2c_audio::{MixSettings, Mixer};
 use p2c_browser::BrowserConfig;
 use p2c_compositor::{
-    CpuProducer, FrameSink, OutputFormat, OutputProducer, OutputSpec, ProducerEvent, Ticker,
+    CpuProducer, FrameSink, OutputFormat, OutputProducer, OutputSpec, OverlayStyle, ProducerEvent,
+    Ticker,
 };
 use p2c_core::AudioRing;
 use p2c_core::{FrameSlot, Nv12Gate, Nv12Slot};
@@ -408,7 +410,22 @@ fn run() -> anyhow::Result<i32> {
     sinks.push(Box::new(stream.sink()));
 
     let layout = Arc::new(RwLock::new(cfg.pip_layout()?));
-    let backdrop = Arc::new(RwLock::new(p2c_compositor::Backdrop::default()));
+    // Saved backgrounds. The page to restore: `--url` if given, else the
+    // saved `last_page_url`, else `url`.
+    let last_page_url = if cli.url.is_none() && background::is_user_page_url(&cfg.last_page_url) {
+        cfg.last_page_url.clone()
+    } else {
+        cfg.url.clone()
+    };
+    let (bg_state, bg_warnings) = background::BgState::from_config(&cfg, last_page_url);
+    for w in &bg_warnings {
+        tracing::warn!("background setting: {w}");
+    }
+    if bg_state.full != background::FullBg::Page && layout.read().style == OverlayStyle::Box {
+        // A full-frame background needs a cut-out style (hand-edited settings).
+        layout.write().style = OverlayStyle::CutoutFull;
+    }
+    let backdrop = Arc::new(RwLock::new(bg_state.backdrop()));
     let crop: p2c_core::SharedCrop = Arc::new(RwLock::new(cfg.crop()));
     // NV12 originals of the webcam frames (stays empty for fake/test input).
     let nv12_slot = Nv12Slot::new();
@@ -501,7 +518,7 @@ fn run() -> anyhow::Result<i32> {
     });
     if let Some(seg) = &segmenter {
         let l = *layout.read();
-        seg.set_enabled(l.visible && l.style.is_cutout());
+        seg.set_enabled(l.visible && backdrop.read().needs_mask(&l));
     }
     let (events_tx, events) = mpsc::channel();
     let ticker = Ticker::spawn(
@@ -537,6 +554,11 @@ fn run() -> anyhow::Result<i32> {
         crop,
         layout,
         backdrop,
+        bg: Mutex::new(bg_state),
+        bg_base: OnceLock::new(),
+        data_dir: directories::ProjectDirs::from("", "", "page2cam")
+            .map(|d| d.data_dir().to_path_buf()),
+        thumbs: background::ThumbCache::new(Box::new(|url| p2c_update::fetch_small(url, 8))),
         stream,
         mixer,
         mic_ring,
@@ -696,6 +718,13 @@ fn run() -> anyhow::Result<i32> {
         Ok(admin) => tracing::info!("admin page on 127.0.0.1:{}", admin.addr.port()),
         Err(e) => tracing::error!(port_failed, "admin page: {e:#}"),
     }
+    // Background pages are served by the admin server: a saved YouTube,
+    // picture or colour background starts now that its URL is known.
+    let start_url = match &admin {
+        Ok(a) => app.start_background(a.bg_url.clone()),
+        Err(_) => None,
+    }
+    .unwrap_or_else(|| cfg.url.clone());
 
     let result = if let Err(e) = admin {
         Err(e)
@@ -722,7 +751,7 @@ fn run() -> anyhow::Result<i32> {
             .data_dir()
             .join("cef-profile");
         let browser_cfg = BrowserConfig {
-            url: cfg.url.clone(),
+            url: start_url.clone(),
             width: cfg.width,
             height: cfg.height,
             fps: cfg.fps,
@@ -736,7 +765,7 @@ fn run() -> anyhow::Result<i32> {
             .is_some()
             .then(|| gpu_video.as_ref().map(|g| g.stats.clone()))
             .flatten();
-        tracing::info!(url = %cfg.url, "loading page");
+        tracing::info!(url = %start_url, "loading page");
         let app2 = app.clone();
         let (quit2, fell_back2, fallback2) = (quit.clone(), fell_back.clone(), fallback.clone());
         // CEF owns the main thread until shutdown; Ctrl-C asks it to close.

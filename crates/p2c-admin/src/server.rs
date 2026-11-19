@@ -16,8 +16,8 @@ use serde::Deserialize;
 use tokio::sync::watch;
 
 use crate::api::{
-    AudioSettings, Controls, CropDto, GpuInfo, InputEvent, KeyAction, MouseBtn, NavAction, PipDto,
-    StreamRequest,
+    AudioSettings, BackgroundDto, Controls, CropDto, GpuInfo, ImageRow, InputEvent, KeyAction,
+    MouseBtn, NavAction, PipDto, StreamRequest,
 };
 use crate::input::{map_preview, normalize_url};
 use crate::preview::spawn_encoder;
@@ -65,6 +65,10 @@ pub struct AdminServer {
     pub addr: SocketAddr,
     /// Full URL including the access token.
     pub url: String,
+    /// Base of the generated background pages, ending in `/`:
+    /// `http://127.0.0.1:<port>/bg/<per-launch random id>/` (no token needed;
+    /// the unguessable id and the Host check guard it).
+    pub bg_url: String,
 }
 
 #[derive(Clone)]
@@ -76,6 +80,8 @@ pub(crate) struct State {
     height: u32,
     preview: Arc<watch::Sender<Jpeg>>,
     tray: Option<Arc<TrayLink>>,
+    /// Per-launch random id of the background pages (`/bg/<id>/…`).
+    pub(crate) bg_id: Arc<str>,
 }
 
 impl State {
@@ -95,6 +101,7 @@ impl State {
             height,
             preview: Arc::new(tx),
             tray: TrayLink::global(),
+            bg_id: random_token().into(),
         }
     }
 }
@@ -121,6 +128,17 @@ pub(crate) fn router(st: State) -> Router {
         .route("/api/input", post(input))
         .route("/api/snapshot", get(snapshot))
         .route("/api/agents", get(agents).post(agents))
+        .route("/api/background", get(background_get).post(background_set))
+        .route(
+            "/api/background/image",
+            post(background_upload)
+                .get(background_image_get)
+                // Pictures up to 20 MB (other routes keep the 2 MB limit).
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_IMAGE_BYTES)),
+        )
+        .route("/api/background/thumb", get(background_thumb))
+        .route("/bg/{id}/current.html", get(bg_page))
+        .route("/bg/{id}/image", get(bg_image))
         .route("/ws", get(ws))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(st.clone(), guard))
@@ -134,7 +152,7 @@ pub fn serve(
     preview_frames: FrameSlot,
 ) -> anyhow::Result<AdminServer> {
     let token = cfg.token.clone().unwrap_or_else(random_token);
-    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<SocketAddr>>();
+    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<(SocketAddr, Arc<str>)>>();
     let token2 = token.clone();
     std::thread::Builder::new()
         .name("p2c-admin".into())
@@ -172,20 +190,21 @@ pub fn serve(
                 let addr = listener.local_addr().expect("bound socket has an address");
                 let st = State::new(controls, token2, addr.port(), cfg.width, cfg.height);
                 spawn_encoder(preview_frames, st.preview.clone());
-                let _ = tx.send(Ok(addr));
+                let _ = tx.send(Ok((addr, st.bg_id.clone())));
                 if let Err(e) = axum::serve(listener, router(st)).await {
                     tracing::error!(error = %e, "admin server stopped");
                 }
             });
         })?;
-    let addr = rx.recv()??;
+    let (addr, bg_id) = rx.recv()??;
+    let bg_url = format!("http://127.0.0.1:{}/bg/{bg_id}/", addr.port());
     let url = format!("http://127.0.0.1:{}/?t={}", addr.port(), token);
     if cfg.open_browser {
         if let Err(e) = webbrowser::open(&url) {
             tracing::warn!(error = %e, "could not open a browser; open the admin URL manually");
         }
     }
-    Ok(AdminServer { addr, url })
+    Ok(AdminServer { addr, url, bg_url })
 }
 
 fn random_token() -> String {
@@ -214,6 +233,22 @@ async fn guard(AxState(st): AxState<State>, req: Request, next: Next) -> Respons
         .uri()
         .query()
         .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("t=")));
+    // Background pages: Chromium loads them without the token. The Host
+    // check stays; the per-launch id must match, and only the page and its
+    // image are reachable this way.
+    if let Some(rest) = req.uri().path().strip_prefix("/bg/") {
+        if !host_ok {
+            return (StatusCode::FORBIDDEN, "forbidden").into_response();
+        }
+        let known = rest.split_once('/').is_some_and(|(id, file)| {
+            constant_time_eq(id.as_bytes(), st.bg_id.as_bytes())
+                && matches!(file, "current.html" | "image")
+        });
+        if !known {
+            return (StatusCode::NOT_FOUND, "not found").into_response();
+        }
+        return next.run(req).await;
+    }
     let token_ok = header_token
         .or(query_token)
         .is_some_and(|t| constant_time_eq(t.as_bytes(), st.token.as_bytes()));
@@ -567,6 +602,145 @@ async fn agents(
         _ => json_error(StatusCode::BAD_GATEWAY, "tray did not answer"),
     }
 }
+/// Largest background picture upload.
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+/// Longest a thumbnail request waits for the engine's fetch.
+const THUMB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// PNG, JPEG or WebP, by the first bytes (never by the file name).
+fn looks_like_image(b: &[u8]) -> bool {
+    b.starts_with(b"\x89PNG\r\n\x1a\n")
+        || b.starts_with(&[0xff, 0xd8, 0xff])
+        || (b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP")
+}
+
+async fn background_get(AxState(st): AxState<State>) -> Json<BackgroundDto> {
+    Json(st.controls.background())
+}
+
+async fn background_set(AxState(st): AxState<State>, Json(b): Json<BackgroundDto>) -> Response {
+    // May navigate and write the settings file: off the async runtime.
+    let c = st.controls.clone();
+    match tokio::task::spawn_blocking(move || c.set_background(b).map(|()| c.background())).await {
+        Ok(Ok(dto)) => Json(dto).into_response(),
+        Ok(Err(e)) => json_error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct RowQuery {
+    row: Option<ImageRow>,
+}
+
+/// `POST /api/background/image?row=full|box`, body = the image file.
+async fn background_upload(
+    AxState(st): AxState<State>,
+    q: Result<axum::extract::Query<RowQuery>, axum::extract::rejection::QueryRejection>,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(row) = q.ok().and_then(|q| q.0.row) else {
+        return json_error(StatusCode::BAD_REQUEST, "row must be full or box");
+    };
+    if !looks_like_image(&body) {
+        return json_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "only PNG, JPEG and WebP images are accepted",
+        );
+    }
+    let c = st.controls.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        c.set_background_image(row, body.to_vec())
+            .map(|()| c.background())
+    })
+    .await;
+    match res {
+        Ok(Ok(dto)) => Json(dto).into_response(),
+        Ok(Err(e)) => json_error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+fn image_response(img: Option<(Arc<Vec<u8>>, &'static str)>) -> Response {
+    match img {
+        Some((bytes, kind)) => (
+            [
+                (header::CONTENT_TYPE, kind),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes.as_ref().clone(),
+        )
+            .into_response(),
+        None => json_error(StatusCode::NOT_FOUND, "no image"),
+    }
+}
+
+/// `GET /api/background/image?row=full|box`: the stored picture (previews).
+async fn background_image_get(
+    AxState(st): AxState<State>,
+    q: Result<axum::extract::Query<RowQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    match q.ok().and_then(|q| q.0.row) {
+        Some(row) => image_response(st.controls.background_image(row)),
+        None => json_error(StatusCode::BAD_REQUEST, "row must be full or box"),
+    }
+}
+
+#[derive(Deserialize)]
+struct ThumbQuery {
+    link: Option<String>,
+}
+
+/// `GET /api/background/thumb[?link=…]`: the YouTube thumbnail, fetched by
+/// the engine (the admin page loads nothing from outside).
+async fn background_thumb(
+    AxState(st): AxState<State>,
+    axum::extract::Query(q): axum::extract::Query<ThumbQuery>,
+) -> Response {
+    let c = st.controls.clone();
+    let link = q.link.filter(|l| !l.trim().is_empty());
+    let job = tokio::task::spawn_blocking(move || c.youtube_thumb(link));
+    match tokio::time::timeout(THUMB_TIMEOUT, job).await {
+        Ok(Ok(Ok(jpg))) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "max-age=3600"),
+            ],
+            jpg.as_ref().clone(),
+        )
+            .into_response(),
+        Ok(Ok(Err(e))) => json_error(StatusCode::NOT_FOUND, &format!("{e:#}")),
+        Ok(Err(e)) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(_) => json_error(StatusCode::GATEWAY_TIMEOUT, "thumbnail fetch timed out"),
+    }
+}
+
+/// What a background page may load: inline styles, its own image and the
+/// YouTube embed; nothing else (no scripts of ours, no other sites).
+const BG_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; \
+                      frame-src https://www.youtube-nocookie.com";
+
+/// `GET /bg/<id>/current.html` (id checked by the guard; no token).
+async fn bg_page(AxState(st): AxState<State>) -> Response {
+    match st.controls.background_page() {
+        Some(html) => (
+            [
+                (header::CACHE_CONTROL, "no-store"),
+                (header::CONTENT_SECURITY_POLICY, BG_CSP),
+                (header::REFERRER_POLICY, "strict-origin-when-cross-origin"),
+            ],
+            Html(html),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no background page").into_response(),
+    }
+}
+
+/// `GET /bg/<id>/image`: the full-frame picture (id checked by the guard).
+async fn bg_image(AxState(st): AxState<State>) -> Response {
+    image_response(st.controls.background_image(ImageRow::Full))
+}
+
 async fn ws(AxState(st): AxState<State>, up: WebSocketUpgrade) -> Response {
     up.on_upgrade(move |socket| handle_ws(st, socket))
 }
@@ -749,6 +923,13 @@ mod tests {
             pub crop_saves: Mutex<Vec<bool>>,
             pub events: Mutex<Vec<InputEvent>>,
             pub snap: Mutex<Option<Vec<u8>>>,
+            pub background: Mutex<Option<BackgroundDto>>,
+            /// (row, byte count) of every image upload that reached the app.
+            pub uploads: Mutex<Vec<(ImageRow, usize)>>,
+            pub page: Mutex<Option<String>>,
+            pub full_image: Mutex<Option<Vec<u8>>>,
+            /// The `link` of every thumbnail request.
+            pub thumbs: Mutex<Vec<Option<String>>>,
         }
 
         fn gpu(name: &str, kind: &str) -> GpuInfo {
@@ -838,6 +1019,35 @@ mod tests {
             fn set_crop(&self, c: CropDto, save: bool) {
                 *self.crop.lock().unwrap() = c;
                 self.crop_saves.lock().unwrap().push(save);
+            }
+            fn background(&self) -> BackgroundDto {
+                self.background.lock().unwrap().clone().unwrap_or_default()
+            }
+            fn set_background(&self, b: BackgroundDto) -> anyhow::Result<()> {
+                if b.full == "youtube" {
+                    let link = b.full_youtube.clone().unwrap_or_default();
+                    anyhow::ensure!(link.contains("watch?v="), "not a YouTube video link");
+                }
+                *self.background.lock().unwrap() = Some(b);
+                Ok(())
+            }
+            fn set_background_image(&self, row: ImageRow, bytes: Vec<u8>) -> anyhow::Result<()> {
+                self.uploads.lock().unwrap().push((row, bytes.len()));
+                Ok(())
+            }
+            fn background_page(&self) -> Option<String> {
+                self.page.lock().unwrap().clone()
+            }
+            fn background_image(&self, row: ImageRow) -> Option<(Arc<Vec<u8>>, &'static str)> {
+                (row == ImageRow::Full)
+                    .then(|| self.full_image.lock().unwrap().clone())
+                    .flatten()
+                    .map(|b| (Arc::new(b), "image/jpeg"))
+            }
+            fn youtube_thumb(&self, link: Option<String>) -> anyhow::Result<Arc<Vec<u8>>> {
+                self.thumbs.lock().unwrap().push(link.clone());
+                anyhow::ensure!(link.as_deref() != Some("slow"), "never");
+                Ok(Arc::new(vec![0xff, 0xd8, 0xff, 0xd9]))
             }
         }
     }
@@ -1787,5 +1997,334 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The router and its per-launch background id.
+    fn app_with_id(fake: Arc<Fake>) -> (axum::Router, String) {
+        let st = State::new(fake, TOKEN.into(), PORT, 1920, 1080);
+        let id = st.bg_id.to_string();
+        (router(st), id)
+    }
+
+    #[tokio::test]
+    async fn bg_route_needs_id_and_host() {
+        let fake = Arc::new(Fake::default());
+        *fake.page.lock().unwrap() = Some("<!doctype html><p>bg</p>".into());
+        *fake.full_image.lock().unwrap() = Some(vec![0xff, 0xd8, 0xff, 0xd9]);
+        let (a, id) = app_with_id(fake.clone());
+        assert_eq!(id.len(), 32);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+        // Right id and host, no token: served, never cached, locked down.
+        let r = a
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/bg/{id}/current.html"),
+                "127.0.0.1:8765",
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()["cache-control"], "no-store");
+        let csp = r.headers()["content-security-policy"].to_str().unwrap();
+        assert!(csp.contains("default-src 'none'"), "{csp}");
+        assert!(
+            csp.contains("frame-src https://www.youtube-nocookie.com"),
+            "{csp}"
+        );
+        assert!(body_string(r).await.contains("<p>bg</p>"));
+        let r = a
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/bg/{id}/image?v=3"),
+                "localhost:8765",
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()["content-type"], "image/jpeg");
+        // Wrong id or foreign host: nothing.
+        let wrong = "0".repeat(32);
+        for (uri, host, want) in [
+            (
+                format!("/bg/{wrong}/current.html"),
+                "127.0.0.1:8765",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                format!("/bg/{wrong}/image"),
+                "127.0.0.1:8765",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/bg//current.html".to_string(),
+                "127.0.0.1:8765",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                format!("/bg/{id}/other"),
+                "127.0.0.1:8765",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                format!("/bg/{id}/current.html"),
+                "evil.test:8765",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                format!("/bg/{id}/image"),
+                "127.0.0.1:9999",
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let r = a
+                .clone()
+                .oneshot(req("GET", &uri, host, None, None))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), want, "{uri} {host}");
+        }
+        // The id opens only the background, never the API.
+        for uri in [
+            format!("/bg/{id}/../api/state"),
+            format!("/api/state?bg={id}"),
+        ] {
+            let r = a
+                .clone()
+                .oneshot(req("GET", &uri, "127.0.0.1:8765", None, None))
+                .await
+                .unwrap();
+            assert_ne!(r.status(), StatusCode::OK, "{uri}");
+        }
+        // No background page right now: 404.
+        *fake.page.lock().unwrap() = None;
+        let r = a
+            .oneshot(req(
+                "GET",
+                &format!("/bg/{id}/current.html"),
+                "127.0.0.1:8765",
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn upload(uri: &str, body: Vec<u8>) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("host", "127.0.0.1:8765")
+            .header("x-p2c-token", TOKEN)
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn image_upload_limits() {
+        let fake = Arc::new(Fake::default());
+        let png = |n: usize| {
+            let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+            v.resize(n, 0);
+            v
+        };
+        // 25 MB: 413, never reaches the app.
+        let r = app(fake.clone())
+            .oneshot(upload(
+                "/api/background/image?row=full",
+                png(25 * 1024 * 1024),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // HTML (named .png by the browser or not): 415.
+        let r = app(fake.clone())
+            .oneshot(upload(
+                "/api/background/image?row=box",
+                b"<!doctype html><script>alert(1)</script>".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(body_string(r).await.contains("\"error\""));
+        assert!(fake.uploads.lock().unwrap().is_empty());
+        // A 3 MB PNG (over the 2 MB limit of other routes) gets through.
+        let r = app(fake.clone())
+            .oneshot(upload(
+                "/api/background/image?row=box",
+                png(3 * 1024 * 1024),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        // JPEG and WebP too; unknown rows are refused.
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8 ".to_vec();
+        webp.resize(64, 0);
+        for (uri, body, want) in [
+            (
+                "/api/background/image?row=full",
+                vec![0xff, 0xd8, 0xff, 0xe0],
+                StatusCode::OK,
+            ),
+            ("/api/background/image?row=full", webp, StatusCode::OK),
+            (
+                "/api/background/image?row=side",
+                png(64),
+                StatusCode::BAD_REQUEST,
+            ),
+            ("/api/background/image", png(64), StatusCode::BAD_REQUEST),
+        ] {
+            let r = app(fake.clone()).oneshot(upload(uri, body)).await.unwrap();
+            assert_eq!(r.status(), want, "{uri}");
+        }
+        assert_eq!(
+            *fake.uploads.lock().unwrap(),
+            vec![
+                (ImageRow::Box, 3 * 1024 * 1024),
+                (ImageRow::Full, 4),
+                (ImageRow::Full, 64)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn background_route_round_trip() {
+        let fake = Arc::new(Fake::default());
+        let body =
+            r##"{"full":"colour","full_colour":"#112233","in_box":"blur","refined_edges":true}"##;
+        assert_eq!(
+            post(fake.clone(), "/api/background", body).await,
+            StatusCode::OK
+        );
+        let r = app(fake.clone())
+            .oneshot(req(
+                "GET",
+                "/api/background",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                None,
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["full"], "colour");
+        assert_eq!(v["full_colour"], "#112233");
+        assert_eq!(v["in_box"], "blur");
+        assert_eq!(v["refined_edges"], true);
+        // A bad link: 400 with the message, nothing changed.
+        let r = app(fake.clone())
+            .oneshot(req(
+                "POST",
+                "/api/background",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                Some(r#"{"full":"youtube","full_youtube":"hello","in_box":"room"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(r).await.contains("not a YouTube video link"));
+        assert_eq!(fake.background().full, "colour");
+        // Status carries the background fields.
+        let r = app(fake.clone())
+            .oneshot(req(
+                "GET",
+                "/api/state",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                None,
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        for k in [
+            "background",
+            "box_background",
+            "refined_edges",
+            "background_note",
+        ] {
+            assert!(v["status"].get(k).is_some(), "missing {k}");
+        }
+    }
+
+    #[tokio::test]
+    async fn thumb_route_serves_the_engine_fetched_jpeg() {
+        let fake = Arc::new(Fake::default());
+        let r = app(fake.clone())
+            .oneshot(req(
+                "GET",
+                "/api/background/thumb?link=https%3A%2F%2Fyoutu.be%2FdQw4w9WgXcQ",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()["content-type"], "image/jpeg");
+        let r = app(fake.clone())
+            .oneshot(req(
+                "GET",
+                "/api/background/thumb",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            *fake.thumbs.lock().unwrap(),
+            vec![Some("https://youtu.be/dQw4w9WgXcQ".to_string()), None]
+        );
+        let r = app(fake.clone())
+            .oneshot(req(
+                "GET",
+                "/api/background/thumb?link=slow",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn background_routes_require_token_and_host() {
+        let fake = Arc::new(Fake::default());
+        for (method, uri, body) in [
+            ("GET", "/api/background", None),
+            (
+                "POST",
+                "/api/background",
+                Some(r#"{"full":"page","in_box":"room"}"#),
+            ),
+            ("POST", "/api/background/image?row=full", Some("x")),
+            ("GET", "/api/background/image?row=full", None),
+            ("GET", "/api/background/thumb", None),
+        ] {
+            for (host, token) in [
+                ("127.0.0.1:8765", None),
+                ("127.0.0.1:8765", Some("wrong")),
+                ("evil.test:8765", Some(TOKEN)),
+            ] {
+                let r = app(fake.clone())
+                    .oneshot(req(method, uri, host, token, body))
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), StatusCode::FORBIDDEN, "{method} {uri} {host}");
+            }
+        }
+        assert!(fake.background.lock().unwrap().is_none());
+        assert!(fake.uploads.lock().unwrap().is_empty());
+        assert!(fake.thumbs.lock().unwrap().is_empty());
     }
 }

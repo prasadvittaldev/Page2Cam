@@ -1,13 +1,15 @@
 //! The running app as seen by the admin page.
 use std::sync::{Arc, OnceLock};
 
+use anyhow::Context;
+
 use p2c_admin::{
-    AudioSettings, Controls, GpuInfo, InputEvent, KeyAction, MouseBtn, NavAction, Status,
-    StreamRequest,
+    AudioSettings, BackgroundDto, Controls, GpuInfo, ImageRow, InputEvent, KeyAction, MouseBtn,
+    NavAction, Status, StreamRequest,
 };
 use p2c_audio::{MicCapture, MixSettings, Mixer};
 use p2c_browser::{BrowserHandle, KeyInput, KeyKind, MouseButton};
-use p2c_compositor::{Backdrop, PipLayout};
+use p2c_compositor::{Backdrop, OverlayStyle, PipLayout};
 use p2c_core::{AudioRing, FrameSlot};
 use p2c_segment::{EngineChoice, Segmenter};
 use p2c_stream::{StreamConfig, StreamController, StreamState};
@@ -19,11 +21,18 @@ const KEYRING_USER: &str = "stream-key";
 pub struct App {
     pub browser: OnceLock<BrowserHandle>,
     pub layout: Arc<RwLock<PipLayout>>,
-    /// Backgrounds and edge quality, read by the ticker every tick (default
-    /// until the settings and admin page drive it). The fallback note is in
-    /// `ticker_stats.compose_note()`.
-    #[allow(dead_code, reason = "set from the settings and admin API in Task 5")]
+    /// Backgrounds and edge quality, read by the ticker every tick (kept in
+    /// step with `bg`). The fallback note is in `ticker_stats.compose_note()`.
     pub backdrop: Arc<RwLock<Backdrop>>,
+    /// The operator's background choices (full frame, in box, pictures,
+    /// the page to restore).
+    pub bg: Mutex<crate::background::BgState>,
+    /// `http://127.0.0.1:<port>/bg/<id>/` once the admin server is up.
+    pub bg_base: OnceLock<String>,
+    /// Where uploaded pictures are kept (`<data dir>/backgrounds/`).
+    pub data_dir: Option<std::path::PathBuf>,
+    /// YouTube thumbnails for the admin page.
+    pub thumbs: crate::background::ThumbCache,
     /// Webcam crop, read by the capture thread for every frame.
     pub crop: p2c_core::SharedCrop,
     pub stream: StreamController,
@@ -179,7 +188,7 @@ impl App {
         let Some(seg) = &self.segmenter else {
             return "no webcam".into();
         };
-        if !self.layout.read().style.is_cutout() {
+        if !self.mask_in_use(false) {
             return "off (Box style)".into();
         }
         let st = seg.status();
@@ -200,7 +209,7 @@ impl App {
         let Some(seg) = &self.segmenter else {
             return String::new();
         };
-        if !self.layout.read().style.is_cutout() {
+        if !self.mask_in_use(false) {
             return String::new();
         }
         let st = seg.status();
@@ -212,7 +221,7 @@ impl App {
     /// Changes under 20 ms are ignored to avoid churn.
     pub fn update_mic_delay(&self) {
         let latest = match &self.segmenter {
-            Some(seg) if self.layout.read().style.is_cutout() => {
+            Some(seg) if self.mask_in_use(false) => {
                 let st = seg.status();
                 st.active.map(|_| st.latency_ms)
             }
@@ -257,7 +266,7 @@ impl App {
     pub fn health(&self) -> p2c_admin::Health {
         use crate::health::{cutout_auto_fallback, video_fallback, webcam_state};
         let l = *self.layout.read();
-        let in_use = l.visible && l.style.is_cutout();
+        let in_use = l.visible && self.backdrop.read().needs_mask(&l);
         let auto_fast = self.segmenter.as_ref().is_some_and(|s| {
             let st = s.status();
             cutout_auto_fallback(in_use, st.requested, st.active)
@@ -321,11 +330,266 @@ impl App {
     }
 }
 
+/// Note shown when a full-frame background switched the style to a cut-out.
+const NOTE_TO_CUTOUT: &str =
+    "Style set to full-height cut-out: a full-frame background needs the person cut out";
+/// Note shown when choosing Box put the full frame back to the page.
+const NOTE_TO_PAGE: &str = "Full-frame background set back to Page: the Box style shows the page";
+
+/// One change of the background choices (see [`App::apply_background`]).
+struct BgChange {
+    full: crate::background::FullBg,
+    in_box: crate::background::BoxBg,
+    refined: bool,
+    /// The operator asked for this page (admin navigation).
+    page_url: Option<String>,
+    /// Reload the generated page even if the choice is the same (new picture).
+    reload: bool,
+    /// Extra settings to write with the change.
+    extra: Vec<(&'static str, toml_edit::Value)>,
+}
+
+impl App {
+    /// Load `url` in Chromium (or remember it until the browser exists).
+    fn load_url(&self, url: &str) {
+        *self.fallback_url.lock() = url.to_string();
+        self.with_browser(|b| b.navigate(url));
+    }
+
+    /// The URL Chromium shows.
+    fn shown_url(&self) -> String {
+        self.browser
+            .get()
+            .map(|b| b.current_url())
+            .unwrap_or_else(|| lock(&self.fallback_url, "fallback_url").clone())
+    }
+
+    fn save_values(&self, values: &[(&str, toml_edit::Value)]) {
+        let Some(p) = &self.settings_path else { return };
+        if values.is_empty() {
+            return;
+        }
+        match crate::config::save_values(p, values) {
+            Ok(()) => tracing::info!(file = %p.display(), "background settings saved"),
+            Err(e) => tracing::warn!("could not save the background settings: {e:#}"),
+        }
+    }
+
+    /// Copy the choices to the compositor and run the cut-out when they need it.
+    fn sync_backdrop(&self) {
+        let b = self.bg.lock().backdrop();
+        *self.backdrop.write() = b;
+        self.update_segmenter();
+    }
+
+    /// The cut-out runs while the overlay or a backdrop needs the mask.
+    fn update_segmenter(&self) {
+        if let Some(seg) = &self.segmenter {
+            seg.set_enabled(self.mask_in_use(true));
+        }
+    }
+
+    /// Whether drawing needs the person mask (`visible`: only if the
+    /// overlay is shown).
+    fn mask_in_use(&self, visible: bool) -> bool {
+        let l = *self.layout.read();
+        (!visible || l.visible) && self.backdrop.read().needs_mask(&l)
+    }
+
+    /// The generated page's URL (`None` before the admin server is up).
+    fn bg_page_url(&self, version: u64) -> Option<String> {
+        self.bg_base
+            .get()
+            .map(|b| format!("{b}current.html?v={version}"))
+    }
+
+    /// The admin server is up: generated pages live under `base`. Returns
+    /// the URL Chromium should start on when a saved background is a
+    /// generated page (and loads it if the browser already exists).
+    pub fn start_background(&self, base: String) -> Option<String> {
+        let _ = self.bg_base.set(base);
+        let url = {
+            let s = self.bg.lock();
+            s.full
+                .is_generated()
+                .then(|| self.bg_page_url(s.version))
+                .flatten()
+        };
+        if let Some(u) = &url {
+            self.load_url(u);
+        }
+        self.sync_backdrop();
+        url
+    }
+
+    /// Apply a background change: remember the user's page, navigate
+    /// Chromium, apply the interplay rule (a full-frame background needs a
+    /// cut-out style), update the compositor and save everything.
+    fn apply_background(&self, c: BgChange) {
+        use crate::background::{is_user_page_url, FullBg};
+        let shown = self.shown_url();
+        let style = self.layout.read().style;
+        let to_cutout = c.full != FullBg::Page && style == OverlayStyle::Box;
+        let mut saves = c.extra;
+        let nav = {
+            let mut s = self.bg.lock();
+            let old_last = s.last_page_url.clone();
+            // Chromium shows the user's page unless a generated one is up
+            // (and a `/bg/` URL is never the user's page).
+            if !s.full.is_generated() && is_user_page_url(&shown) {
+                s.last_page_url = shown.clone();
+            }
+            if let Some(u) = c.page_url.filter(|u| is_user_page_url(u)) {
+                s.last_page_url = u;
+            }
+            // Chromium is on one of our pages (e.g. its navigation away
+            // from it hasn't finished): never leave it there for Page.
+            let shown_is_bg = !is_user_page_url(&shown) && shown.contains("/bg/");
+            let was_generated = s.full.is_generated();
+            let full_changed = s.full != c.full;
+            s.full = c.full;
+            s.in_box = c.in_box;
+            s.refined = c.refined;
+            match &s.full {
+                FullBg::Colour(col) => s.full_colour = col.clone(),
+                FullBg::YouTube(id) => s.youtube = id.clone(),
+                _ => {}
+            }
+            if let crate::background::BoxBg::Colour(col) = &s.in_box {
+                s.box_colour = col.clone();
+            }
+            if to_cutout {
+                s.note = Some((NOTE_TO_CUTOUT.into(), std::time::Instant::now()));
+            }
+            saves.push(("background", s.full.as_str().into()));
+            saves.push(("box_background", s.in_box.as_str().into()));
+            saves.push(("refined_edges", s.refined.into()));
+            match &s.full {
+                FullBg::Colour(col) => saves.push(("background_colour", col.as_str().into())),
+                FullBg::YouTube(id) => saves.push(("background_youtube", id.as_str().into())),
+                _ => {}
+            }
+            if let crate::background::BoxBg::Colour(col) = &s.in_box {
+                saves.push(("box_background_colour", col.as_str().into()));
+            }
+            if s.last_page_url != old_last {
+                saves.push(("last_page_url", s.last_page_url.as_str().into()));
+            }
+            if s.full.is_generated() {
+                if full_changed || c.reload {
+                    s.version += 1;
+                    self.bg_page_url(s.version)
+                } else {
+                    None
+                }
+            } else if was_generated || shown_is_bg {
+                Some(if s.last_page_url.is_empty() {
+                    "about:blank".to_string()
+                } else {
+                    s.last_page_url.clone()
+                })
+            } else {
+                None
+            }
+        };
+        if to_cutout {
+            let mut l = self.layout.write();
+            l.style = OverlayStyle::CutoutFull;
+            drop(l);
+            tracing::info!("full-frame background chosen in Box style: style set to cutout-full");
+            saves.push(("overlay_style", OverlayStyle::CutoutFull.as_str().into()));
+        }
+        if let Some(u) = nav {
+            tracing::info!(url = %u, "background page");
+            self.load_url(&u);
+        }
+        self.sync_backdrop();
+        self.save_values(&saves);
+    }
+
+    /// The current choices with one part changed.
+    fn change(&self) -> BgChange {
+        let s = self.bg.lock();
+        BgChange {
+            full: s.full.clone(),
+            in_box: s.in_box.clone(),
+            refined: s.refined,
+            page_url: None,
+            reload: false,
+            extra: Vec::new(),
+        }
+    }
+
+    /// The text under the Background section: a recent automatic change,
+    /// else why the output doesn't show the choice.
+    fn background_note(&self) -> String {
+        if let Some(n) = self.bg.lock().recent_note() {
+            return n.to_string();
+        }
+        self.ticker_stats.compose_note().as_str().to_string()
+    }
+
+    /// Parse the admin page's choices (nothing is changed on an error).
+    fn parse_background(&self, d: &BackgroundDto) -> anyhow::Result<BgChange> {
+        use crate::background::{normalize_colour, youtube_id, BoxBg, FullBg};
+        let s = self.bg.lock();
+        let colour = |given: &Option<String>, last: &str| {
+            normalize_colour(given.as_deref().unwrap_or(last)).map_err(anyhow::Error::msg)
+        };
+        let full = match d.full.as_str() {
+            "page" => FullBg::Page,
+            "image" => {
+                anyhow::ensure!(s.full_image.is_some(), "upload a full-frame image first");
+                FullBg::Image
+            }
+            "colour" => FullBg::Colour(colour(&d.full_colour, &s.full_colour)?),
+            "youtube" => FullBg::YouTube(
+                youtube_id(d.full_youtube.as_deref().unwrap_or(&s.youtube))
+                    .map_err(anyhow::Error::msg)?,
+            ),
+            "blurred-room" => FullBg::BlurredRoom,
+            other => anyhow::bail!(
+                "unknown full-frame background {other:?} (page, image, colour, youtube or blurred-room)"
+            ),
+        };
+        let in_box = match d.in_box.as_str() {
+            "room" => BoxBg::Room,
+            "blur" => BoxBg::Blur,
+            "image" => {
+                anyhow::ensure!(s.box_image.is_some(), "upload an in-box image first");
+                BoxBg::Image
+            }
+            "colour" => BoxBg::Colour(colour(&d.box_colour, &s.box_colour)?),
+            other => {
+                anyhow::bail!("unknown in-box background {other:?} (room, blur, image or colour)")
+            }
+        };
+        Ok(BgChange {
+            full,
+            in_box,
+            refined: d.refined_edges,
+            page_url: None,
+            reload: false,
+            extra: Vec::new(),
+        })
+    }
+}
+
 impl Controls for App {
     fn navigate(&self, url: &str) {
         tracing::info!(url, "navigate");
-        *self.fallback_url.lock() = url.to_string();
-        self.with_browser(|b| b.navigate(url));
+        if self.bg.lock().full.is_generated() {
+            // The operator wants a page: the full frame goes back to Page.
+            let mut c = self.change();
+            c.full = crate::background::FullBg::Page;
+            c.page_url = Some(url.to_string());
+            self.apply_background(c);
+            if !crate::background::is_user_page_url(url) {
+                self.load_url(url);
+            }
+            return;
+        }
+        self.load_url(url);
     }
 
     fn nav(&self, a: NavAction) {
@@ -383,9 +647,15 @@ impl Controls for App {
             tracing::info!(style = l.style.as_str(), "overlay style");
             self.save_choice("overlay_style", l.style.as_str());
         }
-        if let Some(seg) = &self.segmenter {
-            seg.set_enabled(l.visible && l.style.is_cutout());
+        // Box chosen while a full-frame background shows: back to the page.
+        if l.style == OverlayStyle::Box && self.bg.lock().full != crate::background::FullBg::Page {
+            tracing::info!("Box style chosen: full-frame background set back to Page");
+            let mut c = self.change();
+            c.full = crate::background::FullBg::Page;
+            self.apply_background(c);
+            self.bg.lock().note = Some((NOTE_TO_PAGE.into(), std::time::Instant::now()));
         }
+        self.update_segmenter();
     }
 
     fn start_stream(&self, req: StreamRequest) -> anyhow::Result<()> {
@@ -443,11 +713,7 @@ impl Controls for App {
     }
 
     fn status(&self) -> Status {
-        let url = self
-            .browser
-            .get()
-            .map(|b| b.current_url())
-            .unwrap_or_else(|| lock(&self.fallback_url, "fallback_url").clone());
+        let url = self.shown_url();
         let webcam_aspect = self
             .webcam_slot
             .as_ref()
@@ -476,6 +742,25 @@ impl Controls for App {
         let update = self.updater.info();
         let has_saved_key = Self::saved_key().is_some();
         let health = self.health();
+        // While a generated background shows, the admin page keeps the
+        // user's page URL (never a /bg/ URL).
+        let (background, box_background, refined_edges, url) = {
+            let s = lock(&self.bg, "bg");
+            let url = if s.full.is_generated()
+                || !crate::background::is_user_page_url(&url) && url.contains("/bg/")
+            {
+                s.last_page_url.clone()
+            } else {
+                url
+            };
+            (
+                s.full.as_str().to_string(),
+                s.in_box.as_str().to_string(),
+                s.refined,
+                url,
+            )
+        };
+        let background_note = self.background_note();
         Status {
             url,
             width: self.width,
@@ -501,6 +786,10 @@ impl Controls for App {
             gpu_running: self.gpu_running.clone(),
             health,
             agents_allowed: p2c_admin::TrayLink::global().and_then(|l| l.allowed()),
+            background,
+            box_background,
+            refined_edges,
+            background_note,
         }
     }
 
@@ -587,6 +876,114 @@ impl Controls for App {
                 None
             }
         }
+    }
+
+    fn background(&self) -> BackgroundDto {
+        let s = self.bg.lock();
+        BackgroundDto {
+            full: s.full.as_str().into(),
+            full_colour: Some(s.full_colour.clone()),
+            full_youtube: (!s.youtube.is_empty()).then(|| s.youtube.clone()),
+            in_box: s.in_box.as_str().into(),
+            box_colour: Some(s.box_colour.clone()),
+            refined_edges: s.refined,
+            full_image: s.full_image.is_some(),
+            box_image: s.box_image.is_some(),
+        }
+    }
+
+    fn set_background(&self, b: BackgroundDto) -> anyhow::Result<()> {
+        let change = self.parse_background(&b)?;
+        tracing::info!(
+            full = change.full.as_str(),
+            in_box = change.in_box.as_str(),
+            refined = change.refined,
+            "background chosen"
+        );
+        self.apply_background(change);
+        Ok(())
+    }
+
+    fn set_background_image(&self, row: ImageRow, bytes: Vec<u8>) -> anyhow::Result<()> {
+        use crate::background::{content_type, prepare_image, BoxBg, FullBg, StoredImage};
+        let p = prepare_image(&bytes)?;
+        tracing::info!(
+            row = row.as_str(),
+            w = p.width,
+            h = p.height,
+            "background image uploaded"
+        );
+        let path = match &self.data_dir {
+            Some(d) => {
+                let dir = d.join("backgrounds");
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("creating {}", dir.display()))?;
+                let path = dir.join(format!("{}.{}", row.as_str(), p.ext));
+                std::fs::write(&path, &p.encoded)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                // One picture per row: drop the other format's file.
+                for ext in ["png", "jpg"].iter().filter(|e| **e != p.ext) {
+                    let _ = std::fs::remove_file(dir.join(format!("{}.{ext}", row.as_str())));
+                }
+                Some(path)
+            }
+            None => {
+                tracing::warn!("no data folder: the picture is kept until Page2Cam closes");
+                None
+            }
+        };
+        let img = StoredImage {
+            bytes: Arc::new(p.encoded),
+            content_type: content_type(p.ext),
+            frame: Arc::new(p.frame),
+        };
+        let mut c = self.change();
+        let key = match row {
+            ImageRow::Full => {
+                self.bg.lock().full_image = Some(img);
+                c.full = FullBg::Image;
+                c.reload = true;
+                "background_image"
+            }
+            ImageRow::Box => {
+                self.bg.lock().box_image = Some(img);
+                c.in_box = BoxBg::Image;
+                "box_background_image"
+            }
+        };
+        if let Some(p) = &path {
+            c.extra.push((key, p.display().to_string().into()));
+        }
+        self.apply_background(c);
+        Ok(())
+    }
+
+    fn background_page(&self) -> Option<String> {
+        let s = self.bg.lock();
+        s.full.is_generated().then(|| {
+            crate::background::background_html(&s.full, Some(&format!("image?v={}", s.version)))
+        })
+    }
+
+    fn background_image(&self, row: ImageRow) -> Option<(Arc<Vec<u8>>, &'static str)> {
+        let s = self.bg.lock();
+        let img = match row {
+            ImageRow::Full => s.full_image.as_ref(),
+            ImageRow::Box => s.box_image.as_ref(),
+        }?;
+        Some((img.bytes.clone(), img.content_type))
+    }
+
+    fn youtube_thumb(&self, link: Option<String>) -> anyhow::Result<Arc<Vec<u8>>> {
+        let id = match link {
+            Some(l) => crate::background::youtube_id(&l).map_err(anyhow::Error::msg)?,
+            None => {
+                let id = self.bg.lock().youtube.clone();
+                anyhow::ensure!(!id.is_empty(), "no YouTube video chosen");
+                id
+            }
+        };
+        self.thumbs.get(&id)
     }
 }
 
@@ -733,6 +1130,7 @@ pub fn display_video(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p2c_compositor::{BoxBackdrop, FullBackdrop};
 
     #[test]
     fn set_crop_saves_only_when_asked() {
@@ -927,6 +1325,18 @@ mod tests {
             browser: OnceLock::new(),
             layout: Arc::new(RwLock::new(PipLayout::default())),
             backdrop: Arc::default(),
+            bg: Mutex::new(
+                crate::background::BgState::from_config(
+                    &crate::config::Config::default(),
+                    "about:blank".into(),
+                )
+                .0,
+            ),
+            bg_base: OnceLock::new(),
+            data_dir: None,
+            thumbs: crate::background::ThumbCache::new(Box::new(|_| {
+                anyhow::bail!("no network in tests")
+            })),
             crop: Arc::new(RwLock::new(p2c_core::Crop::FULL)),
             stream: StreamController::new(mixer.clone()),
             mixer,
@@ -1058,6 +1468,272 @@ mod tests {
         // No cut-out: only the output pipeline delays the video.
         assert_eq!(mic_delay(&[], 66), 66);
         assert_eq!(mic_delay(&[], 0), 0);
+    }
+
+    const BG_BASE: &str = "http://127.0.0.1:8765/bg/0123456789abcdef0123456789abcdef/";
+
+    /// A bare app with a settings file, data folder and background pages.
+    fn bg_app(dir: &std::path::Path) -> App {
+        let mut app = bare_app();
+        std::fs::write(dir.join("page2cam.toml"), "# keep me\n").unwrap();
+        app.settings_path = Some(dir.join("page2cam.toml"));
+        app.data_dir = Some(dir.to_path_buf());
+        app.start_background(BG_BASE.into());
+        app
+    }
+
+    fn bg(full: &str, in_box: &str) -> BackgroundDto {
+        BackgroundDto {
+            full: full.into(),
+            in_box: in_box.into(),
+            ..BackgroundDto::default()
+        }
+    }
+
+    fn settings(dir: &std::path::Path) -> crate::config::Config {
+        let text = std::fs::read_to_string(dir.join("page2cam.toml")).unwrap();
+        assert!(text.contains("# keep me"), "{text}");
+        toml::from_str(&text).unwrap()
+    }
+
+    fn shown(app: &App) -> String {
+        app.fallback_url.lock().clone()
+    }
+
+    #[test]
+    fn last_page_url_never_becomes_a_background_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bg_app(dir.path());
+        app.navigate("https://user.test/a");
+        assert_eq!(shown(&app), "https://user.test/a");
+        let youtube = BackgroundDto {
+            full_youtube: Some("https://youtu.be/dQw4w9WgXcQ?t=3".into()),
+            ..bg("youtube", "room")
+        };
+        let colour = BackgroundDto {
+            full_colour: Some("#112233".into()),
+            ..bg("colour", "room")
+        };
+        // Switching quickly between backgrounds: Chromium shows the
+        // generated page; the admin page keeps the user's URL.
+        app.set_background(youtube.clone()).unwrap();
+        assert!(
+            shown(&app).starts_with(&format!("{BG_BASE}current.html")),
+            "{}",
+            shown(&app)
+        );
+        assert_eq!(app.status().url, "https://user.test/a");
+        app.set_background(colour.clone()).unwrap();
+        assert!(shown(&app).starts_with(BG_BASE));
+        app.set_background(youtube.clone()).unwrap();
+        // Blurred room: the page is not drawn, but the video must stop.
+        app.set_background(bg("blurred-room", "room")).unwrap();
+        assert_eq!(shown(&app), "https://user.test/a");
+        app.set_background(colour).unwrap();
+        // Back to Page: the user's page again.
+        app.set_background(bg("page", "room")).unwrap();
+        assert_eq!(shown(&app), "https://user.test/a");
+        assert_eq!(app.bg.lock().last_page_url, "https://user.test/a");
+        assert_eq!(settings(dir.path()).last_page_url, "https://user.test/a");
+        // The page moved on by itself (link click): remembered on leaving.
+        *app.fallback_url.lock() = "https://user.test/b".into();
+        app.set_background(youtube.clone()).unwrap();
+        app.set_background(bg("page", "room")).unwrap();
+        assert_eq!(shown(&app), "https://user.test/b");
+        assert_eq!(settings(dir.path()).last_page_url, "https://user.test/b");
+        // Navigating from the admin page while a background shows: the page
+        // comes back with the new URL.
+        app.set_background(youtube).unwrap();
+        app.navigate("https://user.test/c");
+        assert_eq!(shown(&app), "https://user.test/c");
+        assert_eq!(app.background().full, "page");
+        let c = settings(dir.path());
+        assert_eq!(
+            (c.last_page_url.as_str(), c.background.as_str()),
+            ("https://user.test/c", "page")
+        );
+        // Non-page URLs are never remembered.
+        app.navigate("about:blank");
+        app.set_background(bg("blurred-room", "room")).unwrap();
+        app.set_background(bg("page", "room")).unwrap();
+        assert_eq!(app.bg.lock().last_page_url, "https://user.test/c");
+        let text = std::fs::read_to_string(dir.path().join("page2cam.toml")).unwrap();
+        assert!(!text.contains("/bg/"), "{text}");
+    }
+
+    #[test]
+    fn box_switch_resets_full_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bg_app(dir.path());
+        app.navigate("https://user.test/a");
+        let colour = BackgroundDto {
+            full_colour: Some("#112233".into()),
+            ..bg("colour", "blur")
+        };
+        app.set_background(colour).unwrap();
+        assert_eq!(app.pip().style, OverlayStyle::CutoutFull);
+        // The operator picks Box again: the full frame goes back to the page.
+        app.set_pip(PipLayout {
+            style: OverlayStyle::Box,
+            ..app.pip()
+        });
+        assert_eq!(app.pip().style, OverlayStyle::Box);
+        let b = app.background();
+        assert_eq!((b.full.as_str(), b.in_box.as_str()), ("page", "blur"));
+        assert_eq!(shown(&app), "https://user.test/a");
+        assert_eq!(app.backdrop.read().full, FullBackdrop::Page);
+        assert_eq!(app.backdrop.read().in_box, BoxBackdrop::Blur);
+        let note = app.status().background_note;
+        assert!(note.contains("Page"), "{note}");
+        let c = settings(dir.path());
+        assert_eq!(
+            (c.background.as_str(), c.overlay_style.as_str()),
+            ("page", "box")
+        );
+        assert_eq!(c.box_background, "blur");
+    }
+
+    #[test]
+    fn full_background_in_box_switches_to_cutout_full_and_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bg_app(dir.path());
+        assert_eq!(app.pip().style, OverlayStyle::Box);
+        app.set_background(BackgroundDto {
+            refined_edges: true,
+            ..bg("blurred-room", "room")
+        })
+        .unwrap();
+        assert_eq!(app.pip().style, OverlayStyle::CutoutFull);
+        assert_eq!(app.backdrop.read().full, FullBackdrop::BlurredRoom);
+        assert!(app.backdrop.read().refined_edges);
+        let s = app.status();
+        assert!(
+            s.background_note.contains("cut-out"),
+            "{}",
+            s.background_note
+        );
+        assert_eq!(
+            (
+                s.background.as_str(),
+                s.box_background.as_str(),
+                s.refined_edges
+            ),
+            ("blurred-room", "room", true)
+        );
+        let c = settings(dir.path());
+        assert_eq!(c.overlay_style, "cutout-full");
+        assert_eq!(c.background, "blurred-room");
+        assert!(c.refined_edges);
+        // Already a cut-out style: kept as it is.
+        app.set_pip(PipLayout {
+            style: OverlayStyle::CutoutSmall,
+            ..app.pip()
+        });
+        app.set_background(BackgroundDto {
+            full_colour: Some("#ABCDEF".into()),
+            ..bg("colour", "room")
+        })
+        .unwrap();
+        assert_eq!(app.pip().style, OverlayStyle::CutoutSmall);
+        let c = settings(dir.path());
+        assert_eq!(c.overlay_style, "cutout-small");
+        assert_eq!(
+            (c.background.as_str(), c.background_colour.as_str()),
+            ("colour", "#abcdef")
+        );
+        assert!(app
+            .background_page()
+            .unwrap()
+            .contains("background:#abcdef"));
+        // Errors change nothing.
+        for bad in [
+            BackgroundDto {
+                full_youtube: Some("https://youtube.com/playlist?list=PL1".into()),
+                ..bg("youtube", "room")
+            },
+            BackgroundDto {
+                full_colour: Some("blue".into()),
+                ..bg("colour", "room")
+            },
+            bg("image", "room"),
+            bg("aquarium", "room"),
+            bg("page", "fog"),
+        ] {
+            assert!(app.set_background(bad.clone()).is_err(), "{bad:?}");
+        }
+        assert_eq!(app.background().full, "colour");
+        assert_eq!(app.background().full_colour.as_deref(), Some("#abcdef"));
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(w, h, image::Rgb([200, 10, 20]));
+        let mut out = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn uploaded_images_are_stored_and_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bg_app(dir.path());
+        // In the box: decoded for the compositor, saved re-encoded.
+        app.set_background_image(ImageRow::Box, png(64, 32))
+            .unwrap();
+        assert!(matches!(app.backdrop.read().in_box, BoxBackdrop::Image(ref f) if f.width == 64));
+        let c = settings(dir.path());
+        assert_eq!(c.box_background, "image");
+        let stored = std::path::PathBuf::from(&c.box_background_image);
+        assert_eq!(stored, dir.path().join("backgrounds").join("box.jpg"));
+        assert!(stored.is_file());
+        // Full frame: a page showing /bg/<id>/image, served re-encoded.
+        app.set_background_image(ImageRow::Full, png(64, 32))
+            .unwrap();
+        assert_eq!(app.background().full, "image");
+        assert!(app.background().full_image);
+        let page = app.background_page().unwrap();
+        assert!(page.contains("<img src=\"image?v="), "{page}");
+        let (bytes, kind) = app.background_image(ImageRow::Full).unwrap();
+        assert_eq!(kind, "image/jpeg");
+        assert_eq!(&bytes[..2], &[0xff, 0xd8]);
+        // Not an image: refused, nothing replaced.
+        assert!(app
+            .set_background_image(ImageRow::Full, b"<html>".to_vec())
+            .is_err());
+        assert_eq!(app.background_image(ImageRow::Full).unwrap().0, bytes);
+        // Saved choices come back at the next start.
+        let (st, warn) =
+            crate::background::BgState::from_config(&settings(dir.path()), "https://x.test".into());
+        assert!(warn.is_empty(), "{warn:?}");
+        assert_eq!(st.full, crate::background::FullBg::Image);
+        assert_eq!(st.in_box, crate::background::BoxBg::Image);
+        assert_eq!(st.box_image.unwrap().frame.width, 64);
+    }
+
+    #[test]
+    fn youtube_thumb_uses_the_injected_fetcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bg_app(dir.path());
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let c = calls.clone();
+        app.thumbs = crate::background::ThumbCache::new(Box::new(move |u| {
+            c.lock().push(u.to_string());
+            Ok(vec![0xff, 0xd8, 0xff, 0xd9])
+        }));
+        assert!(app.youtube_thumb(None).is_err()); // no video chosen yet
+        app.youtube_thumb(Some("https://youtu.be/dQw4w9WgXcQ".into()))
+            .unwrap();
+        assert!(app.youtube_thumb(Some("hello".into())).is_err());
+        app.set_background(BackgroundDto {
+            full_youtube: Some("dQw4w9WgXcQ".into()),
+            ..bg("youtube", "room")
+        })
+        .unwrap();
+        app.youtube_thumb(None).unwrap();
+        assert_eq!(
+            *calls.lock(),
+            vec!["https://img.youtube.com/vi/dQw4w9WgXcQ/mqdefault.jpg".to_string()]
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! What the admin UI can ask of the app, and the JSON shapes it uses.
 use p2c_compositor::{OverlayStyle, PipLayout};
+use std::sync::Arc;
+
 use p2c_core::Crop;
 use serde::{Deserialize, Serialize};
 
@@ -219,6 +221,15 @@ pub struct Status {
     pub cutout_gpu: String,
     /// Health over the last ~10 s, for the tray's icon.
     pub health: Health,
+    /// Full-frame background: "page" | "image" | "colour" | "youtube" | "blurred-room".
+    pub background: String,
+    /// In-box background (Box style): "room" | "blur" | "image" | "colour".
+    pub box_background: String,
+    /// Guided-filter cut-out edges are on.
+    pub refined_edges: bool,
+    /// Why the chosen background isn't (fully) showing, or what was changed
+    /// with it (e.g. "cut-out not ready"); "" when all is as chosen.
+    pub background_note: String,
     /// Agents may control Page2Cam (read from the tray). `None` without a tray.
     #[serde(default)]
     pub agents_allowed: Option<bool>,
@@ -268,6 +279,49 @@ pub struct UpdateInfo {
     pub can_install: bool,
 }
 
+/// Background choices as JSON (`GET`/`POST /api/background`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundDto {
+    /// "page" | "image" | "colour" | "youtube" | "blurred-room"
+    pub full: String,
+    /// `#rrggbb` for "colour" (the last one chosen when reading).
+    #[serde(default)]
+    pub full_colour: Option<String>,
+    /// A YouTube video link or id for "youtube" (the last video's id when reading).
+    #[serde(default)]
+    pub full_youtube: Option<String>,
+    /// "room" | "blur" | "image" | "colour"
+    pub in_box: String,
+    /// `#rrggbb` for an in-box "colour".
+    #[serde(default)]
+    pub box_colour: Option<String>,
+    #[serde(default)]
+    pub refined_edges: bool,
+    /// Reading only: a full-frame image has been uploaded.
+    #[serde(default)]
+    pub full_image: bool,
+    /// Reading only: an in-box image has been uploaded.
+    #[serde(default)]
+    pub box_image: bool,
+}
+
+/// Which background picture (`?row=full|box`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageRow {
+    Full,
+    Box,
+}
+
+impl ImageRow {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImageRow::Full => "full",
+            ImageRow::Box => "box",
+        }
+    }
+}
+
 /// The app side of the admin UI. Implementations must be cheap and non-blocking.
 pub trait Controls: Send + Sync + 'static {
     fn navigate(&self, url: &str);
@@ -303,4 +357,20 @@ pub trait Controls: Send + Sync + 'static {
     /// The latest output frame as a 1280x720 JPEG (quality 80), encoded on
     /// demand; `None` before the first frame.
     fn snapshot(&self) -> Option<Vec<u8>>;
+    /// The background choices.
+    fn background(&self) -> BackgroundDto;
+    /// Apply (and save) background choices, with the style interplay rules.
+    /// Errors (bad colour or link, no image uploaded) change nothing. May
+    /// navigate and write the settings file: call it off the async runtime.
+    fn set_background(&self, b: BackgroundDto) -> anyhow::Result<()>;
+    /// Check, scale down and store an uploaded picture for `row`, and show
+    /// it there. Slow (decodes the image): call it off the async runtime.
+    fn set_background_image(&self, row: ImageRow, bytes: Vec<u8>) -> anyhow::Result<()>;
+    /// The generated background page Chromium shows, if one is chosen.
+    fn background_page(&self) -> Option<String>;
+    /// A stored (re-encoded) background picture and its content type.
+    fn background_image(&self, row: ImageRow) -> Option<(Arc<Vec<u8>>, &'static str)>;
+    /// The JPEG thumbnail of `link` (a YouTube link or id), else of the
+    /// chosen video. May block on the first fetch: call it off the runtime.
+    fn youtube_thumb(&self, link: Option<String>) -> anyhow::Result<Arc<Vec<u8>>>;
 }
