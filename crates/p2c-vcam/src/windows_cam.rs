@@ -445,6 +445,15 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A registration attempt pending this long is given up by `re_register`.
+const ABANDON_AFTER: Duration = Duration::from_secs(30);
+
+/// Has the attempt started at `started` been pending too long (Force
+/// restart then abandons it and starts a fresh one)?
+fn pending_is_stale(started: Option<Instant>, now: Instant) -> bool {
+    started.is_some_and(|t| now.saturating_duration_since(t) > ABANDON_AFTER)
+}
+
 /// A registration attempt running this long is reported (status: retrying).
 const SLOW_START: Duration = Duration::from_secs(10);
 const SLOW_STATUS: &str = "starting (retrying): the camera service is not answering";
@@ -581,10 +590,20 @@ impl CameraOwner {
     }
 
     /// Drop the registration and register the camera again, in the background
-    /// (tray: Force restart). A start already in flight is kept.
+    /// (tray: Force restart). A start already in flight is kept, unless it
+    /// has been pending for over 30 s (then it is abandoned).
     pub fn re_register(&mut self) {
         if self.pending.is_some() {
-            return;
+            if !pending_is_stale(self.last_start_try, Instant::now()) {
+                return;
+            }
+            // Wedged (e.g. Frame Server hung): give that attempt up. Dropping
+            // the receiver never blocks; if the attempt ever finishes, its
+            // thread drops (removes) the camera it made.
+            tracing::warn!(
+                "abandoning a camera registration pending for over 30 s; starting a new one"
+            );
+            self.pending = None;
         }
         let old = self.owner.take();
         self.service_pid = None;
@@ -1112,6 +1131,56 @@ mod tests {
             gone(),
         );
         assert!(r.err().unwrap().to_string().contains("not installed"));
+    }
+
+    #[test]
+    fn pending_start_is_abandoned_only_after_30s() {
+        let t = Instant::now();
+        assert!(!pending_is_stale(Some(t), t + Duration::from_secs(30)));
+        assert!(pending_is_stale(Some(t), t + Duration::from_secs(31)));
+        assert!(!pending_is_stale(None, t));
+    }
+
+    #[test]
+    fn re_register_replaces_a_wedged_start() {
+        // First attempt hangs for good; the second succeeds.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let (_keep, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let start: StartFn = Arc::new(move || {
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = gate.lock().unwrap().recv(); // never released
+            }
+            Ok(Owner::dummy())
+        });
+        let mut cam = CameraOwner::open_background_with(
+            CameraStatus::default(),
+            true,
+            start,
+            no_watch(),
+            gone(),
+        )
+        .unwrap();
+        // Fresh: Force restart keeps the attempt in flight.
+        cam.re_register();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Pending for over 30 s: abandoned, a new attempt registers.
+        let Some(old) = Instant::now().checked_sub(Duration::from_secs(31)) else {
+            return; // machine up for less than 31 s: can't backdate
+        };
+        cam.last_start_try = Some(old);
+        cam.re_register();
+        for _ in 0..200 {
+            cam.poll(Instant::now());
+            if cam.is_registered() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(cam.is_registered());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

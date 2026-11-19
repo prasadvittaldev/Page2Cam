@@ -53,8 +53,9 @@ const NIN_BALLOONTIMEOUT: u32 = 0x0404;
 const NIN_BALLOONUSERCLICK: u32 = 0x0405;
 const BALLOON_TIMER: usize = 1;
 const BALLOON_MAX_MS: u32 = 10_000;
-/// How long sign-out waits for the engine stop and camera removal.
-const END_SESSION_WAIT: std::time::Duration = std::time::Duration::from_secs(7);
+/// How long sign-out waits for the tray to end the engine and remove the
+/// camera (it needs about 1 s at worst).
+const END_SESSION_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Window-thread state (the window procedure has no other context).
 struct Wnd {

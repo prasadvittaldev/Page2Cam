@@ -126,6 +126,20 @@ pub fn spawn(gen: u64, port: u16, token: &str, tx: Sender<Cmd>) -> anyhow::Resul
 }
 
 impl Engine {
+    /// End the engine tree without waiting (sign-out: Windows allows ~5 s).
+    pub fn kill_now(&self) {
+        tracing::info!(gen = self.gen, "ending the engine's processes (sign-out)");
+        // SAFETY: handles we own.
+        unsafe {
+            match &self.job {
+                Some(j) => j.kill(),
+                None => {
+                    let _ = TerminateProcess(self.process, 1);
+                }
+            }
+        }
+    }
+
     /// End the engine's whole process tree now; waits up to 3 s for it.
     pub fn kill(&self) {
         tracing::info!(gen = self.gen, "ending the engine's processes");

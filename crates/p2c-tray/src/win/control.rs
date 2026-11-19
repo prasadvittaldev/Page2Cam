@@ -110,8 +110,10 @@ const TICK: Duration = Duration::from_secs(1);
 const UNRESPONSIVE_AFTER: Duration = Duration::from_secs(5);
 /// Quit gives the engine this long in total, then ends it.
 const QUIT_LIMIT: Duration = Duration::from_secs(15);
-/// At sign-out Windows waits only a few seconds for us.
-const END_SESSION_LIMIT: Duration = Duration::from_secs(2);
+/// Camera removal limit at Quit, and at sign-out (Windows allows about 5 s
+/// for everything then; the engine job is ended without waiting).
+const CAMERA_REMOVE_LIMIT: Duration = Duration::from_secs(3);
+const END_SESSION_CAMERA_LIMIT: Duration = Duration::from_secs(1);
 const SYSLOAD_EVERY: Duration = Duration::from_secs(2);
 const FIRST_RUN: &str = "Page2Cam is in your tray. Click Start when you need it.";
 
@@ -137,8 +139,6 @@ struct Controller {
     tx: Sender<Cmd>,
     ui: Arc<Ui>,
     quitting: Option<Instant>,
-    /// How long Quit waits for the engine (shorter at sign-out).
-    quit_limit: Duration,
     /// Sign-out: told when everything is closed.
     end_session: Option<Sender<()>>,
     done: bool,
@@ -178,7 +178,6 @@ pub fn run(rx: Receiver<Cmd>, tx: Sender<Cmd>, ui: Arc<Ui>) {
         tx,
         ui,
         quitting: None,
-        quit_limit: QUIT_LIMIT,
         end_session: None,
         done: false,
         level: Level::Grey,
@@ -259,10 +258,13 @@ impl Controller {
             Cmd::Poll { gen, result } => self.poll_result(gen, result, now),
             Cmd::Notify(text) => self.ui.balloon(text, true),
             Cmd::EndSession(done) => {
-                tracing::info!("Windows is ending the session; closing");
+                // No graceful engine stop (no POST /api/quit, no wait):
+                // `finish` ends the job at once and removes the camera
+                // within 1 s.
+                tracing::info!("Windows is ending the session; closing now");
                 self.end_session = Some(done);
-                self.quit_limit = END_SESSION_LIMIT;
-                self.begin_quit(now);
+                self.quitting.get_or_insert(now);
+                self.done = true;
             }
         }
         self.refresh_ui();
@@ -297,7 +299,7 @@ impl Controller {
         }
     }
 
-    /// Stop the engine (bounded by `quit_limit`), then `finish`.
+    /// Stop the engine (bounded by `QUIT_LIMIT`), then `finish`.
     fn begin_quit(&mut self, now: Instant) {
         if self.quitting.is_none() {
             tracing::info!("quitting");
@@ -452,15 +454,20 @@ impl Controller {
         };
         let idle = matches!(self.sup.state(), TrayState::Stopped | TrayState::Error(_))
             && self.engine.is_none();
-        if idle || now.saturating_duration_since(since) >= self.quit_limit {
+        if idle || now.saturating_duration_since(since) >= QUIT_LIMIT {
             self.done = true;
         }
     }
 
     /// End everything: engine tree, camera registration; tell the UI.
     fn finish(&mut self) {
+        let signing_out = self.end_session.is_some();
         if let Some(e) = self.engine.take() {
-            e.kill();
+            if signing_out {
+                e.kill_now();
+            } else {
+                e.kill();
+            }
         }
         // Removing the camera waits for Frame Server; don't let a hung
         // service keep the tray from closing.
@@ -474,7 +481,11 @@ impl Controller {
             });
         if spawned.is_ok()
             && rx
-                .recv_timeout(Duration::from_secs(3))
+                .recv_timeout(if signing_out {
+                    END_SESSION_CAMERA_LIMIT
+                } else {
+                    CAMERA_REMOVE_LIMIT
+                })
                 .is_err_and(|e| e == RecvTimeoutError::Timeout)
         {
             tracing::warn!("removing the virtual camera hangs; closing anyway");
