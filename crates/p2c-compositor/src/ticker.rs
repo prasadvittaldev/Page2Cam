@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use p2c_core::{
     bgra_to_nv12, camera_size, DurationStats, Frame, FrameSlot, Mask, MaskSlot, Nv12Frame, Slot,
+    Summary,
 };
 
 use parking_lot::RwLock;
@@ -132,6 +133,11 @@ pub trait OutputProducer: Send {
     /// successful `produce`; the CPU then draws the same tick). For things
     /// this producer can't draw, e.g. backdrops without their GPU shaders.
     fn fallback_request(&mut self) -> Option<String> {
+        None
+    }
+    /// Refined-edges (guided filter) times since the last call, for the
+    /// stats line. Only the CPU compositor measures them.
+    fn take_refined_summary(&mut self) -> Option<Summary> {
         None
     }
 }
@@ -339,6 +345,10 @@ impl OutputProducer for CpuProducer {
 
     fn can_fall_back(&self) -> bool {
         false
+    }
+
+    fn take_refined_summary(&mut self) -> Option<Summary> {
+        self.compositor.take_refined_summary()
     }
 }
 
@@ -728,11 +738,17 @@ impl Ticker {
                         if let (Some(c), Some(s)) =
                             (compose_t.take_summary(), sinks_t.take_summary())
                         {
+                            // Refined edges on the CPU (none on the GPU or when off).
+                            let refined = slot
+                                .producer
+                                .take_refined_summary()
+                                .map(|r| format!("; refined edges {r}"))
+                                .unwrap_or_default();
                             tracing::info!(
                                 ticks,
                                 redrawn,
                                 skipped,
-                                "output ({}): compose {c}; sinks {s}",
+                                "output ({}): compose {c}; sinks {s}{refined}",
                                 slot.name
                             );
                         }

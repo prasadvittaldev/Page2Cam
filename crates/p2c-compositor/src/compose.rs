@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
-use p2c_core::{Frame, Mask};
+use p2c_core::{DurationStats, Frame, Mask, Summary};
 
 use crate::{
     pip_rect, Backdrop, BlurCache, BoxBackdrop, FullBackdrop, GuidedScratch, OverlayStyle,
@@ -107,6 +107,8 @@ pub struct Compositor {
     image: Option<ScaledImage>,
     guided: GuidedScratch,
     guided_out: Vec<u8>,
+    /// Time per refined matte (guided filter + upscale), for the stats line.
+    refined_t: DurationStats,
 }
 
 /// The page scaled to fit the output.
@@ -292,7 +294,13 @@ impl Compositor {
             image: None,
             guided: GuidedScratch::new(),
             guided_out: Vec::new(),
+            refined_t: DurationStats::default(),
         }
+    }
+
+    /// Refined-matte times since the last call (`None` if none was made).
+    pub fn take_refined_summary(&mut self) -> Option<Summary> {
+        self.refined_t.take_summary()
     }
 
     /// The note for the last compose that redrew (it is not updated when
@@ -591,6 +599,7 @@ impl Compositor {
     /// Guided upsampling of `m` to `w` x `h` (webcam as guide) into `dst`.
     /// Wider than [`REFINED_MAX_W`]: computed at that width, then scaled up.
     fn refined_matte(&mut self, m: &Mask, cam: &Frame, w: u32, h: u32, dst: &mut Vec<u8>) {
+        let t0 = std::time::Instant::now();
         let (gw, gh) = refined_size(w, h);
         self.guided.run(
             m,
@@ -608,6 +617,7 @@ impl Compositor {
             dst.resize(w as usize * h as usize, 0);
             scale_u8_into(&mut self.resizer, &self.guided_out, gw, gh, dst, w, h);
         }
+        self.refined_t.record(t0.elapsed());
     }
 }
 
@@ -1648,6 +1658,28 @@ mod tests {
         let (v_off, v_on) = (off.pixel(160, 90)[0], on.pixel(160, 90)[0]);
         assert!(v_off > 200, "LUT path {v_off}");
         assert!(v_on.abs_diff(155) <= 3, "guided path {v_on}");
+    }
+
+    #[test]
+    fn refined_matte_time_is_recorded_for_the_stats_line() {
+        let cam = person_cam(160, 90);
+        let m = person_mask();
+        let l = full_layout(OverlayStyle::CutoutFull);
+        let mut b = Backdrop::default();
+        let mut c = Compositor::new();
+        let mut out = Frame::new_black(320, 180);
+        let page = solid(320, 180, WHITE);
+        let pip = || Pip {
+            cam: &cam,
+            mask: Some(&m),
+            layout: &l,
+        };
+        assert!(c.compose(Some(&page), Some(pip()), &b, &mut out));
+        assert_eq!(c.take_refined_summary(), None, "refined edges off");
+        b.refined_edges = true;
+        assert!(c.compose(Some(&page), Some(pip()), &b, &mut out));
+        assert_eq!(c.take_refined_summary().map(|s| s.count), Some(1));
+        assert_eq!(c.take_refined_summary(), None, "a new window after taking");
     }
 
     #[test]
