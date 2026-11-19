@@ -59,6 +59,27 @@ The line under the buttons shows what is running, e.g.
 this PC, switched to Fast", Page2Cam switched by itself to keep the video
 smooth; you can click Quality again to retry. Your choices are saved in
 page2cam.toml.
+"Refined edges" (under the Quality/Fast buttons) makes the edges around
+hair and shoulders sharper; it costs a little extra processing, so switch it
+off if the picture stutters.
+
+
+BACKGROUND
+----------
+The "Background" panel chooses what is behind you:
+  Full frame - Page (the website, as usual), Image (your own picture: PNG,
+               JPEG or WebP, up to 20 MB), Colour, YouTube (paste a video
+               link; it plays full screen and loops) or Blurred room (your
+               own room, blurred). Anything but Page needs a cut-out, so
+               Page2Cam switches from Box to Cut-out full by itself. While a
+               background shows, the website is paused; click Page (or Go)
+               to get it back.
+  In box     - for the Box style: Room (as usual), Blur, Image or Colour
+               behind you inside the webcam box.
+YouTube sound goes to the YouTube Live stream only, never into Teams/Zoom.
+If a background can't be shown right now (e.g. the cut-out is not ready),
+a note under the panel says so. Blur and Blurred room then blur everything,
+you included, rather than showing your room sharp.
 
 
 THINGS TO TRY AND REPORT BACK
@@ -74,6 +95,9 @@ THINGS TO TRY AND REPORT BACK
 [ ] Cut-out small and Cut-out full: is your room gone? Are the edges around
     your hair and shoulders clean? Tell me what the status line under the
     Quality/Fast buttons says (masks/s, GPU or CPU).
+[ ] Background: try each Full frame and In box choice. Does YouTube play
+    with sound on a test stream (and stay silent in Teams)?
+[ ] Refined edges on and off: which looks better, and does the video stay smooth?
 [ ] Does your voice line up with your lips on the YouTube stream?
 [ ] In page2cam.log, what does the "webcam measured ... fps" line say?
 

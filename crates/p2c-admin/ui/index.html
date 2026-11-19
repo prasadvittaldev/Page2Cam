@@ -165,6 +165,36 @@
   .corners { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .state { font-size: 13px; color: var(--muted); min-height: 1.4em; word-break: break-word; }
   .state.err { color: var(--amber); }
+  /* Background choices: tiles with a small preview each. */
+  .tiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+  .tile {
+    display: grid; gap: 3px; padding: 3px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; cursor: pointer; font-size: 12px; line-height: 1.2; text-align: center;
+  }
+  .tile:hover { border-color: var(--brand); }
+  .tile[aria-pressed=true] { border-color: var(--brand); box-shadow: 0 0 0 1px var(--brand); background: var(--brand-soft); }
+  .pv {
+    position: relative; aspect-ratio: 16 / 9; border-radius: 3px; overflow: hidden;
+    background: var(--well); border: 1px solid var(--line);
+  }
+  .pv img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .pv .add { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 16px; }
+  .pv.page { background: linear-gradient(var(--brand) 0 24%, #fff 24%); }
+  .pv.room::before, .pv.blur::before {
+    content: ""; position: absolute; inset: -4px;
+    background: radial-gradient(ellipse 22% 40% at 50% 85%, #4b3b30 0 98%, transparent 100%),
+                radial-gradient(circle at 50% 42%, #8a6f5a 0 13%, transparent 14%),
+                linear-gradient(160deg, #c9b79f, #6d7f8f);
+  }
+  .pv.blur::before { filter: blur(3px); }
+  .pv.yt { background: #1b1b1b; }
+  .pv.yt::after {
+    content: ""; position: absolute; left: 50%; top: 50%; transform: translate(-35%, -50%);
+    border-left: 10px solid #e5372b; border-top: 6px solid transparent; border-bottom: 6px solid transparent;
+  }
+  .bg-opts .row { margin: 6px 0; }
+  .bg-opts input[type=color] { width: 48px; height: 28px; padding: 0 2px; border: 1px solid var(--line); border-radius: 6px; background: var(--well); }
+  form.url .paused { align-self: center; font-size: 13px; color: var(--amber); white-space: nowrap; }
   .presets { display: flex; flex-wrap: wrap; gap: 6px; }
   .presets .btn { padding: 3px 9px; font-size: 13px; }
 
@@ -188,6 +218,7 @@
   <button class="btn icon" id="reload" title="Reload" aria-label="Reload">&#8635;</button>
   <form class="url" id="urlform">
     <input id="url" type="text" spellcheck="false" autocomplete="off" aria-label="Website address" placeholder="Website to show, e.g. example.com">
+    <span class="paused" id="urlPaused" title="A full-frame background is showing instead of this page. Go (or Page under Background) shows the page again." hidden>(paused — background showing)</span>
     <button class="btn primary" type="submit">Go</button>
     <button class="btn" type="button" id="save" title="Save this site to the quick list">Save</button>
   </form>
@@ -231,6 +262,10 @@
           <button class="btn" data-engine="quality" aria-pressed="false" title="Cleaner edges around hair; needs a faster PC">Quality</button>
           <button class="btn" data-engine="fast" aria-pressed="false" title="Smooth on any PC; rougher edges">Fast</button>
         </div>
+        <div class="row" title="Sharper cut-out edges around hair and shoulders. Takes a little extra processing per frame; switch it off if the picture stutters.">
+          <label for="refinedEdges">Refined edges</label>
+          <input type="checkbox" id="refinedEdges">
+        </div>
         <div class="state" id="cutoutState"></div>
       </div>
       <div class="corners" id="corners" style="margin-top:10px">
@@ -264,6 +299,59 @@
         <span id="restartText">Restart Page2Cam to apply</span>
         <button class="btn primary" id="restartBtn">Restart now</button>
       </div>
+    </section>
+
+    <section class="panel bg-opts" aria-labelledby="h-bg">
+      <h2 id="h-bg">Background</h2>
+      <p class="sub" style="margin-top:0">Full frame (behind you)</p>
+      <div class="tiles" id="bgFullRow" role="group" aria-label="Full-frame background">
+        <button class="tile" data-bg-full="page" aria-pressed="false" title="The web page (as today)"><span class="pv page"></span>Page</button>
+        <button class="tile" data-bg-full="image" aria-pressed="false" title="A picture of your own"><span class="pv"><span class="add">+</span><img id="bgFullImagePrev" alt="" hidden></span>Image</button>
+        <button class="tile" data-bg-full="colour" aria-pressed="false" title="One colour"><span class="pv" id="bgFullSwatch"></span>Colour</button>
+        <button class="tile" data-bg-full="youtube" aria-pressed="false" title="A YouTube video, full screen and looping"><span class="pv yt"><img id="bgYoutubeThumb" alt="" hidden></span>YouTube</button>
+        <button class="tile" data-bg-full="blurred-room" aria-pressed="false" title="Your own room, blurred, full screen"><span class="pv blur"></span>Blurred room</button>
+      </div>
+      <div id="bgFullImageOpts" hidden>
+        <div class="row">
+          <button class="btn" id="bgFullImagePick">Change picture…</button>
+          <span class="sub" style="margin:0">PNG, JPEG or WebP, up to 20 MB</span>
+        </div>
+      </div>
+      <input type="file" id="bgFullImageFile" accept="image/png,image/jpeg,image/webp" hidden>
+      <div class="row" id="bgFullColourOpts" hidden>
+        <label for="bgFullColour">Colour</label>
+        <input type="color" id="bgFullColour">
+      </div>
+      <div id="bgYoutubeOpts" hidden>
+        <form class="row" id="bgYoutubeForm">
+          <input type="text" id="bgYoutube" aria-label="YouTube video link" placeholder="Paste a YouTube video link" spellcheck="false" autocomplete="off">
+          <button class="btn primary" type="submit">Show</button>
+        </form>
+        <div class="state err" id="bgYoutubeErr"></div>
+        <p class="sub">Plays full screen with sound. The sound goes to the stream only, never to calls.</p>
+      </div>
+
+      <p class="sub">In box (behind you inside the webcam box)</p>
+      <div class="tiles" id="bgBoxRow" role="group" aria-label="In-box background">
+        <button class="tile" data-bg-box="room" aria-pressed="false" title="Your room as the camera sees it"><span class="pv room"></span>Room</button>
+        <button class="tile" data-bg-box="blur" aria-pressed="false" title="Your room, blurred"><span class="pv blur"></span>Blur</button>
+        <button class="tile" data-bg-box="image" aria-pressed="false" title="A picture of your own"><span class="pv"><span class="add">+</span><img id="bgBoxImagePrev" alt="" hidden></span>Image</button>
+        <button class="tile" data-bg-box="colour" aria-pressed="false" title="One colour"><span class="pv" id="bgBoxSwatch"></span>Colour</button>
+      </div>
+      <p class="sub" id="bgBoxHint" hidden>Used with the Box style.</p>
+      <div id="bgBoxImageOpts" hidden>
+        <div class="row">
+          <button class="btn" id="bgBoxImagePick">Change picture…</button>
+          <span class="sub" style="margin:0">PNG, JPEG or WebP, up to 20 MB</span>
+        </div>
+      </div>
+      <input type="file" id="bgBoxImageFile" accept="image/png,image/jpeg,image/webp" hidden>
+      <div class="row" id="bgBoxColourOpts" hidden>
+        <label for="bgBoxColour">Colour</label>
+        <input type="color" id="bgBoxColour">
+      </div>
+      <div class="state" id="bgErr"></div>
+      <div class="state err" id="bgNote" role="status"></div>
     </section>
 
     <section class="panel" aria-labelledby="h-stream">
@@ -320,6 +408,7 @@
   };
 
   let state = null;
+  let bg = null; // GET /api/background as the server last returned it
   let pip = { visible: true, x: 1, y: 1, width: 0.25 };
   let dragging = false;
   let restarting = false;
@@ -455,8 +544,9 @@
   let pushTimer = 0;
   function pushPip(now) {
     clearTimeout(pushTimer);
-    const go = () => api("/api/pip", pip);
-    if (now) go(); else pushTimer = setTimeout(go, 60);
+    const go = () => api("/api/pip", pip).catch(() => {});
+    if (now) return go();
+    pushTimer = setTimeout(go, 60);
   }
   function startDrag(e, resize) {
     e.preventDefault(); e.stopPropagation();
@@ -611,11 +701,14 @@
     const [x, y] = b.dataset.corner.split(",").map(Number);
     pip.x = x; pip.y = y; pip.visible = true; layoutPip(); pushPip(true); syncControls();
   });
-  document.querySelectorAll("[data-style]").forEach((b) => b.onclick = () => {
+  document.querySelectorAll("[data-style]").forEach((b) => b.onclick = async () => {
     pip.style = b.dataset.style; pip.visible = true;
     if (pip.style !== "box") pip.y = 1;
     if (pip.style === "cutout-full") pip.x = 0.5;
-    layoutPip(); pushPip(true); syncControls();
+    layoutPip(); syncControls();
+    // Box may put the full-frame background back to Page: show what the app did.
+    await pushPip(true);
+    refresh(); loadBg();
   });
   document.querySelectorAll("[data-engine]").forEach((b) => b.onclick = async () => {
     document.querySelectorAll("[data-engine]").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
@@ -627,7 +720,10 @@
     $("pipOn").checked = pip.visible;
     $("pipSize").value = Math.round(pip.width * 100);
     document.querySelectorAll("[data-style]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.style === style)));
-    $("cutoutBox").hidden = style === "box";
+    // The cut-out also runs in Box when the box has a background behind you.
+    const inBox = bg ? bg.in_box : state ? state.status.box_background : "room";
+    $("cutoutBox").hidden = style === "box" && (inBox || "room") === "room";
+    $("bgBoxHint").hidden = style === "box";
     $("corners").hidden = style !== "box";
     $("sizeRow").hidden = style === "cutout-full";
     $("cropBtn").setAttribute("aria-pressed", String(cropMode));
@@ -636,6 +732,135 @@
     $("cropBox").hidden = !cropMode;
     if (!zoomBase) $("cropZoom").value = Math.round(clampR(100 / Math.max(crop.w, crop.h), 100, 400));
   }
+
+  // ---------- background ----------
+  // Every change goes to the app, and the panel shows the choices it sends
+  // back (it may change the overlay style or the full frame too).
+  const MAX_PICTURE = 20 * 1024 * 1024;
+  const withToken = (p) => p + (p.includes("?") ? "&" : "?") + "t=" + encodeURIComponent(token);
+  let picVersion = Date.now(), ytEditing = false;
+  function bgMessage(id, text, isErr) {
+    const el = $(id); el.textContent = text || ""; el.classList.toggle("err", !!text && isErr !== false);
+  }
+  async function errorText(r) {
+    if (r.status === 413) return "The picture is larger than 20 MB.";
+    const t = await r.text();
+    try { return JSON.parse(t).error || t; } catch { return t; }
+  }
+  async function loadBg() {
+    try {
+      const r = await api("/api/background");
+      if (r.ok) { bg = await r.json(); syncBg(); }
+    } catch {}
+  }
+  // The current choices with `change` applied. The video is sent only when
+  // it changes (the app keeps the last one).
+  const bgBody = (change) => ({
+    full: bg.full, full_colour: bg.full_colour, in_box: bg.in_box,
+    box_colour: bg.box_colour, refined_edges: bg.refined_edges, ...change,
+  });
+  async function setBg(change, errId) {
+    if (!bg) return false;
+    errId = errId || "bgErr";
+    try {
+      const r = await api("/api/background", bgBody(change));
+      if (!r.ok) { bgMessage(errId, await errorText(r)); await loadBg(); return false; }
+      bg = await r.json();
+    } catch { bgMessage(errId, "Page2Cam is not responding."); return false; }
+    bgMessage("bgErr", ""); bgMessage("bgYoutubeErr", "");
+    syncBg(); refresh();
+    return true;
+  }
+  async function upload(row, file) {
+    if (!file) return;
+    if (file.size > MAX_PICTURE) { bgMessage("bgErr", "The picture is larger than 20 MB."); return; }
+    bgMessage("bgErr", "Loading the picture…", false);
+    try {
+      const r = await fetch("/api/background/image?row=" + row, {
+        method: "POST",
+        headers: { "x-p2c-token": token, "content-type": file.type || "application/octet-stream" },
+        body: file,
+      });
+      if (!r.ok) { bgMessage("bgErr", await errorText(r)); return; }
+      bg = await r.json();
+    } catch { bgMessage("bgErr", "Page2Cam is not responding."); return; }
+    picVersion++;
+    bgMessage("bgErr", "");
+    syncBg(); refresh();
+  }
+  function showPicture(id, has, row) {
+    const img = $(id);
+    img.hidden = !has;
+    if (!has) return;
+    const src = withToken("/api/background/image?row=" + row + "&v=" + picVersion);
+    if (img.dataset.src !== src) { img.dataset.src = src; img.src = src; }
+  }
+  function showThumb() {
+    const img = $("bgYoutubeThumb"), id = bg.full_youtube;
+    if (!id) { img.hidden = true; img.dataset.src = ""; return; }
+    const src = withToken("/api/background/thumb?link=" + encodeURIComponent(id));
+    if (img.dataset.src !== src) { img.dataset.src = src; img.hidden = false; img.src = src; }
+  }
+  $("bgYoutubeThumb").onerror = () => { $("bgYoutubeThumb").hidden = true; };
+  function syncBg() {
+    if (!bg) return;
+    document.querySelectorAll("[data-bg-full]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.bgFull === bg.full)));
+    document.querySelectorAll("[data-bg-box]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.bgBox === bg.in_box)));
+    showPicture("bgFullImagePrev", bg.full_image, "full");
+    showPicture("bgBoxImagePrev", bg.box_image, "box");
+    showThumb();
+    if (bg.full_colour) {
+      $("bgFullSwatch").style.background = bg.full_colour;
+      if (document.activeElement !== $("bgFullColour")) $("bgFullColour").value = bg.full_colour;
+    }
+    if (bg.box_colour) {
+      $("bgBoxSwatch").style.background = bg.box_colour;
+      if (document.activeElement !== $("bgBoxColour")) $("bgBoxColour").value = bg.box_colour;
+    }
+    $("bgYoutube").placeholder = bg.full_youtube ? "Showing youtu.be/" + bg.full_youtube + " — paste another link" : "Paste a YouTube video link";
+    $("bgFullImageOpts").hidden = bg.full !== "image";
+    $("bgFullColourOpts").hidden = bg.full !== "colour";
+    $("bgYoutubeOpts").hidden = !(bg.full === "youtube" || ytEditing);
+    $("bgBoxImageOpts").hidden = bg.in_box !== "image";
+    $("bgBoxColourOpts").hidden = bg.in_box !== "colour";
+    $("refinedEdges").checked = bg.refined_edges;
+    if (!dragging) syncControls();
+  }
+  document.querySelectorAll("[data-bg-full]").forEach((b) => b.onclick = () => {
+    if (!bg) return;
+    const v = b.dataset.bgFull;
+    // Nothing to show yet: ask for it first (an upload selects it by itself).
+    if (v === "image" && !bg.full_image) { $("bgFullImageFile").click(); return; }
+    if (v === "youtube" && !bg.full_youtube) { ytEditing = true; syncBg(); $("bgYoutube").focus(); return; }
+    ytEditing = false;
+    setBg({ full: v });
+  });
+  document.querySelectorAll("[data-bg-box]").forEach((b) => b.onclick = () => {
+    if (!bg) return;
+    const v = b.dataset.bgBox;
+    if (v === "image" && !bg.box_image) { $("bgBoxImageFile").click(); return; }
+    setBg({ in_box: v });
+  });
+  $("bgFullImagePick").onclick = () => $("bgFullImageFile").click();
+  $("bgBoxImagePick").onclick = () => $("bgBoxImageFile").click();
+  [["bgFullImageFile", "full"], ["bgBoxImageFile", "box"]].forEach(([id, row]) => $(id).onchange = () => {
+    const f = $(id).files[0];
+    $(id).value = "";
+    upload(row, f);
+  });
+  // `change` fires once the colour is picked (not on every drag), so the
+  // background page is not reloaded over and over.
+  $("bgFullColour").onchange = () => setBg({ full: "colour", full_colour: $("bgFullColour").value });
+  $("bgBoxColour").onchange = () => setBg({ in_box: "colour", box_colour: $("bgBoxColour").value });
+  $("bgYoutubeForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (await setBg({ full: "youtube", full_youtube: $("bgYoutube").value }, "bgYoutubeErr")) {
+      ytEditing = false; $("bgYoutube").value = ""; syncBg();
+    }
+  });
+  $("bgYoutube").addEventListener("input", () => bgMessage("bgYoutubeErr", ""));
+  $("refinedEdges").onchange = () => setBg({ refined_edges: $("refinedEdges").checked });
+  loadBg();
 
   // ---------- stream ----------
   $("rtmpUrl").value = store.get("rtmpUrl", "rtmp://a.rtmp.youtube.com/live2");
@@ -766,6 +991,10 @@
       setState("webcamState", s.webcam === "none" ? "No webcam found. Plug one in and restart Page2Cam." : /^error/.test(s.webcam) ? s.webcam : /^reconnecting/.test(s.webcam) ? "Webcam " + s.webcam : "");
       document.querySelectorAll("[data-engine]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.engine === s.cutout_engine)));
       setState("cutoutState", s.cutout);
+      // Changed elsewhere (another tab, a style switch): take the app's choices.
+      if (!bg || s.background !== bg.full || s.box_background !== bg.in_box || s.refined_edges !== bg.refined_edges) loadBg();
+      bgMessage("bgNote", s.background_note);
+      $("urlPaused").hidden = !["image", "colour", "youtube"].includes(s.background);
       syncGpu();
       if (Date.now() > videoErrUntil) {
         const v = $("videoState");

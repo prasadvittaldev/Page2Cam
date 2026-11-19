@@ -1151,6 +1151,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ui_has_background_section() {
+        let r = app(Arc::default())
+            .oneshot(req("GET", "/?t=abc123", "127.0.0.1:8765", None, None))
+            .await
+            .unwrap();
+        let html = body_string(r).await;
+        for id in [
+            "h-bg",
+            "bgFullRow",
+            "bgBoxRow",
+            "bgFullImageFile",
+            "bgBoxImageFile",
+            "bgFullColour",
+            "bgBoxColour",
+            "bgYoutube",
+            "bgYoutubeErr",
+            "bgYoutubeThumb",
+            "bgFullImagePrev",
+            "bgBoxImagePrev",
+            "bgNote",
+            "bgErr",
+            "refinedEdges",
+            "urlPaused",
+        ] {
+            assert!(html.contains(&format!("id=\"{id}\"")), "missing id {id}");
+        }
+        for v in ["page", "image", "colour", "youtube", "blurred-room"] {
+            assert!(html.contains(&format!("data-bg-full=\"{v}\"")), "full {v}");
+        }
+        for v in ["room", "blur", "image", "colour"] {
+            assert!(html.contains(&format!("data-bg-box=\"{v}\"")), "box {v}");
+        }
+        // The routes it talks to, and nothing fetched from outside.
+        for route in [
+            "/api/background\"",
+            "/api/background/image?row=",
+            "/api/background/thumb",
+        ] {
+            assert!(html.contains(route), "route {route}");
+        }
+        assert!(html.contains("(paused — background showing)"));
+        assert!(!html.contains("img.youtube.com"));
+        assert!(!html.contains("src=\"http"));
+        assert!(!html.contains("href=\"http"));
+    }
+
+    #[tokio::test]
     async fn navigate_normalizes_and_rejects() {
         let fake = Arc::new(Fake::default());
         let ok = req(
