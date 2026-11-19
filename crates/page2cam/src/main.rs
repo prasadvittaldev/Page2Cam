@@ -408,6 +408,7 @@ fn run() -> anyhow::Result<i32> {
     sinks.push(Box::new(stream.sink()));
 
     let layout = Arc::new(RwLock::new(cfg.pip_layout()?));
+    let backdrop = Arc::new(RwLock::new(p2c_compositor::Backdrop::default()));
     let crop: p2c_core::SharedCrop = Arc::new(RwLock::new(cfg.crop()));
     // NV12 originals of the webcam frames (stays empty for fake/test input).
     let nv12_slot = Nv12Slot::new();
@@ -510,6 +511,7 @@ fn run() -> anyhow::Result<i32> {
         webcam_slot.clone(),
         segmenter.as_ref().map(|_| matte.clone()),
         layout.clone(),
+        backdrop.clone(),
         video_start.producer,
         sinks,
         events_tx,
@@ -534,6 +536,7 @@ fn run() -> anyhow::Result<i32> {
         browser: OnceLock::new(),
         crop,
         layout,
+        backdrop,
         stream,
         mixer,
         mic_ring,

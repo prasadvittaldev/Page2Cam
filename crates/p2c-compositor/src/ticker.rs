@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -10,7 +10,7 @@ use p2c_core::{
 
 use parking_lot::RwLock;
 
-use crate::{Compositor, Pip, PipLayout};
+use crate::{Backdrop, ComposeNote, Compositor, Pip, PipLayout};
 
 const WEBCAM_STALE_AFTER: Duration = Duration::from_secs(1);
 /// How often the ticker's timing is written to the log.
@@ -87,6 +87,8 @@ pub struct TickInputs {
     /// The cut-out mask, if fresh.
     pub mask: Option<Arc<Mask>>,
     pub layout: PipLayout,
+    /// Backgrounds and edge quality (`Backdrop::default()`: page, room, LUT edges).
+    pub backdrop: Backdrop,
 }
 
 /// Turns the tick's inputs into an `Output` (the CPU compositor now, D3D11 later).
@@ -266,7 +268,7 @@ impl OutputProducer for CpuProducer {
         // Check before taking a target: that may allocate a whole frame.
         if self
             .compositor
-            .is_unchanged(inputs.page.as_ref(), pip, w, h)
+            .is_unchanged(inputs.page.as_ref(), pip, &inputs.backdrop, w, h)
         {
             // Unchanged, but the preview may still lack the latest frame.
             if preview_due && self.preview_pending {
@@ -282,7 +284,8 @@ impl OutputProducer for CpuProducer {
         }
         let i = self.free_frame();
         let target = Arc::get_mut(&mut self.pool[i]).expect("free pool frame");
-        self.compositor.compose(inputs.page.as_ref(), pip, target);
+        self.compositor
+            .compose(inputs.page.as_ref(), pip, &inputs.backdrop, target);
         let frame = self.pool[i].clone();
         let mut out = match self.spec.format {
             OutputFormat::Bgra => Output {
@@ -398,9 +401,27 @@ pub struct TickerStats {
     ticks: AtomicU64,
     skipped: AtomicU64,
     output_ready: AtomicBool,
+    /// [`ComposeNote`] of the latest tick, as `note_code`.
+    note: AtomicU8,
+}
+
+fn note_code(n: ComposeNote) -> u8 {
+    match n {
+        ComposeNote::None => 0,
+        ComposeNote::CutoutNotReady => 1,
+    }
 }
 
 impl TickerStats {
+    /// Why the output doesn't show the chosen backdrop right now (for
+    /// `Status.background_note`); the same on the CPU and GPU paths.
+    pub fn compose_note(&self) -> ComposeNote {
+        match self.note.load(Ordering::Relaxed) {
+            1 => ComposeNote::CutoutNotReady,
+            _ => ComposeNote::None,
+        }
+    }
+
     /// Ticks run since start.
     pub fn ticks(&self) -> u64 {
         self.ticks.load(Ordering::Relaxed)
@@ -515,7 +536,8 @@ impl Ticker {
     /// `webcam`: optional PIP source; a webcam frame not updated for 1 s is treated
     /// as absent. `mask`: the latest cut-out mask, used by cut-out styles (same
     /// 1 s staleness; without a fresh one the webcam is drawn as a box, never a
-    /// frozen cut-out). `layout` may be changed live. `producer` turns each
+    /// frozen cut-out). `layout` and `backdrop` may be changed live; the
+    /// backdrop's fallback note is in [`TickerStats::compose_note`]. `producer` turns each
     /// tick's inputs into an `Output` for the sinks. A preview is due every
     /// `max(1, fps / 12)` ticks.
     ///
@@ -532,6 +554,7 @@ impl Ticker {
         webcam: Option<FrameSlot>,
         mask: Option<MaskSlot>,
         layout: Arc<RwLock<PipLayout>>,
+        backdrop: Arc<RwLock<Backdrop>>,
         producer: Box<dyn OutputProducer>,
         mut sinks: Vec<Box<dyn FrameSink>>,
         events: Sender<ProducerEvent>,
@@ -582,7 +605,15 @@ impl Ticker {
                         cam: webcam.as_ref().and_then(|s| cam_fresh.latest(s)),
                         mask: mask.as_ref().and_then(|s| mask_fresh.latest(s)),
                         layout: *layout.read(),
+                        backdrop: backdrop.read().clone(),
                     };
+                    let note = ComposeNote::of(
+                        &inputs.backdrop,
+                        &inputs.layout,
+                        inputs.cam.is_some(),
+                        inputs.mask.is_some(),
+                    );
+                    stats_out.note.store(note_code(note), Ordering::Relaxed);
                     let preview_due = k.is_multiple_of(preview_every);
                     k = k.wrapping_add(1);
                     // Unchanged or failed: push the previous output again (same
@@ -774,6 +805,7 @@ mod tests {
             webcam,
             mask,
             layout,
+            Arc::default(),
             Box::new(CpuProducer::new(spec)),
             sinks,
             std::sync::mpsc::channel().0,
@@ -961,6 +993,39 @@ mod tests {
     }
 
     #[test]
+    fn ticker_reads_backdrop_live_and_reports_the_note() {
+        // Blurred room without a mask: whole frame blurred (never the red
+        // page) and "cut-out not ready"; back to the page when switched off.
+        let cam = FrameSlot::new();
+        cam.put(Frame::from_bgra(16, 9, GREEN.repeat(16 * 9)).unwrap());
+        let backdrop = Arc::new(parking_lot::RwLock::new(crate::Backdrop {
+            full: crate::FullBackdrop::BlurredRoom,
+            ..crate::Backdrop::default()
+        }));
+        let samples: Samples = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let t = Ticker::spawn(
+            small_spec(),
+            Some(red_page()),
+            Some(cam),
+            Some(MaskSlot::new()),
+            cutout_layout(),
+            backdrop.clone(),
+            Box::new(CpuProducer::new(small_spec())),
+            vec![Box::new(Sampler(samples.clone(), 5, 5))],
+            std::sync::mpsc::channel().0,
+        );
+        let stats = t.stats();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(stats.compose_note(), crate::ComposeNote::CutoutNotReady);
+        assert_eq!(samples.lock().last().map(|s| s.1), Some(GREEN));
+        *backdrop.write() = crate::Backdrop::default();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(stats.compose_note(), crate::ComposeNote::None);
+        assert_eq!(samples.lock().last().map(|s| s.1), Some(RED));
+        t.stop();
+    }
+
+    #[test]
     fn ticker_cutout_falls_back_to_box_when_mask_stale() {
         // Raw webcam has alpha 0: only an opaque Box draw makes it visible.
         let cam = FrameSlot::new();
@@ -1100,6 +1165,7 @@ mod tests {
             cam: None,
             mask: None,
             layout: crate::PipLayout::default(),
+            backdrop: crate::Backdrop::default(),
         };
         let out = p.produce(&inputs, false).unwrap().unwrap();
         let n = out.nv12.unwrap();
@@ -1246,6 +1312,7 @@ mod tests {
             None,
             None,
             layout(),
+            Arc::default(),
             producer,
             vec![Box::new(Sampler(samples.clone(), 10, 10))],
             tx,
@@ -1367,6 +1434,7 @@ mod tests {
                 crate::Corner::BottomRight,
                 0.25,
             ))),
+            Arc::default(),
             Box::new(Fake::new(|n| n > 3)),
             // PIP centre (the 16x9 PIP sits at (47, 26)).
             vec![Box::new(Sampler(samples.clone(), 55, 30))],
@@ -1460,6 +1528,7 @@ mod tests {
                 crate::Corner::BottomRight,
                 0.25,
             ))),
+            Arc::default(),
             Box::new(Holding {
                 n: 0,
                 since: since.clone(),
@@ -1515,6 +1584,7 @@ mod tests {
                 cam: None,
                 mask: None,
                 layout: crate::PipLayout::default(),
+                backdrop: crate::Backdrop::default(),
             };
             held.push(p.produce(&inputs, false).unwrap().unwrap());
             last = Some(inputs);

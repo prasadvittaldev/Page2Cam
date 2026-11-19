@@ -417,7 +417,12 @@ fn parity_case_tol(
         mask: mask.as_ref(),
         layout: &layout,
     });
-    Compositor::new().compose(Some(&page_arc), pip, &mut cpu);
+    Compositor::new().compose(
+        Some(&page_arc),
+        pip,
+        &p2c_compositor::Backdrop::default(),
+        &mut cpu,
+    );
     for a in hardware() {
         let gpu = Gpu::new(a.luid).unwrap();
         let mut p = producer_with_page(&gpu, page, spec(ow, oh));
@@ -426,6 +431,7 @@ fn parity_case_tol(
             cam: cam.clone(),
             mask: mask.clone(),
             layout,
+            backdrop: p2c_compositor::Backdrop::default(),
         };
         let got = p.render_bgra_for_test(&inputs).unwrap();
         let (d, x, y) = bgra_diff(&cpu, &got);
@@ -561,6 +567,7 @@ fn gpu_pip_layer_rebuilt_only_on_change() {
             cam: Some(cam.clone()),
             mask: Some(mask.clone()),
             layout: layout(OverlayStyle::CutoutSmall, 0.3, 0.0, 0.4),
+            backdrop: p2c_compositor::Backdrop::default(),
         };
         // The page changes every tick (animated page): one layer build.
         for _ in 0..5 {
@@ -608,6 +615,7 @@ fn gpu_pip_layer_rebuilt_only_on_change() {
                 cam: Some(cam.clone()),
                 mask: m.cloned(),
                 layout: l,
+                backdrop: p2c_compositor::Backdrop::default(),
             };
             let got = p.render_bgra_for_test(&inputs).unwrap();
             let mut cpu = Frame::new_black(640, 360);
@@ -616,7 +624,12 @@ fn gpu_pip_layer_rebuilt_only_on_change() {
                 mask: m,
                 layout: &l,
             };
-            Compositor::new().compose(Some(&page_arc), Some(pip), &mut cpu);
+            Compositor::new().compose(
+                Some(&page_arc),
+                Some(pip),
+                &p2c_compositor::Backdrop::default(),
+                &mut cpu,
+            );
             let (d, x, y) = bgra_diff(&cpu, &got);
             let mean = bgra_mean_diff(&cpu, &got);
             println!(
@@ -679,6 +692,7 @@ fn gpu_no_page_yet_is_black_with_webcam() {
                 cam: Some(cam.clone()),
                 mask: None,
                 layout: l,
+                backdrop: p2c_compositor::Backdrop::default(),
             })
             .unwrap();
         let mut cpu = Frame::new_black(640, 360);
@@ -687,7 +701,12 @@ fn gpu_no_page_yet_is_black_with_webcam() {
             mask: None,
             layout: &l,
         };
-        Compositor::new().compose(None, Some(pip), &mut cpu);
+        Compositor::new().compose(
+            None,
+            Some(pip),
+            &p2c_compositor::Backdrop::default(),
+            &mut cpu,
+        );
         let (d, x, y) = bgra_diff(&cpu, &got);
         assert!(d <= 2, "{}: diff {d} at ({x},{y})", a.name);
         println!("no page yet on {}: max diff {d}", a.name);
@@ -706,6 +725,7 @@ fn gpu_output_4k_camera_downscaled() {
             cam: Some(Arc::new(gradient(1280, 720, 18))),
             mask: None,
             layout: PipLayout::default(),
+            backdrop: p2c_compositor::Backdrop::default(),
         };
         // The readback ring lags two frames; unchanged inputs drain it.
         let mut out = None;
@@ -743,6 +763,7 @@ fn gpu_producer_skips_unchanged_and_drains() {
             cam: Some(Arc::new(gradient(320, 180, 20))),
             mask: None,
             layout: PipLayout::default(),
+            backdrop: p2c_compositor::Backdrop::default(),
         };
         let outs: Vec<_> = (0..6).map(|_| p.produce(&inputs, false).unwrap()).collect();
         // Tick 0 renders (ring not filled yet), ticks 1-2 drain it, then nothing.
@@ -806,6 +827,7 @@ fn bench_compose_1080p_cutout_full() {
                 cam: Some(Arc::new((*cams[i % 4]).clone())),
                 mask: Some(masks[i % 4].clone()),
                 layout: l,
+                backdrop: p2c_compositor::Backdrop::default(),
             };
             let t = Instant::now();
             let out = p.produce(&inputs, false).unwrap();
@@ -878,6 +900,7 @@ fn bench_compose_gpu_passes_1080p() {
                     cam: Some(cam.clone()),
                     mask: Some(mask.clone()),
                     layout: l,
+                    backdrop: p2c_compositor::Backdrop::default(),
                 };
                 p.produce(&inputs, i % 2 == 0).unwrap();
                 let Some(prof) = p.take_profile() else {
@@ -941,6 +964,7 @@ fn no_inputs() -> TickInputs {
         cam: None,
         mask: None,
         layout: PipLayout::default(),
+        backdrop: p2c_compositor::Backdrop::default(),
     }
 }
 
@@ -1046,6 +1070,7 @@ fn ticker_falls_back_to_cpu_after_second_device_loss() {
         None,
         None,
         Arc::new(parking_lot::RwLock::new(PipLayout::default())),
+        Arc::default(),
         Box::new(p),
         vec![Box::new(Rec(seen.clone()))],
         tx,
@@ -1134,6 +1159,7 @@ fn hung_rebuild_errors_within_a_second_and_ticker_falls_back() {
         None,
         None,
         Arc::new(parking_lot::RwLock::new(PipLayout::default())),
+        Arc::default(),
         Box::new(p),
         vec![Box::new(Count(n.clone()))],
         tx,

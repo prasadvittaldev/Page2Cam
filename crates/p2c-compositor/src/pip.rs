@@ -1,4 +1,7 @@
-//! Picture-in-picture placement.
+//! Picture-in-picture placement and backdrops.
+use std::sync::Arc;
+
+use p2c_core::Frame;
 
 /// Fraction of the output width/height kept clear around the PIP.
 const MARGIN: f32 = 0.02;
@@ -52,6 +55,65 @@ impl OverlayStyle {
     /// True for the styles that use the cut-out mask.
     pub fn is_cutout(self) -> bool {
         self != OverlayStyle::Box
+    }
+}
+
+/// What fills the whole output behind the webcam overlay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FullBackdrop {
+    /// The web page (as before backdrops existed).
+    #[default]
+    Page,
+    /// The webcam picture, cover-scaled to the output and blurred, instead of
+    /// the page. Without a fresh mask the whole frame is blurred (person too).
+    BlurredRoom,
+}
+
+/// What is drawn behind the person inside the Box style's rectangle. Cut-out
+/// styles have no box and ignore it.
+#[derive(Clone, Debug, Default)]
+pub enum BoxBackdrop {
+    /// The webcam's own room (as before backdrops existed).
+    #[default]
+    Room,
+    /// The room blurred. Without a fresh mask the whole box is blurred.
+    Blur,
+    /// A picture, cover-scaled to the box. Without a fresh mask: the raw room.
+    Image(Arc<Frame>),
+    /// An opaque colour, `[r, g, b]`. Without a fresh mask: the raw room.
+    Colour([u8; 3]),
+}
+
+/// Images compare by identity (a new upload is a new `Arc`), not by content.
+impl PartialEq for BoxBackdrop {
+    fn eq(&self, o: &BoxBackdrop) -> bool {
+        match (self, o) {
+            (BoxBackdrop::Room, BoxBackdrop::Room) | (BoxBackdrop::Blur, BoxBackdrop::Blur) => true,
+            (BoxBackdrop::Image(a), BoxBackdrop::Image(b)) => Arc::ptr_eq(a, b),
+            (BoxBackdrop::Colour(a), BoxBackdrop::Colour(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Backgrounds and edge quality, shared like [`PipLayout`] and read each tick.
+/// The default draws exactly what the compositor drew before backdrops.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Backdrop {
+    pub full: FullBackdrop,
+    pub in_box: BoxBackdrop,
+    /// Matte from guided upsampling of the mask (webcam as guide) instead of
+    /// bilinear upscaling plus the mask's `EdgeRange` LUT.
+    pub refined_edges: bool,
+}
+
+impl Backdrop {
+    /// Whether drawing `layout` with this backdrop uses the person mask (so
+    /// the segmenter should run).
+    pub fn needs_mask(&self, layout: &PipLayout) -> bool {
+        layout.style.is_cutout()
+            || self.full != FullBackdrop::Page
+            || self.in_box != BoxBackdrop::Room
     }
 }
 

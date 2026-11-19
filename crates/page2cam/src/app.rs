@@ -7,7 +7,7 @@ use p2c_admin::{
 };
 use p2c_audio::{MicCapture, MixSettings, Mixer};
 use p2c_browser::{BrowserHandle, KeyInput, KeyKind, MouseButton};
-use p2c_compositor::PipLayout;
+use p2c_compositor::{Backdrop, PipLayout};
 use p2c_core::{AudioRing, FrameSlot};
 use p2c_segment::{EngineChoice, Segmenter};
 use p2c_stream::{StreamConfig, StreamController, StreamState};
@@ -19,6 +19,11 @@ const KEYRING_USER: &str = "stream-key";
 pub struct App {
     pub browser: OnceLock<BrowserHandle>,
     pub layout: Arc<RwLock<PipLayout>>,
+    /// Backgrounds and edge quality, read by the ticker every tick (default
+    /// until the settings and admin page drive it). The fallback note is in
+    /// `ticker_stats.compose_note()`.
+    #[allow(dead_code, reason = "set from the settings and admin API in Task 5")]
+    pub backdrop: Arc<RwLock<Backdrop>>,
     /// Webcam crop, read by the capture thread for every frame.
     pub crop: p2c_core::SharedCrop,
     pub stream: StreamController,
@@ -921,6 +926,7 @@ mod tests {
         App {
             browser: OnceLock::new(),
             layout: Arc::new(RwLock::new(PipLayout::default())),
+            backdrop: Arc::default(),
             crop: Arc::new(RwLock::new(p2c_core::Crop::FULL)),
             stream: StreamController::new(mixer.clone()),
             mixer,

@@ -158,6 +158,11 @@ fn same<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
 impl Key {
     /// The effective inputs: the mask only for cut-out styles, and a cut-out
     /// without a mask becomes a Box (as in the CPU compositor).
+    ///
+    /// TODO(Task 4): `inputs.backdrop` is accepted but not drawn yet: the GPU
+    /// path still renders Page + Room with LUT edges (refined off). Add the
+    /// backdrop to the key and draw it in shaders (blur, guided matte, image,
+    /// colour) to match the CPU compositor.
     fn of(page_seq: u64, inputs: &TickInputs) -> Key {
         let cam = inputs.cam.clone().filter(|c| c.width > 0 && c.height > 0);
         let mut layout = inputs.layout;
