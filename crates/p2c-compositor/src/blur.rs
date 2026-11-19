@@ -11,6 +11,20 @@ const MAX_LOW_W: u32 = 160;
 /// Gaussian sigma as a fraction of the output width.
 const SIGMA_FRAC: f32 = 0.02;
 
+/// The reduced size a `w` x `h` blur is computed at: at most 1/4 of the
+/// width and never wider than 160 px, aspect kept (both at least 1).
+pub fn blur_low_size(w: u32, h: u32) -> (u32, u32) {
+    let lw = (w / 4).clamp(1, MAX_LOW_W);
+    let lh = ((h as u64 * lw as u64 / w.max(1) as u64) as u32).max(1);
+    (lw, lh)
+}
+
+/// The normalised Gaussian kernel (2 % of the width as sigma, at least one
+/// pixel; 3 sigma each side) used at the reduced width `lw`.
+pub fn blur_kernel(lw: u32) -> Vec<f32> {
+    kernel((SIGMA_FRAC * lw as f32).max(1.0))
+}
+
 /// A blurred copy of the webcam frame at output size, rebuilt only when the
 /// source frame (by identity) or the requested size changes. Buffers and the
 /// resizer are kept between rebuilds.
@@ -79,8 +93,7 @@ impl BlurCache {
             self.out.as_chunks_mut::<4>().0.fill([0, 0, 0, 255]);
             return;
         }
-        let lw = (w / 4).clamp(1, MAX_LOW_W);
-        let lh = ((h as u64 * lw as u64 / w as u64) as u32).max(1);
+        let (lw, lh) = blur_low_size(w, h);
         let (lwu, lhu) = (lw as usize, lh as usize);
         let resizer = self.resizer.get_or_insert_with(Resizer::new);
         self.small.resize(lwu * lhu * 4, 0);

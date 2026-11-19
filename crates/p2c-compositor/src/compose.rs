@@ -12,11 +12,22 @@ use crate::{
 /// Guided-filter window radius, in pixels of the refined matte as computed:
 /// for a PIP wider than [`REFINED_MAX_W`] that is the capped size, so the
 /// radius covers proportionally more of the drawn PIP.
-const GUIDED_RADIUS: u32 = 40;
+pub const GUIDED_RADIUS: u32 = 40;
 /// Guided-filter regularisation (guide and mask in 0..1).
-const GUIDED_EPS: f32 = 1e-4;
+pub const GUIDED_EPS: f32 = 1e-4;
 /// The refined matte is computed at most this wide, then scaled up bilinearly.
-const REFINED_MAX_W: u32 = 960;
+pub const REFINED_MAX_W: u32 = 960;
+
+/// The size the refined matte of a `w` x `h` PIP is computed at (capped to
+/// [`REFINED_MAX_W`] wide, aspect kept; then scaled up to `w` x `h`).
+pub fn refined_size(w: u32, h: u32) -> (u32, u32) {
+    if w > REFINED_MAX_W {
+        let gh = (h as u64 * REFINED_MAX_W as u64 / w as u64).max(1) as u32;
+        (REFINED_MAX_W, gh)
+    } else {
+        (w, h)
+    }
+}
 
 /// The webcam overlay for one compose: the latest webcam frame, the latest
 /// cut-out mask (if any) and where to draw it.
@@ -141,7 +152,7 @@ fn same<T>(a: &Option<Arc<T>>, b: Option<&Arc<T>>) -> bool {
 
 /// What fills the frame behind the PIP.
 #[derive(Clone, Copy)]
-enum Base<'a> {
+pub enum PlanBase<'a> {
     Page(Option<&'a Arc<Frame>>),
     /// The webcam, cover-scaled and blurred.
     BlurredRoom(&'a Arc<Frame>),
@@ -149,7 +160,7 @@ enum Base<'a> {
 
 /// How the PIP rectangle is filled.
 #[derive(Clone, Copy)]
-enum Draw<'a> {
+pub enum PipDraw<'a> {
     /// The webcam as an opaque rectangle (Box, or a cut-out without a mask).
     Opaque,
     /// The person (premultiplied by the matte) over what is beneath.
@@ -162,30 +173,40 @@ enum Draw<'a> {
 
 /// The PIP actually drawn: webcam, mask used, layout, and how.
 #[derive(Clone, Copy)]
-struct EffectivePip<'a> {
-    cam: &'a Arc<Frame>,
-    mask: Option<&'a Arc<Mask>>,
-    layout: PipLayout,
-    draw: Draw<'a>,
+pub struct PlannedPip<'a> {
+    pub cam: &'a Arc<Frame>,
+    /// The mask the matte comes from (`None` for Opaque and BlurAll).
+    pub mask: Option<&'a Arc<Mask>>,
+    /// The layout drawn (a cut-out without a mask becomes a Box).
+    pub layout: PipLayout,
+    pub draw: PipDraw<'a>,
 }
 
-/// One compose, decided: what goes beneath and what is drawn on top.
+/// One compose, decided: what goes beneath and what is drawn on top. Both
+/// producers (CPU [`Compositor`] and the D3D11 one) draw from this, so every
+/// fallback rule lives in [`plan_compose`] only.
 #[derive(Clone, Copy)]
-struct Plan<'a> {
-    base: Base<'a>,
-    pip: Option<EffectivePip<'a>>,
+pub struct ComposePlan<'a> {
+    pub base: PlanBase<'a>,
+    pub pip: Option<PlannedPip<'a>>,
 }
 
 /// In-box Blur, for a Box under a blurred room.
 static BLUR: BoxBackdrop = BoxBackdrop::Blur;
 
 /// Works out what to draw, including every fallback for a missing mask.
-fn plan<'a>(page: Option<&'a Arc<Frame>>, pip: Option<Pip<'a>>, b: &'a Backdrop) -> Plan<'a> {
+/// `page` only travels into [`PlanBase::Page`] (a producer with its own page
+/// source passes `None`).
+pub fn plan_compose<'a>(
+    page: Option<&'a Arc<Frame>>,
+    pip: Option<Pip<'a>>,
+    b: &'a Backdrop,
+) -> ComposePlan<'a> {
     let base = match (b.full, pip) {
-        (FullBackdrop::Page, _) => Base::Page(page),
-        (FullBackdrop::BlurredRoom, Some(p)) => Base::BlurredRoom(p.cam),
+        (FullBackdrop::Page, _) => PlanBase::Page(page),
+        (FullBackdrop::BlurredRoom, Some(p)) => PlanBase::BlurredRoom(p.cam),
         // Nothing to blur: the page, with a note (`ComposeNote::WebcamOff`).
-        (FullBackdrop::BlurredRoom, None) => Base::Page(page),
+        (FullBackdrop::BlurredRoom, None) => PlanBase::Page(page),
     };
     let pip = pip.and_then(|p| {
         // Blurred room without a mask: the whole frame stays blurred.
@@ -195,10 +216,10 @@ fn plan<'a>(page: Option<&'a Arc<Frame>>, pip: Option<Pip<'a>>, b: &'a Backdrop)
         let mut layout = *p.layout;
         let draw = if layout.style.is_cutout() {
             if p.mask.is_some() {
-                Draw::Cutout
+                PipDraw::Cutout
             } else {
                 layout.style = OverlayStyle::Box;
-                Draw::Opaque
+                PipDraw::Opaque
             }
         } else {
             // Under a blurred room the box's room is blurred too, even if the
@@ -209,40 +230,40 @@ fn plan<'a>(page: Option<&'a Arc<Frame>>, pip: Option<Pip<'a>>, b: &'a Backdrop)
                 (bg, _) => bg,
             };
             match (in_box, p.mask) {
-                (BoxBackdrop::Room, _) => Draw::Opaque,
-                (BoxBackdrop::Blur, None) => Draw::BlurAll,
+                (BoxBackdrop::Room, _) => PipDraw::Opaque,
+                (BoxBackdrop::Blur, None) => PipDraw::BlurAll,
                 // Image/Colour without a mask: the raw room (and a note).
-                (_, None) => Draw::Opaque,
-                (bg, Some(_)) => Draw::Over(bg),
+                (_, None) => PipDraw::Opaque,
+                (bg, Some(_)) => PipDraw::Over(bg),
             }
         };
         let mask = match draw {
-            Draw::Cutout | Draw::Over(_) => p.mask,
-            Draw::Opaque | Draw::BlurAll => None,
+            PipDraw::Cutout | PipDraw::Over(_) => p.mask,
+            PipDraw::Opaque | PipDraw::BlurAll => None,
         };
-        Some(EffectivePip {
+        Some(PlannedPip {
             cam: p.cam,
             mask,
             layout,
             draw,
         })
     });
-    Plan { base, pip }
+    ComposePlan { base, pip }
 }
 
 /// The page drawn (none under a blurred room: its repaints don't matter).
-fn base_page<'a>(plan: &Plan<'a>) -> Option<&'a Arc<Frame>> {
+fn base_page<'a>(plan: &ComposePlan<'a>) -> Option<&'a Arc<Frame>> {
     match plan.base {
-        Base::Page(p) => p,
-        Base::BlurredRoom(_) => None,
+        PlanBase::Page(p) => p,
+        PlanBase::BlurredRoom(_) => None,
     }
 }
 
 /// The webcam frame the output depends on (PIP or blurred room).
-fn base_cam<'a>(plan: &Plan<'a>) -> Option<&'a Arc<Frame>> {
+fn base_cam<'a>(plan: &ComposePlan<'a>) -> Option<&'a Arc<Frame>> {
     match plan.base {
-        Base::BlurredRoom(cam) => Some(cam),
-        Base::Page(_) => plan.pip.map(|p| p.cam),
+        PlanBase::BlurredRoom(cam) => Some(cam),
+        PlanBase::Page(_) => plan.pip.map(|p| p.cam),
     }
 }
 
@@ -288,25 +309,27 @@ impl Compositor {
         backdrop: &Backdrop,
         out: &mut Frame,
     ) -> bool {
-        let plan = plan(page, pip, backdrop);
+        let plan = plan_compose(page, pip, backdrop);
         if self.same_inputs(&plan, backdrop, (out.width, out.height)) {
             return false;
         }
         match plan.base {
-            Base::Page(page) => self.draw_page(page, out),
-            Base::BlurredRoom(cam) => self.draw_blurred_room(cam, out),
+            PlanBase::Page(page) => self.draw_page(page, out),
+            PlanBase::BlurredRoom(cam) => self.draw_blurred_room(cam, out),
         }
         if let Some(p) = plan.pip {
             let (cam, mask, refined) = (p.cam, p.mask, backdrop.refined_edges);
             if let Some(rect) = pip_rect(&p.layout, cam.width, cam.height, out.width, out.height) {
                 let (x, y, w, h) = rect;
                 match p.draw {
-                    Draw::BlurAll => {
+                    PipDraw::BlurAll => {
                         let blurred = self.box_blur.get(cam, w, h);
                         blit_clipped(blurred, w, h, out, x, y);
                     }
-                    Draw::Opaque | Draw::Cutout => self.draw_layer(cam, mask, refined, rect, out),
-                    Draw::Over(bg) => {
+                    PipDraw::Opaque | PipDraw::Cutout => {
+                        self.draw_layer(cam, mask, refined, rect, out)
+                    }
+                    PipDraw::Over(bg) => {
                         self.draw_box_backdrop(bg, cam, rect, out);
                         self.draw_layer(cam, mask, refined, rect, out);
                     }
@@ -340,14 +363,18 @@ impl Compositor {
         width: u32,
         height: u32,
     ) -> bool {
-        self.same_inputs(&plan(page, pip, backdrop), backdrop, (width, height))
+        self.same_inputs(
+            &plan_compose(page, pip, backdrop),
+            backdrop,
+            (width, height),
+        )
     }
 
     /// Every cached layer (scaled page, webcam layer, both blurs, scaled
     /// image) is a function of these, so equal inputs mean an equal output:
     /// a blur is only rebuilt for a new webcam frame or a new size, and both
     /// are compared here.
-    fn same_inputs(&self, plan: &Plan, backdrop: &Backdrop, out: (u32, u32)) -> bool {
+    fn same_inputs(&self, plan: &ComposePlan, backdrop: &Backdrop, out: (u32, u32)) -> bool {
         self.last.as_ref().is_some_and(|l| {
             same(&l.page, base_page(plan))
                 && same(&l.cam, base_cam(plan))
@@ -558,12 +585,7 @@ impl Compositor {
     /// Guided upsampling of `m` to `w` x `h` (webcam as guide) into `dst`.
     /// Wider than [`REFINED_MAX_W`]: computed at that width, then scaled up.
     fn refined_matte(&mut self, m: &Mask, cam: &Frame, w: u32, h: u32, dst: &mut Vec<u8>) {
-        let (gw, gh) = if w > REFINED_MAX_W {
-            let gh = (h as u64 * REFINED_MAX_W as u64 / w as u64).max(1) as u32;
-            (REFINED_MAX_W, gh)
-        } else {
-            (w, h)
-        };
+        let (gw, gh) = refined_size(w, h);
         self.guided.run(
             m,
             cam,
@@ -594,23 +616,29 @@ const IDENTITY_LUT: [u8; 256] = {
     t
 };
 
-/// Scale `src` to fill `dw` x `dh` exactly, cropping its centre to the
-/// target's aspect ratio (CSS `object-fit: cover`). Alpha is plain data.
-pub(crate) fn resize_cover_into(r: &mut Resizer, src: &Frame, dst: &mut [u8], dw: u32, dh: u32) {
-    let (sw, sh) = (src.width as f64, src.height as f64);
+/// The centred crop `(left, top, width, height)` of a `sw` x `sh` source
+/// that has the `dw` x `dh` aspect ratio (CSS `object-fit: cover`), in
+/// source pixels (fractional).
+pub fn cover_crop(sw: u32, sh: u32, dw: u32, dh: u32) -> (f64, f64, f64, f64) {
+    let (sw, sh) = (sw as f64, sh as f64);
     let target = dw as f64 / dh as f64;
     let (cw, ch) = if sw / sh > target {
         (sh * target, sh)
     } else {
         (sw, sw / target)
     };
+    ((sw - cw) / 2.0, (sh - ch) / 2.0, cw, ch)
+}
+
+/// Scale `src` to fill `dw` x `dh` exactly, cropping its centre to the
+/// target's aspect ratio (CSS `object-fit: cover`). Alpha is plain data.
+pub(crate) fn resize_cover_into(r: &mut Resizer, src: &Frame, dst: &mut [u8], dw: u32, dh: u32) {
+    let (left, top, cw, ch) = cover_crop(src.width, src.height, dw, dh);
     let src_img = ImageRef::new(src.width, src.height, &src.data, PixelType::U8x4)
         .expect("Frame invariant: len == w*h*4");
     let mut dst_img =
         Image::from_slice_u8(dw, dh, dst, PixelType::U8x4).expect("buffer sized by caller");
-    let opts = bilinear()
-        .use_alpha(false)
-        .crop((sw - cw) / 2.0, (sh - ch) / 2.0, cw, ch);
+    let opts = bilinear().use_alpha(false).crop(left, top, cw, ch);
     r.resize(&src_img, &mut dst_img, &opts)
         .expect("same pixel type on both sides");
 }

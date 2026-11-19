@@ -8,7 +8,8 @@ use fast_image_resize::Resizer;
 use p2c_core::{Frame, Mask};
 
 /// Subsampling factor for the statistics (the filter itself runs at 1/S size).
-const SUBSAMPLE: usize = 4;
+pub const GUIDED_SUBSAMPLE: usize = 4;
+const SUBSAMPLE: usize = GUIDED_SUBSAMPLE;
 
 /// Source coordinate for output pixel `d` when the source grid has `sn` cells of
 /// `s` output pixels each (cell `i` is centred at `(i + 0.5) * s`).

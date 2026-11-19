@@ -2,6 +2,8 @@
 //! compile everywhere; DXGI/D3D11 calls are Windows-only.
 pub mod adapters;
 #[cfg(windows)]
+mod backdrop;
+#[cfg(windows)]
 pub mod compose;
 #[cfg(windows)]
 pub mod device;

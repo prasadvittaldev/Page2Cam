@@ -8,6 +8,15 @@
 //! size changes; every composite copies the page into place and draws the
 //! cached layer 1:1 (R41).
 //!
+//! What is drawn comes from `p2c_compositor::plan_compose`, the CPU
+//! compositor's own decision (every fallback for a missing mask or webcam
+//! lives there): the page or the blurred room (cover-cropped at output size),
+//! then for the PIP the box backdrop (blur, image, colour) and the webcam
+//! layer over it. With refined edges the layer's matte is the guided-filter
+//! one ([`crate::backdrop`]) instead of the scaled mask through the edge LUT.
+//! Blurs are rebuilt only for a new webcam frame or size; the box image is
+//! uploaded once per image and scaled once per image and size.
+//!
 //! The BGRA intermediate matches `p2c_compositor::Compositor` (same
 //! `fit_rect`/`pip_rect` geometry and rounding): within ±2 per channel where
 //! the exact filter is used (unscaled, downscaled, letterbox), within 8 (mean
@@ -17,8 +26,8 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use p2c_compositor::{
-    fit_rect, pip_rect, Output, OutputFormat, OutputProducer, OutputSpec, OverlayStyle, PipLayout,
-    TickInputs,
+    fit_rect, pip_rect, plan_compose, Backdrop, BoxBackdrop, ComposePlan, Output, OutputFormat,
+    OutputProducer, OutputSpec, Pip, PipDraw, PipLayout, PlanBase, PlannedPip, TickInputs,
 };
 use p2c_core::{camera_size, EdgeRange, Frame, Mask, Nv12Frame};
 use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -33,13 +42,14 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM,
 };
 
+use crate::backdrop::{BackdropShaders, BlurConsts, BoxImage, GpuBlur, Guided};
 use crate::device::{Gpu, Texture};
 use crate::page::PageInput;
 use crate::profile::Profiler;
 use crate::readback::Readback;
 use crate::shaders::{bgra_to_nv12_into, ps};
 
-const COMPOSE_HLSL: &str = include_str!("hlsl/compose.hlsl");
+pub(crate) const COMPOSE_HLSL: &str = include_str!("hlsl/compose.hlsl");
 
 /// Largest admin preview (fitted, aspect kept; never larger than the output).
 const PREVIEW_MAX: (u32, u32) = (960, 540);
@@ -47,18 +57,18 @@ const PREVIEW_MAX: (u32, u32) = (960, 540);
 /// Constants of one draw (`cbuffer PassConsts` in compose.hlsl), 64 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct PassConsts {
-    rect: [f32; 4],
-    src_size: [f32; 2],
-    mask_size: [f32; 2],
-    mode: u32,
-    edge_lo: f32,
-    edge_hi: f32,
-    edge_full: u32,
+pub(crate) struct PassConsts {
+    pub(crate) rect: [f32; 4],
+    pub(crate) src_size: [f32; 2],
+    pub(crate) mask_size: [f32; 2],
+    pub(crate) mode: u32,
+    pub(crate) edge_lo: f32,
+    pub(crate) edge_hi: f32,
+    pub(crate) edge_full: u32,
     /// Scale the webcam / mask with the hardware bilinear sampler.
-    cam_linear: u32,
-    mask_linear: u32,
-    pad: [f32; 2],
+    pub(crate) cam_linear: u32,
+    pub(crate) mask_linear: u32,
+    pub(crate) pad: [f32; 2],
 }
 
 const MODE_OPAQUE: u32 = 0;
@@ -75,8 +85,8 @@ struct Pipeline {
     /// Premultiplied "over" for colour; destination alpha kept (opaque).
     blend: ID3D11BlendState,
     /// One constant buffer per draw of a frame (page, layer build, layer
-    /// draw, preview).
-    cbs: [ID3D11Buffer; 4],
+    /// draw, preview, blurred room, box backdrop).
+    cbs: [ID3D11Buffer; 6],
 }
 
 impl Pipeline {
@@ -116,12 +126,12 @@ impl Pipeline {
             ps_layer: crate::shaders::ps(device, COMPOSE_HLSL, "compose.hlsl", "ps_layer")?,
             ps_sample: crate::shaders::ps(device, COMPOSE_HLSL, "compose.hlsl", "ps_sample")?,
             blend: blend.context("CreateBlendState returned nothing")?,
-            cbs: [cb()?, cb()?, cb()?, cb()?],
+            cbs: [cb()?, cb()?, cb()?, cb()?, cb()?, cb()?],
         })
     }
 }
 
-fn viewport(x: f32, y: f32, w: f32, h: f32) -> D3D11_VIEWPORT {
+pub(crate) fn viewport(x: f32, y: f32, w: f32, h: f32) -> D3D11_VIEWPORT {
     D3D11_VIEWPORT {
         TopLeftX: x,
         TopLeftY: y,
@@ -138,13 +148,38 @@ struct Uploaded<T> {
     tex: Texture,
 }
 
+/// The webcam overlay of `inputs` as the CPU ticker passes it (a webcam
+/// frame without pixels counts as none).
+fn pip_of(inputs: &TickInputs) -> Option<Pip<'_>> {
+    let cam = inputs
+        .cam
+        .as_ref()
+        .filter(|c| c.width > 0 && c.height > 0)?;
+    Some(Pip {
+        cam,
+        mask: inputs.mask.as_ref(),
+        layout: &inputs.layout,
+    })
+}
+
+/// What to draw for `inputs`: the CPU compositor's own decision
+/// ([`plan_compose`]), with every fallback rule. The page comes from our
+/// texture, so the plan gets none.
+fn plan_of(inputs: &TickInputs) -> ComposePlan<'_> {
+    plan_compose(None, pip_of(inputs), &inputs.backdrop)
+}
+
 /// The inputs a composite was made from; identity comparison like the CPU
-/// compositor (Arc pointers, page sequence number, layout).
+/// compositor's `same_inputs` (Arc pointers, page sequence number, layout,
+/// backdrop).
 struct Key {
+    /// 0 under a blurred room (page repaints don't change the output).
     page_seq: u64,
+    /// The webcam frame the output depends on (PIP or blurred room).
     cam: Option<Arc<Frame>>,
     mask: Option<Arc<Mask>>,
     layout: Option<PipLayout>,
+    backdrop: Backdrop,
 }
 
 fn same<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
@@ -156,29 +191,18 @@ fn same<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
 }
 
 impl Key {
-    /// The effective inputs: the mask only for cut-out styles, and a cut-out
-    /// without a mask becomes a Box (as in the CPU compositor).
-    ///
-    /// TODO(Task 4): `inputs.backdrop` is accepted but not drawn yet: the GPU
-    /// path still renders Page + Room with LUT edges (refined off). Add the
-    /// backdrop to the key and draw it in shaders (blur, guided matte, image,
-    /// colour) to match the CPU compositor.
     fn of(page_seq: u64, inputs: &TickInputs) -> Key {
-        let cam = inputs.cam.clone().filter(|c| c.width > 0 && c.height > 0);
-        let mut layout = inputs.layout;
-        let mask = if cam.is_some() && layout.style.is_cutout() {
-            inputs.mask.clone()
-        } else {
-            None
+        let plan = plan_of(inputs);
+        let (page_seq, cam) = match plan.base {
+            PlanBase::Page(_) => (page_seq, plan.pip.map(|p| p.cam.clone())),
+            PlanBase::BlurredRoom(cam) => (0, Some(cam.clone())),
         };
-        if layout.style.is_cutout() && mask.is_none() {
-            layout.style = OverlayStyle::Box;
-        }
         Key {
             page_seq,
-            layout: cam.as_ref().map(|_| layout),
             cam,
-            mask,
+            mask: plan.pip.and_then(|p| p.mask.cloned()),
+            layout: plan.pip.map(|p| p.layout),
+            backdrop: inputs.backdrop.clone(),
         }
     }
 
@@ -187,6 +211,7 @@ impl Key {
             && same(&self.cam, &o.cam)
             && same(&self.mask, &o.mask)
             && self.layout == o.layout
+            && self.backdrop == o.backdrop
     }
 }
 
@@ -196,7 +221,7 @@ impl Key {
 /// rounding. Downscales widen the kernel; they keep the exact filter, which
 /// now runs only when the PIP layer is rebuilt, over a rectangle smaller
 /// than the source.
-fn use_sampler(sw: u32, sh: u32, dw: u32, dh: u32) -> bool {
+pub(crate) fn use_sampler(sw: u32, sh: u32, dw: u32, dh: u32) -> bool {
     dw >= sw && dh >= sh && (dw, dh) != (sw, sh)
 }
 
@@ -205,12 +230,17 @@ fn use_sampler(sw: u32, sh: u32, dw: u32, dh: u32) -> bool {
 struct LayerKey {
     cam: Arc<Frame>,
     mask: Option<Arc<Mask>>,
+    /// The matte is the guided-filter one (refined edges), not the LUT one.
+    refined: bool,
     size: (u32, u32),
 }
 
 impl LayerKey {
     fn same_as(&self, o: &LayerKey) -> bool {
-        Arc::ptr_eq(&self.cam, &o.cam) && same(&self.mask, &o.mask) && self.size == o.size
+        Arc::ptr_eq(&self.cam, &o.cam)
+            && same(&self.mask, &o.mask)
+            && self.refined == o.refined
+            && self.size == o.size
     }
 }
 
@@ -228,6 +258,15 @@ struct PipPlan {
     cam_srv: Option<ID3D11ShaderResourceView>,
     mask_srv: Option<ID3D11ShaderResourceView>,
     key: LayerKey,
+}
+
+/// What fills the box before the person is drawn over it (in-box backdrops).
+enum BoxFill {
+    /// The blurred webcam (reduced size, drawn upscaled).
+    Blur(Texture),
+    /// The image cover-scaled to the box, 1:1; `None` draws black.
+    Image(Option<Texture>),
+    Colour([u8; 3]),
 }
 
 /// NV12 render targets at one size, owned by the producer (R8 Y + R8G8 UV).
@@ -273,6 +312,13 @@ pub struct GpuProducer {
     /// The cached PIP layer (R41) and how often it was built.
     layer: Option<Layer>,
     layer_builds: u64,
+    /// Backdrop / refined-edge shaders, compiled on first use.
+    backdrop: Option<BackdropShaders>,
+    /// Blurred webcam for the box (in-box Blur) and for the whole frame.
+    box_blur: GpuBlur,
+    room_blur: GpuBlur,
+    box_image: Option<BoxImage>,
+    guided: Option<Guided>,
     out_nv12: Nv12Targets,
     /// Camera-size targets when the camera size differs from the output size.
     cam_nv12: Option<Nv12Targets>,
@@ -353,6 +399,11 @@ impl GpuProducer {
             mask: None,
             layer: None,
             layer_builds: 0,
+            backdrop: None,
+            box_blur: GpuBlur::new(),
+            room_blur: GpuBlur::new(),
+            box_image: None,
+            guided: None,
             out_nv12,
             cam_nv12,
             camera_ok,
@@ -389,6 +440,12 @@ impl GpuProducer {
         self.last_profile.take()
     }
 
+    /// How many times a blur (in-box or blurred room) was computed (tests).
+    #[doc(hidden)]
+    pub fn blur_builds(&self) -> u64 {
+        self.box_blur.builds + self.room_blur.builds
+    }
+
     /// How many times the PIP layer was built (tests: R41 caching).
     #[doc(hidden)]
     pub fn layer_builds(&self) -> u64 {
@@ -408,14 +465,13 @@ impl GpuProducer {
     /// readback rings.
     #[doc(hidden)]
     pub fn render_bgra_for_test(&mut self, inputs: &TickInputs) -> Result<Frame> {
-        let key = Key::of(self.page.seq(), inputs);
-        self.composite(&key)?;
+        self.composite(self.page.seq(), inputs)?;
         self.gpu.read_bgra(&self.target)
     }
 
     /// Upload the webcam frame / mask if their Arc changed.
-    fn upload(&mut self, key: &Key) -> Result<()> {
-        if let Some(cam) = &key.cam {
+    fn upload(&mut self, cam: Option<&Arc<Frame>>, mask: Option<&Arc<Mask>>) -> Result<()> {
+        if let Some(cam) = cam {
             match &self.cam {
                 Some(u) if Arc::ptr_eq(&u.src, cam) => {}
                 Some(u) if (u.tex.width(), u.tex.height()) == (cam.width, cam.height) => {
@@ -434,7 +490,7 @@ impl GpuProducer {
                 }
             }
         }
-        if let Some(m) = &key.mask {
+        if let Some(m) = mask {
             match &self.mask {
                 Some(u) if Arc::ptr_eq(&u.src, m) => {}
                 Some(u) if (u.tex.width(), u.tex.height()) == (m.width, m.height) => {
@@ -456,15 +512,17 @@ impl GpuProducer {
         Ok(())
     }
 
-    /// The PIP draw for `key`: its rectangle, and the layer-build constants
-    /// with the webcam and mask views. `None` without a visible PIP.
-    fn pip_plan(&self, key: &Key) -> Option<PipPlan> {
-        let (ow, oh) = (self.spec.width, self.spec.height);
-        let (cam, layout, up) = (key.cam.as_ref()?, key.layout.as_ref()?, self.cam.as_ref()?);
-        let (x, y, w, h) = pip_rect(layout, cam.width, cam.height, ow, oh)?;
-        if w == 0 || h == 0 {
-            return None;
-        }
+    /// The layer build for the planned PIP at `rect`: constants with the
+    /// webcam and mask views. Refined edges replace the mask view with the
+    /// guided matte when the layer is built.
+    fn pip_plan(
+        &self,
+        p: &PlannedPip,
+        rect: (i32, u32, u32, u32),
+        refined: bool,
+    ) -> Option<PipPlan> {
+        let (cam, up) = (p.cam, self.cam.as_ref()?);
+        let (_, _, w, h) = rect;
         let mut c = PassConsts {
             rect: [0.0, 0.0, w as f32, h as f32],
             src_size: [cam.width as f32, cam.height as f32],
@@ -473,7 +531,7 @@ impl GpuProducer {
             ..Default::default()
         };
         let mut mask_srv = None;
-        if let (Some(m), Some(mu)) = (&key.mask, &self.mask) {
+        if let (Some(m), Some(mu)) = (p.mask, &self.mask) {
             c.mode = MODE_CUTOUT;
             c.mask_size = [m.width as f32, m.height as f32];
             c.mask_linear = u32::from(use_sampler(m.width, m.height, w, h));
@@ -484,16 +542,26 @@ impl GpuProducer {
             mask_srv = mu.tex.srv().cloned();
         }
         Some(PipPlan {
-            rect: (x, y, w, h),
+            rect,
             build: c,
             cam_srv: up.tex.srv().cloned(),
             mask_srv,
             key: LayerKey {
                 cam: cam.clone(),
-                mask: key.mask.clone(),
+                mask: p.mask.cloned(),
+                // Without a mask the matte mode doesn't matter.
+                refined: refined && p.mask.is_some(),
                 size: (w, h),
             },
         })
+    }
+
+    /// The backdrop shaders (compiled on first use).
+    fn backdrop_shaders(&mut self) -> Result<&BackdropShaders> {
+        if self.backdrop.is_none() {
+            self.backdrop = Some(BackdropShaders::new(self.gpu.device())?);
+        }
+        self.backdrop.as_ref().context("backdrop shaders")
     }
 
     /// Render webcam x mask into the layer texture (only when its inputs or
@@ -507,6 +575,20 @@ impl GpuProducer {
             return Ok(());
         }
         let (w, h) = plan.key.size;
+        let mut c = plan.build;
+        let mut mask_srv = plan.mask_srv.clone();
+        if plan.key.refined {
+            // The guided matte replaces the scaled mask and its edge LUT.
+            self.backdrop_shaders()?;
+            let (Some(sh), Some(cam), Some(mask)) = (&self.backdrop, &self.cam, &self.mask) else {
+                bail!("refined edges without webcam/mask textures");
+            };
+            let m = Guided::run(&mut self.guided, &self.gpu, sh, &cam.tex, &mask.tex, (w, h))?;
+            c.mask_size = [m.width() as f32, m.height() as f32];
+            c.mask_linear = u32::from(use_sampler(m.width(), m.height(), w, h));
+            c.edge_full = 1;
+            mask_srv = m.srv().cloned();
+        }
         let tex = match self.layer.take() {
             Some(l) if (l.tex.width(), l.tex.height()) == (w, h) => l.tex,
             _ => {
@@ -518,7 +600,6 @@ impl GpuProducer {
         let rtv = tex.rtv().cloned().context("layer has no RTV")?;
         let ctx = self.gpu.context();
         let s = self.gpu.shaders();
-        let c = plan.build;
         {
             let _lock = self.gpu.lock();
             // SAFETY: resources of this device; state sequence under the lock.
@@ -534,7 +615,7 @@ impl GpuProducer {
                 ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
                 ctx.PSSetConstantBuffers(0, Some(&[Some(cb.clone())]));
                 ctx.PSSetSamplers(0, Some(&[Some(s.linear_clamp.clone())]));
-                ctx.PSSetShaderResources(0, Some(&[plan.cam_srv.clone(), plan.mask_srv.clone()]));
+                ctx.PSSetShaderResources(0, Some(&[plan.cam_srv.clone(), mask_srv]));
                 ctx.RSSetViewports(Some(&[viewport(0.0, 0.0, w as f32, h as f32)]));
                 ctx.Draw(3, 0);
                 ctx.OMSetRenderTargets(None, None);
@@ -549,19 +630,88 @@ impl GpuProducer {
         Ok(())
     }
 
-    /// Draw page + PIP into `self.target`.
-    fn composite(&mut self, key: &Key) -> Result<()> {
-        self.upload(key)?;
+    /// The blurred webcam for a `size` destination (`room`: the whole-frame
+    /// blur, cover-cropped; else the box blur, stretched), cached per frame.
+    fn blur(&mut self, cam: &Arc<Frame>, size: (u32, u32), room: bool) -> Result<Texture> {
+        self.backdrop_shaders()?;
+        let (Some(sh), Some(up)) = (&self.backdrop, &self.cam) else {
+            bail!("blur without a webcam texture");
+        };
+        let cache = if room {
+            &mut self.room_blur
+        } else {
+            &mut self.box_blur
+        };
+        Ok(cache.get(&self.gpu, sh, cam, &up.tex, size, room)?.clone())
+    }
+
+    /// What fills the box under the person for `draw` (a `w` x `h` box).
+    fn box_fill(
+        &mut self,
+        draw: &PipDraw,
+        cam: &Arc<Frame>,
+        (w, h): (u32, u32),
+    ) -> Result<Option<BoxFill>> {
+        Ok(match draw {
+            PipDraw::BlurAll | PipDraw::Over(BoxBackdrop::Blur) => {
+                Some(BoxFill::Blur(self.blur(cam, (w, h), false)?))
+            }
+            PipDraw::Over(BoxBackdrop::Image(img)) => {
+                self.backdrop_shaders()?;
+                let sh = self.backdrop.as_ref().context("backdrop shaders")?;
+                let t = BoxImage::scaled(&mut self.box_image, &self.gpu, sh, img, (w, h))?;
+                Some(BoxFill::Image(t.cloned()))
+            }
+            PipDraw::Over(BoxBackdrop::Colour(c)) => {
+                self.backdrop_shaders()?;
+                Some(BoxFill::Colour(*c))
+            }
+            PipDraw::Over(BoxBackdrop::Room) | PipDraw::Opaque | PipDraw::Cutout => None,
+        })
+    }
+
+    /// Draw what [`plan_compose`] decides for `inputs` into `self.target`:
+    /// the page or the blurred room, then the PIP (box backdrop, then the
+    /// webcam layer over it).
+    fn composite(&mut self, page_seq: u64, inputs: &TickInputs) -> Result<()> {
+        let plan = plan_of(inputs);
+        let (ow, oh) = (self.spec.width, self.spec.height);
+        let room_cam = match plan.base {
+            PlanBase::BlurredRoom(cam) => Some(cam),
+            PlanBase::Page(_) => None,
+        };
+        self.upload(
+            room_cam.or(plan.pip.map(|p| p.cam)),
+            plan.pip.and_then(|p| p.mask),
+        )?;
         self.mark("upload")?;
-        let pip = self.pip_plan(key);
-        if let Some(plan) = &pip {
-            self.build_layer(plan)?;
+        let refined = inputs.backdrop.refined_edges;
+        let pip = plan.pip.and_then(|p| {
+            let rect = pip_rect(&p.layout, p.cam.width, p.cam.height, ow, oh)?;
+            (rect.2 > 0 && rect.3 > 0).then_some((p, rect))
+        });
+        let room = match room_cam {
+            Some(cam) => Some(self.blur(cam, (ow, oh), true)?),
+            None => None,
+        };
+        let fill = match &pip {
+            Some((p, (_, _, w, h))) => self.box_fill(&p.draw, p.cam, (*w, *h))?,
+            None => None,
+        };
+        self.mark("backdrop")?;
+        let layer_plan = match &pip {
+            Some((p, rect)) if !matches!(p.draw, PipDraw::BlurAll) => {
+                self.pip_plan(p, *rect, refined)
+            }
+            _ => None,
+        };
+        if let Some(lp) = &layer_plan {
+            self.build_layer(lp)?;
         }
         self.mark("layer")?;
         // Take the page texture before locking the context: PageInput's
         // mutex must never be taken while holding `gpu.lock()` (R22).
-        let page = (key.page_seq > 0).then(|| self.page.texture());
-        let (ow, oh) = (self.spec.width, self.spec.height);
+        let page = (room.is_none() && page_seq > 0).then(|| self.page.texture());
 
         let page_draw = page.as_ref().and_then(|t| {
             let (x, y, w, h) = fit_rect(t.width(), t.height(), ow, oh);
@@ -575,7 +725,7 @@ impl GpuProducer {
                 (t, c)
             })
         });
-        let layer_draw = pip.as_ref().and_then(|plan| {
+        let layer_draw = layer_plan.as_ref().and_then(|plan| {
             let l = self.layer.as_ref()?;
             let (x, y, w, h) = plan.rect;
             let c = PassConsts {
@@ -583,6 +733,13 @@ impl GpuProducer {
                 ..Default::default()
             };
             Some((l.tex.srv().cloned(), c))
+        });
+        let fill_draw = pip.as_ref().zip(fill).map(|((_, (x, y, w, h)), f)| {
+            let c = PassConsts {
+                rect: [*x as f32, *y as f32, *w as f32, *h as f32],
+                ..Default::default()
+            };
+            (f, c)
         });
 
         let rtv = self.target.rtv().cloned().context("target has no RTV")?;
@@ -592,10 +749,11 @@ impl GpuProducer {
         // SAFETY: all resources belong to this device; the lock keeps other
         // threads from changing pipeline state in between.
         unsafe {
-            // An unscaled page covering the output is copied, no clear.
-            let covers = page_draw
-                .as_ref()
-                .is_some_and(|(_, c)| c.rect == [0.0, 0.0, ow as f32, oh as f32]);
+            // An unscaled page or the blurred room covers the output: no clear.
+            let covers = room.is_some()
+                || page_draw
+                    .as_ref()
+                    .is_some_and(|(_, c)| c.rect == [0.0, 0.0, ow as f32, oh as f32]);
             if !covers {
                 ctx.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]);
             }
@@ -630,8 +788,57 @@ impl GpuProducer {
                     ctx.Draw(3, 0);
                 }
             }
+            if let Some(t) = &room {
+                // The blurred room, upscaled bilinearly over the whole frame.
+                let c = PassConsts {
+                    rect: [0.0, 0.0, ow as f32, oh as f32],
+                    ..Default::default()
+                };
+                let cb = &self.pipe.cbs[4];
+                ctx.UpdateSubresource(cb, 0, None, &c as *const _ as _, 0, 0);
+                ctx.PSSetShader(&self.pipe.ps_sample, None);
+                ctx.PSSetSamplers(0, Some(&[Some(s.linear_clamp.clone())]));
+                ctx.OMSetBlendState(None, None, 0xffff_ffff);
+                ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+                ctx.PSSetConstantBuffers(0, Some(&[Some(cb.clone())]));
+                ctx.PSSetShaderResources(0, Some(&[t.srv().cloned(), None]));
+                ctx.RSSetViewports(Some(&[viewport(0.0, 0.0, ow as f32, oh as f32)]));
+                ctx.Draw(3, 0);
+            }
             if self.profiling {
                 self.prof.mark(&self.gpu, "page")?;
+            }
+            if let Some((f, c)) = &fill_draw {
+                // The box backdrop (opaque), before the person.
+                let cb = &self.pipe.cbs[5];
+                ctx.UpdateSubresource(cb, 0, None, c as *const _ as _, 0, 0);
+                let (shader, srv, cb1) = match f {
+                    BoxFill::Blur(t) => (&self.pipe.ps_sample, t.srv().cloned(), None),
+                    BoxFill::Image(Some(t)) => (&self.pipe.ps_layer, t.srv().cloned(), None),
+                    BoxFill::Image(None) | BoxFill::Colour(_) => {
+                        let [r, g, b] = match f {
+                            BoxFill::Colour(rgb) => *rgb,
+                            _ => [0, 0, 0],
+                        };
+                        let sh = self.backdrop.as_ref().context("backdrop shaders")?;
+                        let bc = BlurConsts {
+                            fill: [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0],
+                            ..Default::default()
+                        };
+                        ctx.UpdateSubresource(&sh.cb_blur, 0, None, &bc as *const _ as _, 0, 0);
+                        (&sh.fill, None, Some(sh.cb_blur.clone()))
+                    }
+                };
+                ctx.PSSetShader(shader, None);
+                ctx.PSSetSamplers(0, Some(&[Some(s.linear_clamp.clone())]));
+                ctx.OMSetBlendState(None, None, 0xffff_ffff);
+                ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+                ctx.PSSetConstantBuffers(0, Some(&[Some(cb.clone()), cb1]));
+                ctx.PSSetShaderResources(0, Some(&[srv, None]));
+                ctx.RSSetViewports(Some(&[viewport(
+                    c.rect[0], c.rect[1], c.rect[2], c.rect[3],
+                )]));
+                ctx.Draw(3, 0);
             }
             if let Some((srv, c)) = layer_draw {
                 let cb = &self.pipe.cbs[2];
@@ -652,6 +859,7 @@ impl GpuProducer {
             // Unbind so the target can be sampled and the inputs updated.
             ctx.OMSetRenderTargets(None, None);
             ctx.PSSetShaderResources(0, Some(&[None, None]));
+            ctx.PSSetConstantBuffers(1, Some(&[None]));
             ctx.OMSetBlendState(None, None, 0xffff_ffff);
         }
         Ok(())
@@ -815,7 +1023,7 @@ impl GpuProducer {
         let key = Key::of(self.page.seq(), inputs);
         let changed = !self.last_key.as_ref().is_some_and(|k| k.same_as(&key));
         let fresh = if changed {
-            self.composite(&key)?;
+            self.composite(key.page_seq, inputs)?;
             self.composite += 1;
             self.last_key = Some(key);
             self.convert()?;

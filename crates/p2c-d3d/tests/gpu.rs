@@ -1233,3 +1233,814 @@ fn producer_moves_to_the_adapter_chromium_renders_on() {
         }
     }
 }
+
+// ---- Backdrops and refined edges (quality-backgrounds Task 4) ----
+//
+// Not ignored: they run on every hardware adapter of this machine and skip
+// with a log line where there is none.
+
+use p2c_compositor::{Backdrop, BoxBackdrop, ComposeNote, FullBackdrop};
+
+/// Hardware adapters, or none (with a log line) so the caller skips.
+fn adapters_or_skip(test: &str) -> Vec<AdapterInfo> {
+    let l: Vec<_> = enumerate().into_iter().filter(|a| !a.software).collect();
+    if l.is_empty() {
+        println!("{test}: no hardware D3D11 adapter; skipped");
+    }
+    l
+}
+
+fn fnv(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// (label, page, output size, inputs) of the GPU compositor's existing cases
+/// with `Backdrop::default()` (Page, Room, LUT edges).
+/// (label, page, output size, inputs).
+type TodayCase = (&'static str, Option<Frame>, (u32, u32), TickInputs);
+
+fn today_cases() -> Vec<TodayCase> {
+    let ti = |cam: Option<Frame>, mask: Option<Arc<Mask>>, l: PipLayout| TickInputs {
+        page: None,
+        cam: cam.map(Arc::new),
+        mask,
+        layout: l,
+        backdrop: Backdrop::default(),
+    };
+    let mut edge100 = Mask::new(40, 30, vec![100; 40 * 30]).unwrap();
+    edge100.edge = EdgeRange { lo: 64, hi: 192 };
+    vec![
+        (
+            "box",
+            Some(noise(640, 360, 1)),
+            (640, 360),
+            ti(
+                Some(noise(320, 240, 2)),
+                None,
+                layout(OverlayStyle::Box, 0.3, 0.6, 0.3),
+            ),
+        ),
+        (
+            "box with a mask",
+            Some(noise(640, 360, 1)),
+            (640, 360),
+            ti(
+                Some(noise(320, 240, 2)),
+                Some(soft_mask(80, 60, EdgeRange::FULL)),
+                layout(OverlayStyle::Box, 0.3, 0.6, 0.3),
+            ),
+        ),
+        (
+            "cutout small",
+            Some(noise(640, 360, 3)),
+            (640, 360),
+            ti(
+                Some(noise(320, 180, 4)),
+                Some(soft_mask(80, 45, EdgeRange::FULL)),
+                layout(OverlayStyle::CutoutSmall, 0.7, 0.0, 0.4),
+            ),
+        ),
+        (
+            "cutout full x=0",
+            Some(noise(640, 360, 5)),
+            (640, 360),
+            ti(
+                Some(noise(320, 180, 6)),
+                Some(soft_mask(160, 90, EdgeRange::FULL)),
+                layout(OverlayStyle::CutoutFull, 0.0, 0.0, 0.25),
+            ),
+        ),
+        (
+            "edge range, mask 100",
+            Some(noise(640, 360, 7)),
+            (640, 360),
+            ti(
+                Some(noise(320, 240, 8)),
+                Some(Arc::new(edge100)),
+                layout(OverlayStyle::CutoutFull, 0.5, 0.0, 0.25),
+            ),
+        ),
+        (
+            "edge range, soft mask",
+            Some(noise(640, 360, 9)),
+            (640, 360),
+            ti(
+                Some(noise(320, 240, 10)),
+                Some(soft_mask(64, 48, EdgeRange { lo: 64, hi: 192 })),
+                layout(OverlayStyle::CutoutSmall, 0.2, 0.0, 0.5),
+            ),
+        ),
+        (
+            "cutout full 1080p",
+            Some(noise(1920, 1080, 41)),
+            (1920, 1080),
+            ti(
+                Some(noise(1280, 720, 42)),
+                Some(soft_mask(640, 360, EdgeRange { lo: 40, hi: 220 })),
+                layout(OverlayStyle::CutoutFull, 0.5, 0.0, 0.25),
+            ),
+        ),
+        (
+            "cut-out without mask",
+            Some(noise(640, 360, 11)),
+            (640, 360),
+            ti(
+                Some(noise(320, 180, 12)),
+                None,
+                layout(OverlayStyle::CutoutFull, 0.2, 0.5, 0.3),
+            ),
+        ),
+        (
+            "4:3 page",
+            Some(noise(400, 300, 13)),
+            (640, 360),
+            ti(
+                Some(noise(160, 120, 14)),
+                None,
+                layout(OverlayStyle::Box, 1.0, 1.0, 0.25),
+            ),
+        ),
+        (
+            "4:3 page, downscaled, no webcam",
+            Some(noise(1024, 768, 15)),
+            (640, 360),
+            ti(None, None, PipLayout::default()),
+        ),
+        (
+            "hidden pip",
+            Some(noise(640, 360, 17)),
+            (640, 360),
+            ti(
+                Some(noise(320, 180, 18)),
+                Some(soft_mask(80, 45, EdgeRange::FULL)),
+                PipLayout {
+                    visible: false,
+                    ..layout(OverlayStyle::CutoutSmall, 0.5, 0.0, 0.4)
+                },
+            ),
+        ),
+        (
+            "no page yet",
+            None,
+            (640, 360),
+            ti(
+                Some(noise(320, 180, 16)),
+                None,
+                layout(OverlayStyle::Box, 0.0, 0.0, 0.25),
+            ),
+        ),
+    ]
+}
+
+/// GPU output hashes of [`today_cases`] from the GPU compositor before
+/// backdrops (commit 5296130), per adapter name. A driver update may change
+/// them (the shaders are the same; rounding inside the driver is not ours):
+/// then re-capture with `P2C_PRINT_GPU_HASHES=1` on the old commit.
+const TODAY_GPU: &[(&str, &[u64])] = &[
+    (
+        "Intel(R) UHD Graphics",
+        &[
+            4025485033438984934,
+            4025485033438984934,
+            192081244833896544,
+            8344175307028417851,
+            3667518654555366198,
+            8357457479091645205,
+            5066645306656391881,
+            12231197240143780934,
+            6736479082463568632,
+            2842473286698388443,
+            294307805838554806,
+            3858574375304064849,
+        ],
+    ),
+    (
+        "NVIDIA RTX 2000 Ada Generation Laptop GPU",
+        &[
+            16729803995776210676,
+            16729803995776210676,
+            729809452394762057,
+            8344175307028417851,
+            7087019108189793500,
+            8357457479091645205,
+            10751377556055003541,
+            3808767700574327800,
+            14294963803269799104,
+            209133133403119282,
+            294307805838554806,
+            3858574375304064849,
+        ],
+    ),
+];
+
+/// Refined edges off with Page/Room: exactly what the GPU drew before backdrops.
+#[test]
+fn gpu_refined_off_matches_previous_gpu_output() {
+    for a in adapters_or_skip("gpu_refined_off_matches_previous_gpu_output") {
+        let gpu = Gpu::new(a.luid).unwrap();
+        let mut got = Vec::new();
+        for (label, page, (w, h), inputs) in today_cases() {
+            let mut p = match &page {
+                Some(pg) => producer_with_page(&gpu, pg, spec(w, h)),
+                None => {
+                    let input = PageInput::new(&gpu, w, h).unwrap();
+                    GpuProducer::new(gpu.clone(), input, spec(w, h)).unwrap()
+                }
+            };
+            let out = p.render_bgra_for_test(&inputs).unwrap();
+            assert!(
+                out.data.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
+                "{label}: opaque"
+            );
+            got.push((label, fnv(&out.data)));
+        }
+        let hashes: Vec<u64> = got.iter().map(|(_, h)| *h).collect();
+        if std::env::var_os("P2C_PRINT_GPU_HASHES").is_some() {
+            println!("(\"{}\", &{hashes:?}),", a.name);
+        }
+        match TODAY_GPU.iter().find(|(n, _)| *n == a.name) {
+            Some((_, want)) => {
+                for ((label, h), w) in got.iter().zip(want.iter()) {
+                    assert_eq!(
+                        h, w,
+                        "{}: {label} differs from the previous GPU output",
+                        a.name
+                    );
+                }
+                assert_eq!(hashes.len(), want.len());
+                println!("refined off = previous GPU output on {} (exact)", a.name);
+            }
+            None => println!(
+                "{}: no previous GPU hashes for this adapter; only CPU parity (other tests)",
+                a.name
+            ),
+        }
+    }
+}
+
+const T_PERSON: [u8; 4] = [180, 255, 255, 255];
+const T_GREEN: [u8; 4] = [0, 255, 0, 255];
+const T_BLUE: [u8; 4] = [255, 0, 0, 255];
+const T_MAGENTA: [u8; 4] = [255, 0, 255, 255];
+const T_WHITE: [u8; 4] = [255, 255, 255, 255];
+
+/// The compositor tests' webcam: left half person (solid), right half room
+/// (a 2 px green/blue checker, so sharp and blurred rooms differ a lot).
+fn person_cam(w: u32, h: u32) -> Arc<Frame> {
+    let mut d = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let px = if x < w / 2 {
+                T_PERSON
+            } else if (x / 2 + y / 2) % 2 == 0 {
+                T_GREEN
+            } else {
+                T_BLUE
+            };
+            d.extend_from_slice(&px);
+        }
+    }
+    Arc::new(Frame::from_bgra(w, h, d).unwrap())
+}
+
+/// Person mask matching `person_cam` (left half 255) at `w` x `h`.
+fn person_mask_sized(w: u32, h: u32) -> Arc<Mask> {
+    let data = (0..h)
+        .flat_map(|_| (0..w).map(move |x| if x < w / 2 { 255 } else { 0 }))
+        .collect();
+    Arc::new(Mask::new(w, h, data).unwrap())
+}
+
+fn person_mask() -> Arc<Mask> {
+    person_mask_sized(64, 36)
+}
+
+fn solid_arc(w: u32, h: u32, px: [u8; 4]) -> Arc<Frame> {
+    Arc::new(Frame::from_bgra(w, h, px.repeat((w * h) as usize)).unwrap())
+}
+
+fn backdrop(full: FullBackdrop, in_box: BoxBackdrop, refined_edges: bool) -> Backdrop {
+    Backdrop {
+        full,
+        in_box,
+        refined_edges,
+    }
+}
+
+/// The CPU compositor's output for `inputs` (page `page` or none) and its note.
+fn cpu_compose(
+    page: Option<&Frame>,
+    (w, h): (u32, u32),
+    inputs: &TickInputs,
+) -> (Frame, ComposeNote) {
+    let page = page.map(|p| Arc::new(p.clone()));
+    let mut out = Frame::new_black(w, h);
+    let mut c = Compositor::new();
+    let pip = inputs.cam.as_ref().map(|cam| Pip {
+        cam,
+        mask: inputs.mask.as_ref(),
+        layout: &inputs.layout,
+    });
+    c.compose(page.as_ref(), pip, &inputs.backdrop, &mut out);
+    (out, c.note())
+}
+
+/// A producer showing `page` (or no page yet).
+fn producer(gpu: &Gpu, page: Option<&Frame>, (w, h): (u32, u32)) -> GpuProducer {
+    match page {
+        Some(pg) => producer_with_page(gpu, pg, spec(w, h)),
+        None => {
+            let input = PageInput::new(gpu, w, h).unwrap();
+            GpuProducer::new(gpu.clone(), input, spec(w, h)).unwrap()
+        }
+    }
+}
+
+/// Mean absolute difference of the worst colour channel, and the largest
+/// single difference with its position.
+fn mean_and_max(a: &Frame, b: &Frame) -> (f64, u8, u32, u32) {
+    let mean = bgra_mean_diff(a, b);
+    let (d, x, y) = bgra_diff(a, b);
+    (mean[..3].iter().cloned().fold(0.0, f64::max), d, x, y)
+}
+
+/// Tolerance of the backdrop/refined passes against the CPU compositor.
+const BACKDROP_MEAN: f64 = 3.0;
+const BACKDROP_MAX: u8 = 24;
+
+type Case = (String, Option<Frame>, (u32, u32), TickInputs);
+
+/// Compare the GPU with the CPU on every adapter.
+fn backdrop_parity(test: &str, cases: &[Case]) {
+    let adapters = adapters_or_skip(test);
+    if adapters.is_empty() {
+        return;
+    }
+    let cpu: Vec<_> = cases
+        .iter()
+        .map(|(label, page, size, inputs)| {
+            let (out, note) = cpu_compose(page.as_ref(), *size, inputs);
+            // The ticker computes the note for both paths from the inputs alone.
+            let want = ComposeNote::of(
+                &inputs.backdrop,
+                &inputs.layout,
+                inputs.cam.is_some(),
+                inputs.mask.is_some(),
+            );
+            assert_eq!(note, want, "{label}: note");
+            out
+        })
+        .collect();
+    let mut failures = Vec::new();
+    for a in adapters {
+        let gpu = Gpu::new(a.luid).unwrap();
+        for ((label, page, size, inputs), want) in cases.iter().zip(&cpu) {
+            let mut p = producer(&gpu, page.as_ref(), *size);
+            let got = p.render_bgra_for_test(inputs).unwrap();
+            let (mean, d, x, y) = mean_and_max(want, &got);
+            let line = format!(
+                "{test} | {label} | {} | mean {mean:.3} | max {d} at ({x},{y})",
+                a.name
+            );
+            println!("{line}");
+            assert!(
+                got.data.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
+                "{label} on {}: not opaque",
+                a.name
+            );
+            if mean > BACKDROP_MEAN || d > BACKDROP_MAX {
+                failures.push(format!(
+                    "{line}: cpu {:?} gpu {:?}",
+                    want.pixel(x, y),
+                    got.pixel(x, y)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn ti(cam: &Arc<Frame>, mask: Option<&Arc<Mask>>, l: PipLayout, b: Backdrop) -> TickInputs {
+    TickInputs {
+        page: None,
+        cam: Some(cam.clone()),
+        mask: mask.cloned(),
+        layout: l,
+        backdrop: b,
+    }
+}
+
+/// Task 3's `backdrop_table` cases (and the fallbacks of `plan()`), GPU vs CPU.
+#[test]
+fn gpu_backdrop_matches_cpu() {
+    let white = Frame::from_bgra(320, 180, T_WHITE.repeat(320 * 180)).unwrap();
+    let page = Some(white);
+    let cam = person_cam(256, 144);
+    let m = person_mask();
+    let big_box = layout(OverlayStyle::Box, 0.0, 0.0, 0.8);
+    let magenta = solid_arc(7, 5, T_MAGENTA);
+    let picture = Arc::new(gradient(50, 20, 3));
+    let mut cases: Vec<Case> = Vec::new();
+    for in_box in [
+        BoxBackdrop::Room,
+        BoxBackdrop::Blur,
+        BoxBackdrop::Image(magenta.clone()),
+        BoxBackdrop::Image(picture.clone()),
+        BoxBackdrop::Colour([10, 20, 30]),
+    ] {
+        for fresh in [true, false] {
+            let name = match &in_box {
+                BoxBackdrop::Image(i) => format!("Image {}x{}", i.width, i.height),
+                b => format!("{b:?}"),
+            };
+            let b = backdrop(FullBackdrop::Page, in_box.clone(), false);
+            cases.push((
+                format!("box {name} fresh={fresh}"),
+                page.clone(),
+                (320, 180),
+                ti(&cam, fresh.then_some(&m), big_box, b),
+            ));
+        }
+    }
+    // Blurred room behind a small cut-out, fresh and stale mask.
+    let cam320 = person_cam(320, 180);
+    let small = layout(OverlayStyle::CutoutSmall, 1.0, 0.0, 0.5);
+    for fresh in [true, false] {
+        let b = backdrop(FullBackdrop::BlurredRoom, BoxBackdrop::Room, false);
+        cases.push((
+            format!("blurred room fresh={fresh}"),
+            page.clone(),
+            (320, 180),
+            ti(&cam320, fresh.then_some(&m), small, b),
+        ));
+    }
+    // A Box under a blurred room: in-box Room is treated as Blur.
+    for fresh in [true, false] {
+        let b = backdrop(FullBackdrop::BlurredRoom, BoxBackdrop::Room, false);
+        cases.push((
+            format!("blurred room + box room fresh={fresh}"),
+            page.clone(),
+            (320, 180),
+            ti(&cam, fresh.then_some(&m), big_box, b),
+        ));
+    }
+    // A 4:3 webcam under a blurred room: cover-cropped; hidden PIP.
+    let cam43 = person_cam(160, 120);
+    let hidden = PipLayout {
+        visible: false,
+        ..PipLayout::default()
+    };
+    cases.push((
+        "blurred room 4:3 hidden pip".into(),
+        page.clone(),
+        (320, 180),
+        ti(
+            &cam43,
+            None,
+            hidden,
+            backdrop(FullBackdrop::BlurredRoom, BoxBackdrop::Room, false),
+        ),
+    ));
+    // Blurred room without a webcam: the page.
+    cases.push((
+        "blurred room no webcam".into(),
+        page.clone(),
+        (320, 180),
+        TickInputs {
+            page: None,
+            cam: None,
+            mask: None,
+            layout: small,
+            backdrop: backdrop(FullBackdrop::BlurredRoom, BoxBackdrop::Blur, false),
+        },
+    ));
+    // Cut-out styles ignore the box backdrop.
+    let full = layout(OverlayStyle::CutoutFull, 0.3, 0.0, 0.5);
+    cases.push((
+        "cutout full ignores in-box blur".into(),
+        page.clone(),
+        (320, 180),
+        ti(
+            &cam,
+            Some(&m),
+            full,
+            backdrop(FullBackdrop::Page, BoxBackdrop::Blur, false),
+        ),
+    ));
+    // Live sizes: 1080p output, 1280x720 webcam, 640x360 mask.
+    let page1080 = noise(1920, 1080, 51);
+    let cam720 = person_cam(1280, 720);
+    let m360 = person_mask_sized(640, 360);
+    for in_box in [BoxBackdrop::Blur, BoxBackdrop::Colour([200, 100, 50])] {
+        cases.push((
+            format!("1080p box {in_box:?}"),
+            Some(page1080.clone()),
+            (1920, 1080),
+            ti(
+                &cam720,
+                Some(&m360),
+                layout(OverlayStyle::Box, 1.0, 1.0, 0.3),
+                backdrop(FullBackdrop::Page, in_box, false),
+            ),
+        ));
+    }
+    cases.push((
+        "1080p blurred room cutout full".into(),
+        Some(page1080.clone()),
+        (1920, 1080),
+        ti(
+            &cam720,
+            Some(&m360),
+            layout(OverlayStyle::CutoutFull, 0.5, 0.0, 0.25),
+            backdrop(FullBackdrop::BlurredRoom, BoxBackdrop::Room, false),
+        ),
+    ));
+    backdrop_parity("gpu_backdrop_matches_cpu", &cases);
+}
+
+/// A webcam with texture in both halves, so the guide matters.
+fn textured_person_cam(w: u32, h: u32, salt: u32) -> Arc<Frame> {
+    let n = noise(w, h, 77 + salt);
+    let mut d = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let t = &n.data[i..i + 3];
+            let px = if x < w / 2 {
+                [150 + t[0] / 8, 220 + t[1] / 8, 220 + t[2] / 8, 255]
+            } else {
+                [t[0] / 3, t[1] / 3, t[2] / 3, 255]
+            };
+            d.extend_from_slice(&px);
+        }
+    }
+    Arc::new(Frame::from_bgra(w, h, d).unwrap())
+}
+
+/// Refined edges on (guided upsampling replaces the edge LUT), GPU vs CPU.
+#[test]
+fn gpu_refined_matches_cpu() {
+    let mut cases: Vec<Case> = Vec::new();
+    let page = Some(noise(640, 360, 61));
+    let cam = textured_person_cam(320, 180, 0);
+    let soft = soft_mask(64, 36, EdgeRange { lo: 40, hi: 220 });
+    let sharp = person_mask();
+    for (style, x, w) in [
+        (OverlayStyle::CutoutFull, 0.5, 0.25),
+        (OverlayStyle::CutoutFull, 0.0, 0.25),
+        (OverlayStyle::CutoutSmall, 0.3, 0.4),
+        (OverlayStyle::Box, 0.6, 0.5),
+    ] {
+        for (mname, m) in [("soft", &soft), ("person", &sharp)] {
+            let in_box = if style == OverlayStyle::Box {
+                BoxBackdrop::Blur
+            } else {
+                BoxBackdrop::Room
+            };
+            cases.push((
+                format!("{style:?} x={x} {mname} mask"),
+                page.clone(),
+                (640, 360),
+                ti(
+                    &cam,
+                    Some(m),
+                    layout(style, x, 1.0, w),
+                    backdrop(FullBackdrop::Page, in_box, true),
+                ),
+            ));
+        }
+    }
+    // A PIP downscaled from the webcam (the guide is scaled down).
+    let cam_big = textured_person_cam(1280, 720, 1);
+    cases.push((
+        "small cut-out, 1280x720 webcam".into(),
+        page.clone(),
+        (640, 360),
+        ti(
+            &cam_big,
+            Some(&soft),
+            layout(OverlayStyle::CutoutSmall, 1.0, 1.0, 0.3),
+            backdrop(FullBackdrop::Page, BoxBackdrop::Room, true),
+        ),
+    ));
+    // Live sizes: the 1080p cut-out full is 1920 wide (refined at 960, then upscaled).
+    let m360 = person_mask_sized(640, 360);
+    for full in [FullBackdrop::Page, FullBackdrop::BlurredRoom] {
+        cases.push((
+            format!("1080p cutout full {full:?}"),
+            Some(noise(1920, 1080, 62)),
+            (1920, 1080),
+            ti(
+                &cam_big,
+                Some(&m360),
+                layout(OverlayStyle::CutoutFull, 0.5, 0.0, 0.25),
+                backdrop(full, BoxBackdrop::Room, true),
+            ),
+        ));
+    }
+    // Refined without a mask: the same as off (a Box).
+    cases.push((
+        "refined, stale mask".into(),
+        page.clone(),
+        (640, 360),
+        ti(
+            &cam,
+            None,
+            layout(OverlayStyle::CutoutSmall, 0.3, 0.0, 0.4),
+            backdrop(FullBackdrop::Page, BoxBackdrop::Room, true),
+        ),
+    ));
+    backdrop_parity("gpu_refined_matches_cpu", &cases);
+    // The comparison can tell: the GPU's refined matte is far from the LUT one.
+    let (_, page0, size0, refined0) = &cases[0];
+    let mut lut = refined0.clone();
+    lut.backdrop.refined_edges = false;
+    let (cpu_lut, _) = cpu_compose(page0.as_ref(), *size0, &lut);
+    for a in adapters_or_skip("gpu_refined_matches_cpu") {
+        let gpu = Gpu::new(a.luid).unwrap();
+        let got = producer(&gpu, page0.as_ref(), *size0)
+            .render_bgra_for_test(refined0)
+            .unwrap();
+        let (_, d, _, _) = mean_and_max(&cpu_lut, &got);
+        assert!(
+            d > BACKDROP_MAX,
+            "{}: refined looks like the LUT matte ({d})",
+            a.name
+        );
+    }
+}
+
+/// The blurs are rebuilt for a new webcam frame or a new size (webcam
+/// reconnect, PIP resize), never shown stale at the wrong size, and reused
+/// otherwise.
+#[test]
+fn gpu_blur_cache_rebuilds_on_size_change() {
+    let page = noise(640, 360, 71);
+    for a in adapters_or_skip("gpu_blur_cache_rebuilds_on_size_change") {
+        let gpu = Gpu::new(a.luid).unwrap();
+        let input = PageInput::new(&gpu, 640, 360).unwrap();
+        let shared = gpu.create_shared_bgra(&page).unwrap();
+        input.on_shared_texture(shared.handle()).unwrap();
+        let mut p = GpuProducer::new(gpu.clone(), input.clone(), spec(640, 360)).unwrap();
+        let cam = person_cam(320, 180);
+        let m = person_mask();
+        let mut inputs = ti(
+            &cam,
+            Some(&m),
+            layout(OverlayStyle::Box, 0.2, 0.3, 0.4),
+            backdrop(FullBackdrop::Page, BoxBackdrop::Blur, false),
+        );
+        let check = |p: &mut GpuProducer, inputs: &TickInputs, what: &str| {
+            let got = p.render_bgra_for_test(inputs).unwrap();
+            let (want, _) = cpu_compose(Some(&page), (640, 360), inputs);
+            let (mean, d, x, y) = mean_and_max(&want, &got);
+            println!("{what} on {}: mean {mean:.3}, max {d}", a.name);
+            assert!(
+                mean <= BACKDROP_MEAN && d <= BACKDROP_MAX,
+                "{what} on {}: mean {mean:.3}, max {d} at ({x},{y})",
+                a.name
+            );
+        };
+        // Page-only changes and moves reuse the blur.
+        for _ in 0..3 {
+            input.on_shared_texture(shared.handle()).unwrap();
+            p.produce(&inputs, false).unwrap();
+        }
+        assert_eq!(p.blur_builds(), 1, "{}: page-only changes", a.name);
+        inputs.layout.x = 0.9;
+        p.produce(&inputs, false).unwrap();
+        assert_eq!(p.blur_builds(), 1, "{}: move", a.name);
+        // Resize: rebuilt at the new size.
+        inputs.layout.width = 0.25;
+        p.produce(&inputs, false).unwrap();
+        assert_eq!(p.blur_builds(), 2, "{}: resize", a.name);
+        check(&mut p, &inputs, "after resize");
+        // A new webcam frame at the same size.
+        inputs.cam = Some(person_cam(320, 180));
+        p.produce(&inputs, false).unwrap();
+        assert_eq!(p.blur_builds(), 3, "{}: new frame", a.name);
+        // The webcam reconnects at another size (4:3): new PIP size, new blur.
+        inputs.cam = Some(person_cam(200, 150));
+        p.produce(&inputs, false).unwrap();
+        assert_eq!(p.blur_builds(), 4, "{}: reconnect", a.name);
+        check(&mut p, &inputs, "after reconnect");
+        // Back to Room: no blur needed; then a blurred room (its own cache).
+        inputs.backdrop.in_box = BoxBackdrop::Room;
+        p.produce(&inputs, false).unwrap();
+        assert_eq!(p.blur_builds(), 4, "{}: room", a.name);
+        inputs.backdrop.full = FullBackdrop::BlurredRoom;
+        inputs.layout.style = OverlayStyle::CutoutSmall;
+        p.produce(&inputs, false).unwrap();
+        assert_eq!(p.blur_builds(), 5, "{}: blurred room", a.name);
+        for _ in 0..3 {
+            input.on_shared_texture(shared.handle()).unwrap();
+            p.produce(&inputs, false).unwrap();
+        }
+        assert_eq!(p.blur_builds(), 5, "{}: page ignored", a.name);
+        inputs.cam = Some(person_cam(320, 180));
+        p.produce(&inputs, false).unwrap();
+        assert_eq!(p.blur_builds(), 6, "{}: blurred room, new frame", a.name);
+        check(&mut p, &inputs, "blurred room after a size change");
+    }
+}
+
+/// GPU time per frame (D3D11 timestamps) at 1080p with every input new on
+/// every tick (worst case): Quality-size mask, refined edges, blur.
+#[test]
+#[ignore = "GPU timing; don't run while the user's Page2Cam runs"]
+fn gpu_refined_and_blur_within_budget() {
+    let page = noise(1920, 1080, 81);
+    let cams: Vec<_> = (0..4).map(|i| textured_person_cam(1280, 720, i)).collect();
+    let masks: Vec<_> = (0..4)
+        .map(|i| {
+            soft_mask(
+                640,
+                360,
+                EdgeRange {
+                    lo: 40,
+                    hi: 220 + i,
+                },
+            )
+        })
+        .collect();
+    let configs = [
+        (
+            "blurred room + cut-out full",
+            layout(OverlayStyle::CutoutFull, 0.5, 0.0, 0.25),
+            FullBackdrop::BlurredRoom,
+            BoxBackdrop::Room,
+        ),
+        (
+            "box 0.3 + in-box blur",
+            layout(OverlayStyle::Box, 1.0, 1.0, 0.3),
+            FullBackdrop::Page,
+            BoxBackdrop::Blur,
+        ),
+        (
+            "cut-out small on the page",
+            layout(OverlayStyle::CutoutSmall, 0.5, 1.0, 0.3),
+            FullBackdrop::Page,
+            BoxBackdrop::Room,
+        ),
+    ];
+    let mut over = Vec::new();
+    for a in adapters_or_skip("gpu_refined_and_blur_within_budget") {
+        for (name, l, full, in_box) in &configs {
+            let gpu = Gpu::new(a.luid).unwrap();
+            let input = PageInput::new(&gpu, 1920, 1080).unwrap();
+            let shared = gpu.create_shared_bgra(&page).unwrap();
+            let mut p = GpuProducer::new(gpu.clone(), input.clone(), spec(1920, 1080)).unwrap();
+            p.set_profiling(true);
+            let mut totals = Vec::new();
+            let mut passes: Vec<(&'static str, Vec<f64>)> = Vec::new();
+            for i in 0..120usize {
+                input.on_shared_texture(shared.handle()).unwrap();
+                let inputs = TickInputs {
+                    page: None,
+                    cam: Some(Arc::new((*cams[i % 4]).clone())),
+                    mask: Some(masks[i % 4].clone()),
+                    layout: *l,
+                    backdrop: backdrop(*full, in_box.clone(), true),
+                };
+                p.produce(&inputs, false).unwrap();
+                let Some(prof) = p.take_profile() else {
+                    continue;
+                };
+                if i < 20 {
+                    continue;
+                }
+                totals.push(prof.iter().map(|(_, ms)| ms).sum::<f64>());
+                for (n, ms) in prof {
+                    match passes.iter_mut().find(|(k, _)| *k == n) {
+                        Some((_, v)) => v.push(ms),
+                        None => passes.push((n, vec![ms])),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let mut line = String::new();
+            for (n, v) in &mut passes {
+                line += &format!(" {n} {:.3}", med(v));
+            }
+            let total = med(&mut totals);
+            let p95 = totals[((totals.len() - 1) as f64 * 0.95) as usize];
+            println!(
+                "budget | {name} | {} | GPU median {total:.3} ms, p95 {p95:.3} ms per frame |{line}",
+                a.name
+            );
+            if total > 2.0 {
+                over.push(format!("{name} on {}: {total:.3} ms", a.name));
+            }
+        }
+    }
+    assert!(over.is_empty(), "over the 2 ms budget: {over:?}");
+}
