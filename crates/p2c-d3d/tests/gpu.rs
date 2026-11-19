@@ -142,7 +142,7 @@ fn page_input_copies_shared_texture() {
         let page = PageInput::new(&gpu, 64, 36).unwrap();
         assert_eq!(page.seq(), 0);
         page.on_shared_texture(h).unwrap();
-        page.on_shared_texture(h).unwrap(); // cached handle
+        page.on_shared_texture(h).unwrap(); // same handle again
         assert_eq!(page.seq(), 2);
         assert_eq!(page.adapter_mismatch(), None);
         let back = gpu.read_bgra(&page.texture()).unwrap();
@@ -158,6 +158,86 @@ fn page_input_copies_shared_texture() {
         }
         drop(shared);
         println!("page input ok on {}", a.name);
+    }
+}
+
+fn solid(w: u32, h: u32, bgra: [u8; 4]) -> Frame {
+    Frame::from_bgra(w, h, bgra.repeat((w * h) as usize)).unwrap()
+}
+
+/// CEF's NT handle is valid only during `on_accelerated_paint`; once closed,
+/// Windows hands the same value out again. A new texture behind a recycled
+/// handle value must show up, not a texture from Chromium's previous pool
+/// (seen as old/new page flicker after a navigation).
+#[test]
+#[ignore]
+fn recycled_handle_value_shows_the_new_texture() {
+    const RED: [u8; 4] = [0, 0, 255, 255];
+    const BLUE: [u8; 4] = [255, 0, 0, 255];
+    for a in hardware() {
+        let gpu = Gpu::new(a.luid).unwrap();
+        let page = PageInput::new(&gpu, 32, 16).unwrap();
+        let tex_a = gpu.create_shared_bgra(&solid(32, 16, RED)).unwrap();
+        let ha = tex_a.handle();
+        page.on_shared_texture(ha).unwrap();
+        assert_eq!(
+            gpu.read_bgra(&page.texture()).unwrap().data,
+            solid(32, 16, RED).data
+        );
+        // Close A's handle and release A (Chromium rebuilding its pool).
+        drop(tex_a);
+        // Windows hands freed handle values out again; create (and close)
+        // textures until one gets A's old value.
+        let mut tries = 0;
+        let mut seen = Vec::new();
+        let tex_b = loop {
+            let b = gpu.create_shared_bgra(&solid(32, 16, BLUE)).unwrap();
+            if b.handle() == ha {
+                break b;
+            }
+            tries += 1;
+            if seen.len() < 16 {
+                seen.push(b.handle());
+            }
+            assert!(
+                tries < 10_000,
+                "{}: handle value {ha:#x} never reused, got {seen:x?}...",
+                a.name
+            );
+        };
+        println!(
+            "{}: handle value {ha:#x} reused after {tries} other handles",
+            a.name
+        );
+        page.on_shared_texture(tex_b.handle()).unwrap();
+        let back = gpu.read_bgra(&page.texture()).unwrap();
+        assert_eq!(
+            back.pixel(0, 0),
+            solid(1, 1, BLUE).pixel(0, 0),
+            "{}: stale texture behind a recycled handle value",
+            a.name
+        );
+        assert_eq!(back.data, solid(32, 16, BLUE).data, "{}", a.name);
+
+        // Per-callback cost (open + copy + flush) at 1080p.
+        let big = gpu.create_shared_bgra(&gradient(1920, 1080, 3)).unwrap();
+        let page = PageInput::new(&gpu, 1920, 1080).unwrap();
+        page.on_shared_texture(big.handle()).unwrap();
+        let mut times: Vec<_> = (0..200)
+            .map(|_| {
+                let t = Instant::now();
+                page.on_shared_texture(big.handle()).unwrap();
+                t.elapsed()
+            })
+            .collect();
+        times.sort();
+        println!(
+            "  on_shared_texture 1080p on {}: p50 {:.3} ms, p95 {:.3} ms, max {:.3} ms",
+            a.name,
+            times[100].as_secs_f64() * 1e3,
+            times[190].as_secs_f64() * 1e3,
+            times[199].as_secs_f64() * 1e3
+        );
     }
 }
 

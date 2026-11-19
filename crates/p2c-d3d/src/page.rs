@@ -1,7 +1,6 @@
 //! The page texture from Chromium's `on_accelerated_paint`: open the shared
 //! NT handle on our device and copy it into a texture we own.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -58,8 +57,6 @@ struct Probe {
 
 struct PageState {
     tex: Texture,
-    /// Opened shared textures by handle value (CEF reuses a small pool).
-    cache: HashMap<isize, ID3D11Texture2D>,
 }
 
 fn page_texture(gpu: &Gpu, w: u32, h: u32) -> Result<Texture> {
@@ -68,14 +65,13 @@ fn page_texture(gpu: &Gpu, w: u32, h: u32) -> Result<Texture> {
 
 impl PageInput {
     /// `w` x `h` is the expected page size; a texture of another size
-    /// replaces it (and empties the handle cache).
+    /// replaces it.
     pub fn new(gpu: &Gpu, w: u32, h: u32) -> Result<PageInput> {
         Ok(PageInput {
             inner: Arc::new(PageInner {
                 gpu: gpu.clone(),
                 state: Mutex::new(PageState {
                     tex: page_texture(gpu, w, h)?,
-                    cache: HashMap::new(),
                 }),
                 seq: AtomicU64::new(0),
                 probe: Mutex::new(None),
@@ -94,42 +90,34 @@ impl PageInput {
         let gpu = &inner.gpu;
         // The state lock is never held across context calls (lock order:
         // a ticker may hold `gpu.lock()` and then call `texture()`).
-        let (dst, shared) = {
+        // Opened afresh on every callback: CEF closes the handle afterwards
+        // and Windows reuses handle values, so a value seen before may name
+        // a different texture (e.g. after Chromium rebuilds its pool on a
+        // navigation). Caching by value showed stale pages.
+        // SAFETY: CEF's handle is valid for the duration of the callback.
+        let opened = unsafe {
+            gpu.device1()
+                .OpenSharedResource1::<ID3D11Texture2D>(HANDLE(handle as _))
+        };
+        let shared = match opened {
+            Ok(t) => t,
+            Err(e) => return Err(self.open_failed(handle, e.into())),
+        };
+        *inner.probe.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let d = tex_desc(&shared);
+        if d.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            bail!(
+                "page texture format {:?}, expected B8G8R8A8_UNORM",
+                d.Format
+            );
+        }
+        let dst = {
             let mut st = inner.state.lock().unwrap_or_else(|p| p.into_inner());
-            let cached = st.cache.get(&handle).cloned();
-            let shared = match cached {
-                Some(t) => t,
-                None => {
-                    // SAFETY: CEF's handle is valid for the duration of the callback.
-                    let opened = unsafe {
-                        gpu.device1()
-                            .OpenSharedResource1::<ID3D11Texture2D>(HANDLE(handle as _))
-                    };
-                    let t = match opened {
-                        Ok(t) => t,
-                        Err(e) => {
-                            drop(st);
-                            return Err(self.open_failed(handle, e.into()));
-                        }
-                    };
-                    *inner.probe.lock().unwrap_or_else(|p| p.into_inner()) = None;
-                    let d = tex_desc(&t);
-                    if d.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
-                        bail!(
-                            "page texture format {:?}, expected B8G8R8A8_UNORM",
-                            d.Format
-                        );
-                    }
-                    if (d.Width, d.Height) != (st.tex.width(), st.tex.height()) {
-                        st.tex = page_texture(gpu, d.Width, d.Height)
-                            .context("page texture for new size")?;
-                        st.cache.clear();
-                    }
-                    st.cache.insert(handle, t.clone());
-                    t
-                }
-            };
-            (st.tex.clone(), shared)
+            if (d.Width, d.Height) != (st.tex.width(), st.tex.height()) {
+                st.tex =
+                    page_texture(gpu, d.Width, d.Height).context("page texture for new size")?;
+            }
+            st.tex.clone()
         };
         let ctx = gpu.context();
         // SAFETY: same size/format textures on our device; single context
@@ -139,6 +127,8 @@ impl PageInput {
             // Start the copy now: Chromium reuses the texture for later frames.
             ctx.Flush();
         }
+        // shared is released here: never kept past the callback.
+        drop(shared);
         inner.seq.fetch_add(1, Ordering::Release);
         Ok(())
     }
