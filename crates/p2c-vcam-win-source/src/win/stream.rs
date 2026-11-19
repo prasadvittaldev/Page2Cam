@@ -52,6 +52,9 @@ struct State {
     version_logged: Option<Instant>,
     tick: u64,
     scratch: Vec<u8>,
+    /// Fill durations (microseconds) of the current 300-frame window.
+    fill_us: [u32; 300],
+    fill_n: usize,
 }
 
 forward_attributes!(MediaStream_Impl, attrs);
@@ -128,6 +131,8 @@ pub(crate) fn create(index: u32) -> Result<ComObject<MediaStream>> {
             version_logged: None,
             tick: 0,
             scratch: Vec::new(),
+            fill_us: [0; 300],
+            fill_n: 0,
         }),
     }))
 }
@@ -231,6 +236,30 @@ fn now_ms() -> u64 {
 }
 
 impl State {
+    /// Record one fill duration; every 300 frames log p50/p95/max.
+    fn record_fill(&mut self, us: u32) {
+        self.fill_us[self.fill_n] = us;
+        self.fill_n += 1;
+        if self.fill_n == self.fill_us.len() {
+            self.fill_n = 0;
+            let mut t = self.fill_us;
+            t.sort_unstable();
+            let ms = |v: u32| v as f64 / 1000.0;
+            super::log(&format!(
+                "fill p50/p95/max {:.2}/{:.2}/{:.2} ms, {}x{} {} (src {}x{} {:?})",
+                ms(t[150]),
+                ms(t[284]),
+                ms(t[299]),
+                self.width,
+                self.height,
+                if self.nv12 { "NV12" } else { "RGB32" },
+                self.frame_w,
+                self.frame_h,
+                self.frame_fmt
+            ));
+        }
+    }
+
     /// Pick up the newest frame from page2cam, if any.
     fn refresh_frame(&mut self) {
         if let Some(base) = super::shared::base() {
@@ -415,7 +444,10 @@ impl IMFMediaStream_Impl for MediaStream_Impl {
             let sample = allocator.AllocateSample()?;
             sample.SetSampleTime(MFGetSystemTime())?;
             sample.SetSampleDuration(10_000_000 / FPS as i64)?;
-            st.fill(&sample)?;
+            let t0 = Instant::now();
+            let filled = st.fill(&sample);
+            st.record_fill(t0.elapsed().as_micros().min(u32::MAX as u128) as u32);
+            filled?;
             if let Some(t) = token.as_ref() {
                 sample.SetUnknown(&MFSampleExtension_Token, t)?;
             }

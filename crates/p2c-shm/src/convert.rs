@@ -184,6 +184,65 @@ mod tests {
         bgra.repeat((w * h) as usize)
     }
 
+    /// Per-frame cost of the conversions the camera DLL runs inside Frame Server.
+    /// `cargo test --release -p p2c-shm bench_dll_conversions -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    #[allow(clippy::type_complexity)]
+    fn bench_dll_conversions() {
+        let (sw, sh) = (1920u32, 1080u32);
+        let src: Vec<u8> = (0..(sw * sh * 3 / 2) as usize)
+            .map(|i| (i * 31 % 251) as u8)
+            .collect();
+        let run =
+            |name: &str, f: &dyn Fn(&mut [u8], usize, u32, u32), dw: u32, dh: u32, bpp: usize| {
+                let pitch = dw as usize * bpp;
+                let rows = if bpp == 1 { dh + dh / 2 } else { dh } as usize;
+                let mut dst = vec![0u8; pitch * rows];
+                let mut t: Vec<f64> = (0..300)
+                    .map(|_| {
+                        let s = std::time::Instant::now();
+                        f(&mut dst, pitch, dw, dh);
+                        std::hint::black_box(&dst);
+                        s.elapsed().as_secs_f64() * 1000.0
+                    })
+                    .collect();
+                t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!(
+                    "{name}: median {:.2} ms  p95 {:.2} ms  max {:.2} ms",
+                    t[150], t[284], t[299]
+                );
+            };
+        run(
+            "nv12 1080p->720p scale",
+            &|d, p, w, h| nv12_to_nv12(&src, sw, sh, d, p, w, h),
+            1280,
+            720,
+            1,
+        );
+        run(
+            "nv12 1080p->1080p copy",
+            &|d, p, w, h| nv12_to_nv12(&src, sw, sh, d, p, w, h),
+            1920,
+            1080,
+            1,
+        );
+        run(
+            "nv12->rgb32 1080p",
+            &|d, p, w, h| nv12_to_rgb32(&src, sw, sh, d, p, w, h),
+            1920,
+            1080,
+            4,
+        );
+        run(
+            "nv12->rgb32 1080p->720p",
+            &|d, p, w, h| nv12_to_rgb32(&src, sw, sh, d, p, w, h),
+            1280,
+            720,
+            4,
+        );
+    }
+
     #[test]
     fn nv12_white_black_red() {
         for (px, y, u, v) in [
