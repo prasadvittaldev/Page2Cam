@@ -495,7 +495,7 @@ impl Controls for App {
             gpu_choice: gpu_saved,
             gpu_running: self.gpu_running.clone(),
             health,
-            agents_allowed: p2c_admin::TrayLink::global().map(|l| l.allowed()),
+            agents_allowed: p2c_admin::TrayLink::global().and_then(|l| l.allowed()),
         }
     }
 

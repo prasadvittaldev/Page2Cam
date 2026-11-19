@@ -122,6 +122,7 @@ pub(crate) fn router(st: State) -> Router {
         .route("/api/snapshot", get(snapshot))
         .route("/api/agents", get(agents).post(agents))
         .route("/ws", get(ws))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(st.clone(), guard))
         .with_state(st)
 }
@@ -398,6 +399,8 @@ struct InputBody {
 }
 
 const MAX_TEXT_CHARS: usize = 10_000;
+/// Largest request body any route accepts.
+const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Windows virtual-key code for a named key.
 fn named_key(name: &str) -> Option<i32> {
@@ -481,8 +484,8 @@ fn input_events(b: InputBody, w: u32, h: u32) -> Result<Vec<InputEvent>, String>
             let name = b.key.ok_or("key is required")?;
             let code = named_key(&name).ok_or_else(|| format!("unknown key {name:?}"))?;
             let mut v = vec![key(KeyAction::Down, code, 0)];
-            if code == 13 {
-                v.push(key(KeyAction::Char, 13, 13));
+            if code == 13 || code == 32 {
+                v.push(key(KeyAction::Char, code, code as u16));
             }
             v.push(key(KeyAction::Up, code, 0));
             Ok(v)
@@ -492,7 +495,10 @@ fn input_events(b: InputBody, w: u32, h: u32) -> Result<Vec<InputEvent>, String>
             if text.chars().count() > MAX_TEXT_CHARS {
                 return Err(format!("text is longer than {MAX_TEXT_CHARS} characters"));
             }
+            // Newlines are Enter (CR); CRLF counts once.
             Ok(text
+                .replace("\r\n", "\n")
+                .replace('\n', "\r")
                 .encode_utf16()
                 .map(|u| key(KeyAction::Char, 0, u))
                 .collect())
@@ -501,6 +507,8 @@ fn input_events(b: InputBody, w: u32, h: u32) -> Result<Vec<InputEvent>, String>
     }
 }
 
+/// The page is rendered at the output size (`cfg.width` x `cfg.height`), never
+/// letterboxed, so output 0..1 maps straight to page px (same as the WebSocket).
 async fn input(AxState(st): AxState<State>, Json(b): Json<InputBody>) -> Response {
     match input_events(b, st.width, st.height) {
         Ok(events) => {
@@ -1704,5 +1712,80 @@ mod tests {
             }
         }
         assert!(fake.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn input_maps_at_non_default_state_size() {
+        // The page is rendered at the output size (never letterboxed), so
+        // output 0..1 maps straight to page px at whatever size the app has.
+        let fake = Arc::new(Fake::default());
+        let a = router(State::new(fake.clone(), TOKEN.into(), PORT, 1280, 720));
+        let r = a
+            .oneshot(req(
+                "POST",
+                "/api/input",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                Some(r#"{"kind":"move","x":1.0,"y":0.5}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            fake.events.lock().unwrap()[0],
+            InputEvent::Move {
+                x: 1279,
+                y: 360,
+                mods: 0
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn space_sends_char_and_newline_text_is_enter() {
+        let fake = Arc::new(Fake::default());
+        input_post(fake.clone(), r#"{"kind":"key","key":"Space"}"#).await;
+        input_post(fake.clone(), r#"{"kind":"text","text":"a\r\nb\n"}"#).await;
+        let ev = fake.events.lock().unwrap().clone();
+        let acts: Vec<(KeyAction, i32, u16)> = ev
+            .iter()
+            .map(|e| match e {
+                InputEvent::Key {
+                    action, code, ch, ..
+                } => (*action, *code, *ch),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            acts,
+            vec![
+                (KeyAction::Down, 32, 0),
+                (KeyAction::Char, 32, 32),
+                (KeyAction::Up, 32, 0),
+                (KeyAction::Char, 0, 97),
+                (KeyAction::Char, 0, 13),
+                (KeyAction::Char, 0, 98),
+                (KeyAction::Char, 0, 13),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_body_is_413() {
+        let big = format!(
+            r#"{{"kind":"text","text":"{}"}}"#,
+            "a".repeat(3 * 1024 * 1024)
+        );
+        let r = app(Arc::default())
+            .oneshot(req(
+                "POST",
+                "/api/input",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                Some(&big),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
