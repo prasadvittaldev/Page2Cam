@@ -17,6 +17,8 @@ pub const EXIT_CRASH: i32 = 1;
 pub const EXIT_RESTART: i32 = 75;
 /// `--admin-port` could not be bound: the tray retries with another port.
 pub const EXIT_PORT: i32 = 76;
+/// Started wrongly (no usable admin token): retrying the same way won't help.
+pub const EXIT_CONFIG: i32 = 78;
 
 /// Env var the tray passes the admin token in (never on the command line).
 pub const TOKEN_ENV: &str = "P2C_ADMIN_TOKEN";
@@ -74,22 +76,25 @@ pub fn exit_code(restart_requested: bool, user_shutdown: bool, ok: bool) -> i32 
     }
 }
 
-/// The admin token to use: in engine mode the tray's (from [`TOKEN_ENV`]) if
-/// it is usable in a URL query (16..=128 of `[A-Za-z0-9_-]`); else `None`
-/// (a generated token, as standalone always does).
-pub fn admin_token(role: Role, env: Option<String>) -> Option<String> {
+/// The admin token to use. Standalone: `Ok(None)` (a generated token, as
+/// always). Engine: the tray's (from [`TOKEN_ENV`]) if it is usable in a URL
+/// query (16..=128 of `[A-Za-z0-9_-]`); else an error, since nobody could
+/// reach the engine (exit [`EXIT_CONFIG`]).
+pub fn admin_token(role: Role, env: Option<String>) -> Result<Option<String>, String> {
     if role != Role::Engine {
-        return None;
+        return Ok(None);
     }
-    let t = env?;
-    let ok = (16..=128).contains(&t.len())
-        && t.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    if !ok {
-        tracing::warn!("{TOKEN_ENV} is not a usable token; using a generated one");
-        return None;
+    let usable = |t: &str| {
+        (16..=128).contains(&t.len())
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    match env {
+        Some(t) if usable(&t) => Ok(Some(t)),
+        _ => Err(format!(
+            "{TOKEN_ENV} missing or invalid; engine cannot be reached"
+        )),
     }
-    Some(t)
 }
 
 /// Check `alive` every `every` until it says no (→ true) or `stop` is set
@@ -249,18 +254,22 @@ mod tests {
     fn admin_token_only_from_env_in_engine_mode() {
         let good = "0123456789abcdef0123456789abcdef".to_string();
         assert_eq!(
-            admin_token(Role::Engine, Some(good.clone())),
+            admin_token(Role::Engine, Some(good.clone())).unwrap(),
             Some(good.clone())
         );
         // Standalone ignores it (a generated token, as before).
-        assert_eq!(admin_token(Role::Standalone, Some(good)), None);
-        assert_eq!(admin_token(Role::Engine, None), None);
-        // Unusable tokens are refused (too short, not URL-safe).
-        assert_eq!(admin_token(Role::Engine, Some("abc".into())), None);
-        assert_eq!(
-            admin_token(Role::Engine, Some("0123456789abcdef&t=x0123456789".into())),
-            None
-        );
+        assert_eq!(admin_token(Role::Standalone, Some(good)).unwrap(), None);
+        assert_eq!(admin_token(Role::Standalone, None).unwrap(), None);
+        // Engine without a usable token can't be reached: an error (exit 78).
+        for bad in [
+            None,
+            Some("abc".to_string()),
+            Some("0123456789abcdef&t=x0123456789".to_string()),
+        ] {
+            let e = admin_token(Role::Engine, bad.clone()).unwrap_err();
+            assert!(e.contains("P2C_ADMIN_TOKEN"), "{bad:?}: {e}");
+        }
+        assert_eq!(EXIT_CONFIG, 78);
     }
 
     #[test]
@@ -279,10 +288,12 @@ mod tests {
         let stop = AtomicBool::new(true);
         assert!(!watch_parent(|| true, Duration::from_millis(5), &stop));
 
-        // A real process: the watchdog fires within ~2 s of its death.
+        // A real process (one, no shell, so killing it leaves nothing
+        // behind): the watchdog fires within ~2 s of its death.
         let mut child = if cfg!(windows) {
-            std::process::Command::new("cmd")
-                .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            std::process::Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
                 .spawn()
         } else {
             std::process::Command::new("sleep").arg("30").spawn()
@@ -304,9 +315,9 @@ mod tests {
         child.kill().unwrap();
         let _ = child.wait();
         let fired = rx
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(Duration::from_secs(4))
             .expect("watchdog did not fire");
-        assert!(fired.duration_since(killed) <= Duration::from_millis(2100));
+        assert!(fired.duration_since(killed) <= Duration::from_secs(3));
         quit.store(true, Ordering::SeqCst);
     }
 

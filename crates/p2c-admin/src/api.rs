@@ -222,7 +222,9 @@ pub struct Status {
 }
 
 /// Engine health for the tray (rates over a rolling ~10 s window).
+/// Missing fields read as their defaults (a newer tray reading an older engine).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Health {
     /// The ticker has pushed its first output frame (the tray hands the
     /// camera over to the engine after this).

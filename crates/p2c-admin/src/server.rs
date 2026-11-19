@@ -1098,6 +1098,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn health_missing_fields_default() {
+        let h: Health = serde_json::from_str(r#"{"output_ready":true}"#).unwrap();
+        assert!(h.output_ready);
+        assert_eq!(h.webcam_state, "");
+        assert_eq!(
+            serde_json::from_str::<Health>("{}").unwrap(),
+            Health::default()
+        );
+    }
+
     #[tokio::test]
     async fn state_includes_health() {
         let r = app(Arc::new(Fake::default()))

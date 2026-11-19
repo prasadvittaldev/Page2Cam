@@ -77,6 +77,22 @@ pub struct App {
     pub health_window: Mutex<crate::health::HealthWindow>,
 }
 
+/// Lock `m` for the status/health readers. Debug builds panic if it stays
+/// held for 2 s (a re-entrant lock deadlocks otherwise, silently); release
+/// builds just lock.
+fn lock<'a, T>(m: &'a Mutex<T>, what: &str) -> parking_lot::MutexGuard<'a, T> {
+    #[cfg(debug_assertions)]
+    {
+        m.try_lock_for(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|| panic!("`{what}` lock still held after 2 s (re-entrant lock?)"))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = what;
+        m.lock()
+    }
+}
+
 /// Longest mic delay applied for the cut-out (ms).
 const MAX_MIC_DELAY_MS: u32 = 250;
 
@@ -241,10 +257,11 @@ impl App {
         });
         // One lock at a time (each released before the next is taken).
         let (skipped_pct, fps) = {
-            let w = self.health_window.lock();
+            let w = lock(&self.health_window, "health_window");
             (w.skipped_pct(), w.webcam_fps())
         };
-        let video_fallback = video_fallback(&self.video.lock().clone());
+        let video = lock(&self.video, "video").clone();
+        let video_fallback = video_fallback(&video);
         p2c_admin::Health {
             output_ready: self.ticker_stats.output_ready(),
             output_skipped_pct: skipped_pct,
@@ -423,7 +440,7 @@ impl Controls for App {
             .browser
             .get()
             .map(|b| b.current_url())
-            .unwrap_or_else(|| self.fallback_url.lock().clone());
+            .unwrap_or_else(|| lock(&self.fallback_url, "fallback_url").clone());
         let webcam_aspect = self
             .webcam_slot
             .as_ref()
@@ -434,31 +451,45 @@ impl Controls for App {
             StreamState::Idle => "idle".to_string(),
             s => s.to_string(),
         };
-        let gpu_saved = self.gpu_saved.lock().clone();
-        // Before the literal: its temporaries (e.g. the `video` guard) live
-        // until the end of the statement, and `health` takes `video` too.
+        // Every locked value is read into its own local (each guard dropped
+        // at the end of its `let`): a guard alive inside the literal below
+        // would last the whole statement and deadlock any call in it that
+        // takes the same lock again (it happened with `video`/`health`).
+        let gpu_saved = lock(&self.gpu_saved, "gpu_saved").clone();
+        let stream_url = lock(&self.stream_url, "stream_url").clone();
+        let mic = lock(&self.mic_status, "mic_status").clone();
+        let video = display_video(&lock(&self.video, "video").clone());
+        let probed = lock(&self.encoder, "encoder").clone();
+        let encoder = encoder_text(&probed, self.stream.encoder_fallback());
+        let vcam = self.camera_status();
+        let webcam = self.webcam_status.get();
+        let cutout = self.cutout_status();
+        let cutout_engine = self.cutout_engine();
+        let cutout_gpu = self.cutout_device();
+        let update = self.updater.info();
+        let has_saved_key = Self::saved_key().is_some();
         let health = self.health();
         Status {
             url,
             width: self.width,
             height: self.height,
             fps: self.fps,
-            vcam: self.camera_status(),
-            webcam: self.webcam_status.get(),
+            vcam,
+            webcam,
             webcam_aspect,
             stream,
-            stream_url: self.stream_url.lock().clone(),
-            has_saved_key: Self::saved_key().is_some(),
-            mic: self.mic_status.lock().clone(),
+            stream_url,
+            has_saved_key,
+            mic,
             log_file: self.log_file.clone(),
-            cutout: self.cutout_status(),
-            cutout_engine: self.cutout_engine(),
-            update: self.updater.info(),
-            video: display_video(&self.video.lock()),
-            encoder: encoder_text(&self.encoder.lock(), self.stream.encoder_fallback()),
+            cutout,
+            cutout_engine,
+            update,
+            video,
+            encoder,
             restart_needed: restart_needed(&gpu_saved, &self.gpu_running),
             gpu_override: self.gpu_override,
-            cutout_gpu: self.cutout_device(),
+            cutout_gpu,
             gpu_choice: gpu_saved,
             gpu_running: self.gpu_running.clone(),
             health,
@@ -570,6 +601,10 @@ pub fn begin_restart(
     exit: &crate::restart::ExitFlags,
     close: Option<Box<dyn FnOnce() + Send>>,
 ) -> anyhow::Result<()> {
+    // Already closing (quit, tray gone): that wins, no restart (exit 0, not 75).
+    if exit.user_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("Page2Cam is closing");
+    }
     let Some(close) = close else {
         anyhow::bail!("Page2Cam is still starting; try again in a moment");
     };
@@ -848,6 +883,104 @@ mod tests {
         assert!(format!("{e}").contains("still starting"), "{e}");
         // A later Ctrl-C must not relaunch.
         assert!(!exit.restart.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn restart_after_quit_is_refused() {
+        // Quit then "Restart now" within the close delay: exit 0, not 75.
+        let exit = crate::restart::ExitFlags::default();
+        exit.user_shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let e = begin_restart(&exit, Some(Box::new(move || tx.send(()).unwrap()))).unwrap_err();
+        assert!(format!("{e}").contains("closing"), "{e}");
+        assert!(!exit.restart.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(800))
+            .is_err());
+    }
+
+    /// An `App` without browser, webcam or segmenter.
+    fn bare_app() -> App {
+        let (page, mic) = (AudioRing::new(50), AudioRing::new(50));
+        let mixer = Mixer::new(page, mic.clone(), MixSettings::default());
+        App {
+            browser: OnceLock::new(),
+            layout: Arc::new(RwLock::new(PipLayout::default())),
+            crop: Arc::new(RwLock::new(p2c_core::Crop::FULL)),
+            stream: StreamController::new(mixer.clone()),
+            mixer,
+            mic_ring: mic,
+            mic: Mutex::new(None),
+            mic_status: Mutex::new("off".into()),
+            webcam_slot: None,
+            webcam_status: p2c_webcam::WebcamStatus::new("none"),
+            vcam_status: "ok: test".into(),
+            vcam_live: p2c_vcam::CameraStatus::default(),
+            stream_pix_fmt: "bgra",
+            stream_url: Mutex::new(String::new()),
+            width: 1280,
+            height: 720,
+            fps: 30,
+            video_kbps: 4000,
+            fallback_url: Mutex::new("about:blank".into()),
+            log_file: String::new(),
+            segmenter: None,
+            settings_path: None,
+            mic_delay_ms: Mutex::new(0),
+            latencies: Mutex::new(Default::default()),
+            pipeline_ms: Arc::default(),
+            updater: Arc::new(crate::update::Updater::new(
+                "0.0.0",
+                false,
+                Box::new(|| Ok(None)),
+            )),
+            video: Arc::new(Mutex::new("CPU (fallback: test)".into())),
+            encoder: Arc::new(Mutex::new("x264".into())),
+            gpu_saved: Mutex::new("auto".into()),
+            gpu_running: "auto".into(),
+            gpu_override: false,
+            cutout_gpu: None,
+            exit: Arc::default(),
+            quit_main: Mutex::new(None),
+            ticker_stats: Arc::default(),
+            health_window: Mutex::new(Default::default()),
+        }
+    }
+
+    /// `status()` (which calls `health()`) and `health()` run back to back
+    /// and while the sampler runs, without self-deadlock (debug builds panic
+    /// on a lock held 2 s).
+    #[test]
+    fn status_and_health_do_not_self_deadlock() {
+        let app = Arc::new(bare_app());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let a = app.clone();
+        std::thread::spawn(move || {
+            for _ in 0..20 {
+                a.sample_health();
+                let s = a.status();
+                let h = a.health();
+                assert_eq!(s.health, h);
+                assert!(h.video_fallback && h.camera_status == "ok: test");
+                assert_eq!(h.webcam_state, "off");
+            }
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("status/health deadlocked");
+    }
+
+    /// The debug guard turns a held lock into a panic instead of a hang.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn debug_lock_guard_panics_on_a_held_lock() {
+        let app = Arc::new(bare_app());
+        let held = app.video.lock();
+        let a = app.clone();
+        let r = std::thread::spawn(move || a.health()).join();
+        drop(held);
+        assert!(r.is_err(), "health() must panic while `video` is held");
     }
 
     #[test]

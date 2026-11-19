@@ -223,17 +223,35 @@ fn run() -> anyhow::Result<i32> {
     // from ours so Chromium's helpers and ffmpeg don't inherit it.
     let admin_token = engine::admin_token(role, std::env::var(engine::TOKEN_ENV).ok());
     std::env::remove_var(engine::TOKEN_ENV);
+    // Engine nobody can reach: stop before touching anything (no
+    // stop_others, camera or Chromium).
+    let admin_token = match admin_token {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("{e}");
+            return Ok(engine::EXIT_CONFIG);
+        }
+    };
     if role == engine::Role::Engine {
         tracing::info!(
             parent = ?cli.parent_pid,
             camera_from_tray = cli.camera_from_tray,
-            injected_token = admin_token.is_some(),
             "running as the tray's engine"
         );
     }
     // Opened right away (a handle on Windows), so a pid reused later can't
-    // pass for the tray.
-    let parent = cli.parent_pid.map(|pid| (pid, engine::Parent::open(pid)));
+    // pass for the tray. Already gone: exit at once, before stop_others
+    // (which could otherwise stop a tray or Page2Cam started since).
+    let parent = match cli.parent_pid {
+        Some(pid) => match engine::Parent::open(pid) {
+            Some(p) if p.alive() => Some(p),
+            _ => {
+                tracing::warn!(pid, "the tray is already gone; not starting");
+                return Ok(engine::EXIT_OK);
+            }
+        },
+        None => None,
+    };
     // A relaunch: let the old process release the camera, port and CEF
     // profile before opening any of them.
     if let Some(pid) = cli.wait_for_pid {
@@ -254,9 +272,13 @@ fn run() -> anyhow::Result<i32> {
     let _engine_lock =
         match instances::take_engine_lock(std::process::id(), cli.wait_for_pid, &keep) {
             Ok(l) => l,
+            // Standalone: an error from `run`, so a double-click shows why.
+            Err(e) if role == engine::Role::Standalone => {
+                return Err(e.context("Page2Cam is already starting; this one exits"));
+            }
             Err(e) => {
                 tracing::error!("{e:#}; this one exits");
-                std::process::exit(engine::EXIT_CRASH);
+                return Ok(engine::EXIT_CRASH);
             }
         };
     let started = std::time::Instant::now();
@@ -559,21 +581,15 @@ fn run() -> anyhow::Result<i32> {
     };
 
     // Engine: shut down normally once the tray is gone (checked every 1 s).
-    match parent {
-        Some((pid, Some(p))) => {
-            let a = app.clone();
-            engine::spawn_parent_watchdog(
-                p,
-                quit.clone(),
-                Box::new(move || a.request_shutdown(std::time::Duration::ZERO)),
-            )?;
-            tracing::info!(pid, "watching the tray process");
-        }
-        Some((pid, None)) => {
-            tracing::warn!(pid, "the tray is already gone; shutting down");
-            app.request_shutdown(std::time::Duration::ZERO);
-        }
-        None => {}
+    // (If it died since the check at start, the first check here sees it.)
+    if let Some(p) = parent {
+        let (a, pid) = (app.clone(), p.pid());
+        engine::spawn_parent_watchdog(
+            p,
+            quit.clone(),
+            Box::new(move || a.request_shutdown(std::time::Duration::ZERO)),
+        )?;
+        tracing::info!(pid, "watching the tray process");
     }
 
     // Engine: exactly the tray's port and token (exit 76 if the port is taken).
