@@ -205,7 +205,6 @@ pub fn save_choice(path: &Path, key: &str, value: &str) -> anyhow::Result<()> {
 }
 
 /// Save the webcam crop as `webcam_crop = [x, y, w, h]`, keeping comments.
-#[allow(dead_code)] // called by the admin crop controls (next task)
 pub fn save_crop(path: &Path, crop: p2c_core::Crop) -> anyhow::Result<()> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,

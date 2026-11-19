@@ -1,5 +1,6 @@
 //! What the admin UI can ask of the app, and the JSON shapes it uses.
 use p2c_compositor::{OverlayStyle, PipLayout};
+use p2c_core::Crop;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -130,6 +131,50 @@ impl TryFrom<PipDto> for PipLayout {
     }
 }
 
+/// Webcam crop as JSON: a rectangle in 0..1 of the camera picture.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CropDto {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Default for CropDto {
+    fn default() -> Self {
+        Crop::FULL.into()
+    }
+}
+
+impl From<Crop> for CropDto {
+    fn from(c: Crop) -> Self {
+        CropDto {
+            x: c.x,
+            y: c.y,
+            w: c.w,
+            h: c.h,
+        }
+    }
+}
+
+impl From<CropDto> for Crop {
+    fn from(c: CropDto) -> Self {
+        Crop {
+            x: c.x,
+            y: c.y,
+            w: c.w,
+            h: c.h,
+        }
+    }
+}
+
+impl CropDto {
+    /// Through [`Crop::clamp`]: at least 10 % wide/high, inside the frame, NaN → full.
+    pub fn clamped(self) -> CropDto {
+        Crop::from(self).clamp().into()
+    }
+}
+
 /// Everything the status bar and panels show. Never contains the stream key.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Status {
@@ -221,4 +266,9 @@ pub trait Controls: Send + Sync + 'static {
     fn set_gpu_choice(&self, choice: &str) -> anyhow::Result<()>;
     /// Close and start again (same command line); returns before closing.
     fn restart(&self) -> anyhow::Result<()>;
+    /// The webcam crop in use.
+    fn crop(&self) -> CropDto;
+    /// Apply a crop (clamped through `Crop::clamp`) from the next webcam
+    /// frame on; `save` also writes it to the settings file.
+    fn set_crop(&self, c: CropDto, save: bool);
 }

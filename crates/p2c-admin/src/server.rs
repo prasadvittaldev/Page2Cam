@@ -16,7 +16,7 @@ use serde::Deserialize;
 use tokio::sync::watch;
 
 use crate::api::{
-    AudioSettings, Controls, GpuInfo, InputEvent, KeyAction, MouseBtn, NavAction, PipDto,
+    AudioSettings, Controls, CropDto, GpuInfo, InputEvent, KeyAction, MouseBtn, NavAction, PipDto,
     StreamRequest,
 };
 use crate::input::{map_preview, normalize_url};
@@ -89,6 +89,7 @@ pub(crate) fn router(st: State) -> Router {
         .route("/api/stream/start", post(stream_start))
         .route("/api/stream/stop", post(stream_stop))
         .route("/api/audio", post(audio))
+        .route("/api/crop", get(crop_get).post(crop_set))
         .route("/ws", get(ws))
         .layer(middleware::from_fn_with_state(st.clone(), guard))
         .with_state(st)
@@ -206,6 +207,7 @@ async fn state(AxState(st): AxState<State>) -> impl IntoResponse {
         "status": c.status(),
         "pip": PipDto::from(c.pip()),
         "audio": c.audio(),
+        "crop": c.crop(),
     }))
 }
 
@@ -304,6 +306,34 @@ async fn stream_stop(AxState(st): AxState<State>) -> StatusCode {
 async fn audio(AxState(st): AxState<State>, Json(b): Json<AudioSettings>) -> StatusCode {
     st.controls.set_audio(b);
     StatusCode::OK
+}
+
+async fn crop_get(AxState(st): AxState<State>) -> Json<CropDto> {
+    Json(st.controls.crop())
+}
+
+#[derive(Deserialize)]
+struct CropBody {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    /// Write it to the settings file (the end of a drag); live updates don't.
+    #[serde(default)]
+    save: bool,
+}
+
+/// Answers with the crop as applied (clamped).
+async fn crop_set(AxState(st): AxState<State>, Json(b): Json<CropBody>) -> Json<CropDto> {
+    let c = CropDto {
+        x: b.x,
+        y: b.y,
+        w: b.w,
+        h: b.h,
+    }
+    .clamped();
+    st.controls.set_crop(c, b.save);
+    Json(c)
 }
 
 async fn ws(AxState(st): AxState<State>, up: WebSocketUpgrade) -> Response {
@@ -482,6 +512,9 @@ mod tests {
             pub updates: Mutex<u32>,
             pub gpu: Mutex<String>,
             pub restarts: Mutex<u32>,
+            pub crop: Mutex<CropDto>,
+            /// The `save` flag of every `set_crop` call.
+            pub crop_saves: Mutex<Vec<bool>>,
         }
 
         fn gpu(name: &str, kind: &str) -> GpuInfo {
@@ -556,6 +589,13 @@ mod tests {
             fn restart(&self) -> anyhow::Result<()> {
                 *self.restarts.lock().unwrap() += 1;
                 Ok(())
+            }
+            fn crop(&self) -> CropDto {
+                *self.crop.lock().unwrap()
+            }
+            fn set_crop(&self, c: CropDto, save: bool) {
+                *self.crop.lock().unwrap() = c;
+                self.crop_saves.lock().unwrap().push(save);
             }
         }
     }
@@ -928,6 +968,126 @@ mod tests {
         ] {
             assert!(v["status"].get(k).is_some(), "missing {k}");
         }
+    }
+
+    async fn crop_json(fake: Arc<Fake>, method: &str, body: Option<&str>) -> (StatusCode, String) {
+        let r = app(fake)
+            .oneshot(req(
+                method,
+                "/api/crop",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                body,
+            ))
+            .await
+            .unwrap();
+        let st = r.status();
+        (st, body_string(r).await)
+    }
+
+    #[tokio::test]
+    async fn crop_route_roundtrip() {
+        let fake = Arc::new(Fake::default());
+        let (st, body) = crop_json(fake.clone(), "GET", None).await;
+        assert_eq!(st, StatusCode::OK);
+        let c: CropDto = serde_json::from_str(&body).unwrap();
+        assert_eq!((c.x, c.y, c.w, c.h), (0.0, 0.0, 1.0, 1.0));
+
+        let (st, body) = crop_json(
+            fake.clone(),
+            "POST",
+            Some(r#"{"x":0.25,"y":0.5,"w":0.5,"h":0.5,"save":false}"#),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let want = CropDto {
+            x: 0.25,
+            y: 0.5,
+            w: 0.5,
+            h: 0.5,
+        };
+        assert_eq!(serde_json::from_str::<CropDto>(&body).unwrap(), want);
+        assert_eq!(*fake.crop.lock().unwrap(), want);
+        let (_, body) = crop_json(fake.clone(), "GET", None).await;
+        assert_eq!(serde_json::from_str::<CropDto>(&body).unwrap(), want);
+        // The UI's 1 s state poll carries it too.
+        let r = app(fake)
+            .oneshot(req(
+                "GET",
+                "/api/state",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                None,
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["crop"]["w"], 0.5);
+    }
+
+    #[tokio::test]
+    async fn crop_route_clamps() {
+        let fake = Arc::new(Fake::default());
+        let (st, body) = crop_json(
+            fake.clone(),
+            "POST",
+            Some(r#"{"x":0.0,"y":0.0,"w":0.01,"h":0.5,"save":false}"#),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let c: CropDto = serde_json::from_str(&body).unwrap();
+        assert!((c.w - 0.10).abs() < 1e-6, "{c:?}");
+        assert!((fake.crop.lock().unwrap().w - 0.10).abs() < 1e-6);
+        // Off the frame: pulled back inside.
+        let (_, body) = crop_json(
+            fake.clone(),
+            "POST",
+            Some(r#"{"x":0.95,"y":0.0,"w":0.5,"h":1.0,"save":false}"#),
+        )
+        .await;
+        let c: CropDto = serde_json::from_str(&body).unwrap();
+        assert!(
+            (c.x - 0.5).abs() < 1e-6 && (c.w - 0.5).abs() < 1e-6,
+            "{c:?}"
+        );
+    }
+
+    /// Same guard as every route (it answers 403, not 401).
+    #[tokio::test]
+    async fn crop_route_needs_token() {
+        let fake = Arc::new(Fake::default());
+        for (method, body) in [
+            ("GET", None),
+            (
+                "POST",
+                Some(r#"{"x":0.25,"y":0.25,"w":0.5,"h":0.5,"save":true}"#),
+            ),
+        ] {
+            for host in ["127.0.0.1:8765", "evil.test:8765"] {
+                let token = (host == "evil.test:8765").then_some(TOKEN);
+                let r = app(fake.clone())
+                    .oneshot(req(method, "/api/crop", host, token, body))
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), StatusCode::FORBIDDEN, "{method} {host}");
+            }
+        }
+        assert_eq!(*fake.crop.lock().unwrap(), CropDto::default());
+        assert!(fake.crop_saves.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn crop_save_flag_reaches_controls() {
+        let fake = Arc::new(Fake::default());
+        for body in [
+            r#"{"x":0.1,"y":0.1,"w":0.5,"h":0.5,"save":false}"#,
+            r#"{"x":0.1,"y":0.1,"w":0.5,"h":0.5,"save":true}"#,
+            // `save` left out: a live update, not saved.
+            r#"{"x":0.1,"y":0.1,"w":0.5,"h":0.5}"#,
+        ] {
+            assert_eq!(post(fake.clone(), "/api/crop", body).await, StatusCode::OK);
+        }
+        assert_eq!(*fake.crop_saves.lock().unwrap(), vec![false, true, false]);
     }
 
     #[test]

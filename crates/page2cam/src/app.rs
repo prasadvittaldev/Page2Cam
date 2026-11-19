@@ -20,7 +20,6 @@ pub struct App {
     pub browser: OnceLock<BrowserHandle>,
     pub layout: Arc<RwLock<PipLayout>>,
     /// Webcam crop, read by the capture thread for every frame.
-    #[allow(dead_code)] // read by the admin crop controls (next task)
     pub crop: p2c_core::SharedCrop,
     pub stream: StreamController,
     pub mixer: Mixer,
@@ -448,6 +447,36 @@ impl Controls for App {
         self.save_choice("cutout_engine", engine);
         Ok(())
     }
+
+    fn crop(&self) -> p2c_admin::CropDto {
+        (*self.crop.read()).into()
+    }
+
+    fn set_crop(&self, c: p2c_admin::CropDto, save: bool) {
+        change_crop(&self.crop, self.settings_path.as_deref(), c.into(), save);
+    }
+}
+
+/// Apply a crop (clamped) to the shared value the capture thread reads per
+/// frame; with `save`, also write it to the settings file. Returns it as applied.
+pub fn change_crop(
+    shared: &p2c_core::SharedCrop,
+    settings: Option<&std::path::Path>,
+    crop: p2c_core::Crop,
+    save: bool,
+) -> p2c_core::Crop {
+    let crop = crop.clamp();
+    *shared.write() = crop;
+    if save {
+        tracing::info!(?crop, "webcam crop set");
+        if let Some(p) = settings {
+            match crate::config::save_crop(p, crop) {
+                Ok(()) => tracing::info!(file = %p.display(), "webcam crop saved"),
+                Err(e) => tracing::warn!("could not save the webcam crop: {e:#}"),
+            }
+        }
+    }
+    crop
 }
 
 /// "Restart now": set the restart flag and, shortly after (once the request
@@ -567,6 +596,42 @@ pub fn display_video(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_crop_saves_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("page2cam.toml");
+        std::fs::write(&p, "# keep me\nfps = 25\n").unwrap();
+        let shared: p2c_core::SharedCrop = Arc::new(RwLock::new(p2c_core::Crop::FULL));
+        let live = p2c_core::Crop {
+            x: 0.25,
+            y: 0.25,
+            w: 0.5,
+            h: 0.5,
+        };
+        // Live update: applied at once, file untouched.
+        assert_eq!(change_crop(&shared, Some(&p), live, false), live);
+        assert_eq!(*shared.read(), live);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("webcam_crop"), "{text}");
+        // Final update: clamped (w 0.01 -> 0.10), saved, comments kept.
+        let tiny = p2c_core::Crop {
+            x: 0.0,
+            y: 0.0,
+            w: 0.01,
+            h: 0.5,
+        };
+        let got = change_crop(&shared, Some(&p), tiny, true);
+        assert!((got.w - 0.10).abs() < 1e-6, "{got:?}");
+        assert_eq!(*shared.read(), got);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# keep me"), "{text}");
+        let c: crate::config::Config = toml::from_str(&text).unwrap();
+        assert_eq!(c.crop(), got);
+        // No settings file: still applied.
+        assert_eq!(change_crop(&shared, None, live, true), live);
+        assert_eq!(*shared.read(), live);
+    }
 
     #[test]
     fn restart_needed_when_saved_choice_differs() {

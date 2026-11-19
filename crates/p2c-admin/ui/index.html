@@ -130,6 +130,26 @@
     background: #fff; border-radius: 2px; cursor: nwse-resize;
   }
 
+  /* Crop mode: the box edits the camera picture (edges trim, inside pans). */
+  .pip .edge { display: none; }
+  .pip.crop {
+    pointer-events: auto; cursor: grab; border: 2px solid var(--brand);
+    background: rgba(11,99,240,.08);
+  }
+  .pip.crop .grip, .pip.crop .handle { display: none; }
+  .pip.crop .edge { display: block; position: absolute; }
+  .pip.crop .edge::after {
+    content: ""; position: absolute; background: var(--brand); border: 1px solid #fff; border-radius: 3px;
+  }
+  .pip.crop .edge.l, .pip.crop .edge.r { top: 8px; bottom: 8px; width: 14px; cursor: ew-resize; }
+  .pip.crop .edge.t, .pip.crop .edge.b { left: 8px; right: 8px; height: 14px; cursor: ns-resize; }
+  .pip.crop .edge.l { left: -8px; } .pip.crop .edge.r { right: -8px; }
+  .pip.crop .edge.t { top: -8px; } .pip.crop .edge.b { bottom: -8px; }
+  .pip.crop .edge.l::after, .pip.crop .edge.r::after { left: 3px; top: 50%; width: 8px; height: 32px; transform: translateY(-50%); }
+  .pip.crop .edge.t::after, .pip.crop .edge.b::after { top: 3px; left: 50%; height: 8px; width: 32px; transform: translateX(-50%); }
+  #cropBtn[aria-pressed=true] { background: var(--brand); color: #fff; border-color: var(--brand); }
+  .crop-row .btn { flex: 1; }
+
   aside { display: grid; gap: 12px; }
   section.panel {
     background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px;
@@ -186,7 +206,7 @@
       <div class="screen" id="screen" tabindex="0" aria-label="Live output. Click to control the page; keys are sent while focused.">
         <canvas id="canvas" width="960" height="540"></canvas>
         <div class="empty" id="empty">Waiting for the first frame…</div>
-        <div class="pip" id="pip" title="Drag to move your webcam, drag the corner to resize"><div class="grip" id="grip"></div><div class="handle" id="handle" title="Drag sideways to move yourself">↔ Move</div></div>
+        <div class="pip" id="pip" title="Drag to move your webcam, drag the corner to resize"><div class="grip" id="grip"></div><div class="handle" id="handle" title="Drag sideways to move yourself">↔ Move</div><div class="edge l" data-edge="l" title="Drag to trim the left side"></div><div class="edge t" data-edge="t" title="Drag to trim the top"></div><div class="edge r" data-edge="r" title="Drag to trim the right side"></div><div class="edge b" data-edge="b" title="Drag to trim the bottom"></div></div>
       </div>
     </div>
     <p class="hint">Click, scroll and type in the picture to use the page. Drag the dashed box to place your webcam (in Cut-out full, drag the Move handle).</p>
@@ -222,6 +242,17 @@
       <div class="row" id="sizeRow">
         <label for="pipSize">Size</label>
         <input type="range" id="pipSize" min="5" max="50" step="1">
+      </div>
+      <div class="row crop-row">
+        <button class="btn" id="cropBtn" aria-pressed="false" title="Cut away parts of the camera picture">Crop</button>
+        <button class="btn" id="cropReset" title="Show the whole camera picture again" hidden>Reset crop</button>
+      </div>
+      <div id="cropBox" hidden>
+        <div class="row">
+          <label for="cropZoom">Zoom</label>
+          <input type="range" id="cropZoom" min="100" max="400" step="5" aria-label="Zoom into the camera picture">
+        </div>
+        <p class="sub" style="margin-top:0">Drag the blue edges of the box to trim a side; drag inside it to move the picture.</p>
       </div>
       <div class="state" id="webcamState"></div>
       <div id="gpuPick" hidden>
@@ -387,7 +418,15 @@
   // standing on the bottom edge. cutout-full: full height (shrunk to fit the
   // width), bottom edge, x slides it; no margins.
   const pipEl = $("pip");
-  function aspect() { return (state && state.status.webcam_aspect) || 9 / 16; }
+  // Webcam crop (0..1 of the camera picture). camAspect: the uncropped
+  // camera's h/w, so crop drags can resize the box at once instead of waiting
+  // for the status poll to report the new frame size.
+  const FULL = { x: 0, y: 0, w: 1, h: 1 }, MIN_CROP = 0.10;
+  let crop = { ...FULL }, cropMode = false, camAspect = null, cropChangedAt = 0, zoomBase = null;
+  function aspect() {
+    if (cropMode && camAspect) return camAspect * crop.h / crop.w;
+    return (state && state.status.webcam_aspect) || 9 / 16;
+  }
   const clamp01 = (v) => Math.min(Math.max(v, 0), 1);
   function pipGeom(W, H) {
     const style = pip.style || "box";
@@ -409,6 +448,9 @@
     Object.assign(pipEl.style, { left: g.x + "px", top: g.y + "px", width: g.w + "px", height: g.h + "px" });
     pipEl.classList.toggle("hidden", !pip.visible);
     pipEl.classList.toggle("full", g.style === "cutout-full");
+    pipEl.classList.toggle("crop", cropMode);
+    pipEl.title = cropMode ? "Drag inside to move the picture, drag an edge to trim"
+      : "Drag to move your webcam, drag the corner to resize";
   }
   let pushTimer = 0;
   function pushPip(now) {
@@ -447,9 +489,120 @@
     pipEl.addEventListener("pointerup", up);
   }
   pipEl.addEventListener("pointerdown", (e) => {
+    if (cropMode) { startCropDrag(e, e.target.dataset.edge || null); return; }
     if (pipEl.classList.contains("full") && e.target !== $("handle")) return;
     startDrag(e, e.target === $("grip"));
   });
+
+  // ---------- webcam crop ----------
+  // Drags act on the camera picture: the box shows crop.w × crop.h of it, so a
+  // pixel on the box is crop.w / box width of the camera horizontally (and
+  // crop.h / box height vertically). Dragging the right edge left by 10 % of the
+  // box width shrinks crop.w by 10 % of crop.w; the box shrinks with it (same
+  // scale, opposite edge stays put). Dragging inside pans: the picture follows
+  // the pointer. Mirrors p2c_core::Crop::clamp (min 10 %, inside the frame).
+  const clampR = (v, lo, hi) => Math.min(Math.max(v, lo), Math.max(lo, hi));
+  const sameCrop = (a, b) => ["x", "y", "w", "h"].every((k) => Math.abs(a[k] - b[k]) < 1e-4);
+  let cropBusy = false, cropPending = null, cropTimer = 0, cropSent = 0;
+  function sendCrop(body) {
+    // One request at a time, in order; while one is out keep only the newest
+    // (but never lose a save).
+    if (cropBusy) { cropPending = { ...body, save: body.save || (cropPending && cropPending.save) || false }; return; }
+    cropBusy = true; cropSent = Date.now();
+    api("/api/crop", body).catch(() => {}).finally(() => {
+      cropBusy = false;
+      if (cropPending) { const b = cropPending; cropPending = null; sendCrop(b); }
+    });
+  }
+  // Live updates at most ~10/s (save:false); `save` sends now and writes the settings.
+  function pushCrop(save) {
+    cropChangedAt = Date.now();
+    clearTimeout(cropTimer);
+    const go = () => sendCrop({ ...crop, save });
+    if (save) { go(); return; }
+    const wait = 100 - (Date.now() - cropSent);
+    if (wait <= 0) go(); else cropTimer = setTimeout(go, wait);
+  }
+  // Place the box at (left, top) with this width (preview px), as startDrag does.
+  function fitBox(r, left, top, width) {
+    const W = r.width, H = r.height;
+    if ((pip.style || "box") !== "cutout-full") pip.width = Math.min(Math.max(width / W, 0.05), 0.5);
+    const g = pipGeom(W, H);
+    pip.x = clamp01((left - g.mx + g.over) / Math.max(W - 2 * g.mx - g.w + 2 * g.over, 1));
+    if (g.style === "box") pip.y = clamp01((top - g.my) / Math.max(H - 2 * g.my - g.h, 1));
+  }
+  function startCropDrag(e, edge) {
+    e.preventDefault(); e.stopPropagation();
+    dragging = true;
+    pipEl.setPointerCapture(e.pointerId);
+    const r = screen.getBoundingClientRect(), b = pipEl.getBoundingClientRect();
+    const c0 = { ...crop }, L0 = b.left - r.left, T0 = b.top - r.top;
+    const sx = Math.max(b.width, 1) / c0.w, sy = Math.max(b.height, 1) / c0.h; // px per crop unit
+    const move = (ev) => {
+      const dx = (ev.clientX - e.clientX) / sx, dy = (ev.clientY - e.clientY) / sy;
+      const c = { ...c0 };
+      if (!edge) {
+        c.x = clampR(c0.x - dx, 0, 1 - c0.w);
+        c.y = clampR(c0.y - dy, 0, 1 - c0.h);
+      } else if (edge === "l") {
+        c.x = clampR(c0.x + dx, 0, c0.x + c0.w - MIN_CROP); c.w = c0.x + c0.w - c.x;
+      } else if (edge === "r") {
+        c.w = clampR(c0.w + dx, MIN_CROP, 1 - c0.x);
+      } else if (edge === "t") {
+        c.y = clampR(c0.y + dy, 0, c0.y + c0.h - MIN_CROP); c.h = c0.y + c0.h - c.y;
+      } else if (edge === "b") {
+        c.h = clampR(c0.h + dy, MIN_CROP, 1 - c0.y);
+      }
+      crop = c;
+      if (edge) { fitBox(r, L0 + (c.x - c0.x) * sx, T0 + (c.y - c0.y) * sy, c.w * sx); pushPip(false); }
+      layoutPip(); pushCrop(false); syncControls();
+    };
+    const up = () => {
+      dragging = false;
+      pipEl.removeEventListener("pointermove", move);
+      pipEl.removeEventListener("pointerup", up);
+      pipEl.removeEventListener("pointercancel", up);
+      pushCrop(true);
+      if (edge) pushPip(true);
+    };
+    pipEl.addEventListener("pointermove", move);
+    pipEl.addEventListener("pointerup", up);
+    pipEl.addEventListener("pointercancel", up);
+  }
+  function learnCamAspect() {
+    const a = state && state.status.webcam_aspect;
+    if (a) camAspect = a * crop.w / crop.h;
+  }
+  $("cropBtn").onclick = () => {
+    cropMode = !cropMode;
+    if (cropMode) {
+      if (!camAspect) learnCamAspect();
+      if (!pip.visible) { pip.visible = true; pushPip(true); }
+    }
+    layoutPip(); syncControls();
+  };
+  $("cropReset").onclick = () => {
+    crop = { ...FULL }; zoomBase = null;
+    layoutPip(); pushCrop(true); syncControls();
+  };
+  // Zoom: shrink the crop around its centre, keeping its aspect. 1× is the
+  // largest crop of that aspect that fits the camera picture.
+  $("cropZoom").oninput = () => {
+    if (!zoomBase) zoomBase = { ...crop };
+    const c0 = zoomBase, k = 1 / Math.max(c0.w, c0.h), z = $("cropZoom").value / 100;
+    const w = clampR(c0.w * k / z, MIN_CROP, 1), h = clampR(c0.h * k / z, MIN_CROP, 1);
+    const cx = c0.x + c0.w / 2, cy = c0.y + c0.h / 2;
+    crop = { x: clampR(cx - w / 2, 0, 1 - w), y: clampR(cy - h / 2, 0, 1 - h), w, h };
+    layoutPip(); pushCrop(false);
+  };
+  $("cropZoom").onchange = () => { zoomBase = null; pushCrop(true); };
+  // Adopt the app's crop (e.g. changed in another tab) once ours has settled,
+  // and learn the camera's own aspect from a status that matches it.
+  function syncCropFromState(s) {
+    if (dragging || zoomBase || !state.crop || Date.now() - cropChangedAt < 1500) return;
+    if (!sameCrop(state.crop, crop)) { crop = { ...state.crop }; cropChangedAt = Date.now(); layoutPip(); }
+    else if (s.webcam_aspect) learnCamAspect();
+  }
   new ResizeObserver(layoutPip).observe(screen);
 
   $("pipOn").onchange = () => { pip.visible = $("pipOn").checked; layoutPip(); pushPip(true); };
@@ -477,6 +630,11 @@
     $("cutoutBox").hidden = style === "box";
     $("corners").hidden = style !== "box";
     $("sizeRow").hidden = style === "cutout-full";
+    $("cropBtn").setAttribute("aria-pressed", String(cropMode));
+    $("cropBtn").textContent = cropMode ? "Done cropping" : "Crop";
+    $("cropReset").hidden = !cropMode;
+    $("cropBox").hidden = !cropMode;
+    if (!zoomBase) $("cropZoom").value = Math.round(clampR(100 / Math.max(crop.w, crop.h), 100, 400));
   }
 
   // ---------- stream ----------
@@ -591,6 +749,7 @@
       state = await r.json();
       const s = state.status;
       if (first || document.activeElement !== $("url")) $("url").value = s.url;
+      syncCropFromState(s);
       if (!dragging) { pip = state.pip; syncControls(); layoutPip(); }
       if (first) {
         audio = state.audio;
