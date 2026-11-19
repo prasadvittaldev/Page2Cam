@@ -235,7 +235,7 @@ pub fn background_html(kind: &FullBg, image_url: Option<&str>) -> String {
         FullBg::YouTube(id) => (
             "iframe{position:fixed;inset:0;width:100vw;height:100vh;border:0}".to_string(),
             format!(
-                r#"<iframe src="{}" allow="autoplay; encrypted-media; picture-in-picture" referrerpolicy="strict-origin-when-cross-origin" title="YouTube video"></iframe>"#,
+                r#"<iframe src="{}" sandbox="allow-scripts allow-same-origin allow-presentation" allow="autoplay; encrypted-media; picture-in-picture" referrerpolicy="strict-origin-when-cross-origin" title="YouTube video"></iframe>"#,
                 html_escape(&youtube_embed_url(id))
             ),
         ),
@@ -246,6 +246,16 @@ pub fn background_html(kind: &FullBg, image_url: Option<&str>) -> String {
          <style>html,body{{margin:0;height:100%;overflow:hidden;background:#000}}{style}</style>\
          </head><body>{body}</body></html>\n"
     )
+}
+
+/// The page to open at start-up: the saved `last_page_url` when it is a
+/// user page and no `--url` was given, else `url`.
+pub fn initial_page_url(cli_url_given: bool, saved: &str, url: &str) -> String {
+    if !cli_url_given && is_user_page_url(saved) {
+        saved.to_string()
+    } else {
+        url.to_string()
+    }
 }
 
 /// A URL the operator's page can be restored to: http, https or file, and
@@ -331,21 +341,39 @@ pub struct PreparedImage {
 /// Check (size, real type), decode, fit into [`MAX_IMAGE_SIDE`] and
 /// re-encode an uploaded image. Never returns the input bytes as they came.
 pub fn prepare_image(bytes: &[u8]) -> Result<PreparedImage, ImageError> {
+    prepare_image_with(bytes, MAX_IMAGE_SIDE, image_limits())
+}
+
+/// Decoder limits for uploads: at most 16384 px a side and 512 MiB.
+pub fn image_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    limits
+}
+
+/// One image decode at a time (each may take up to 512 MiB).
+static DECODE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// [`prepare_image`] with a given size cap and decoder limits.
+pub fn prepare_image_with(
+    bytes: &[u8],
+    max_side: u32,
+    limits: image::Limits,
+) -> Result<PreparedImage, ImageError> {
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err(ImageError::TooLarge);
     }
     let format = sniff_image(bytes).ok_or(ImageError::NotAnImage)?;
+    let _one_at_a_time = DECODE.lock();
     let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16_384);
-    limits.max_image_height = Some(16_384);
-    limits.max_alloc = Some(1024 * 1024 * 1024);
     reader.limits(limits);
     let img = reader
         .decode()
         .map_err(|e| ImageError::Bad(e.to_string()))?;
-    let img = if img.width() > MAX_IMAGE_SIDE || img.height() > MAX_IMAGE_SIDE {
-        img.thumbnail(MAX_IMAGE_SIDE, MAX_IMAGE_SIDE)
+    let img = if img.width() > max_side || img.height() > max_side {
+        img.thumbnail(max_side, max_side)
     } else {
         img
     };
@@ -434,6 +462,8 @@ pub struct BgState {
     pub note: Option<(String, Instant)>,
     /// Bumped whenever the generated page changes (`current.html?v=<n>`).
     pub version: u64,
+    /// When we last navigated Chromium (its URL may still show the old page).
+    pub nav_at: Option<Instant>,
 }
 
 impl BgState {
@@ -516,6 +546,7 @@ impl BgState {
             last_page_url,
             note: None,
             version: 1,
+            nav_at: None,
         };
         (st, warn)
     }
@@ -546,8 +577,13 @@ pub type Fetcher = Box<dyn Fn(&str) -> anyhow::Result<Vec<u8>> + Send + Sync>;
 /// memory. A failed fetch is retried after a minute at the earliest.
 pub struct ThumbCache {
     fetch: Fetcher,
-    entries: parking_lot::Mutex<HashMap<String, Thumb>>,
+    /// One slot per video, each with its own lock (held while fetching
+    /// that video only).
+    entries: parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<Option<Thumb>>>>>,
 }
+
+/// Most videos whose thumbnails are kept.
+pub const THUMB_CAP: usize = 32;
 
 enum Thumb {
     Ok(Arc<Vec<u8>>),
@@ -572,10 +608,24 @@ impl ThumbCache {
     /// The JPEG thumbnail of `id` (may block on the first call for an id).
     pub fn get(&self, id: &str) -> anyhow::Result<Arc<Vec<u8>>> {
         anyhow::ensure!(is_video_id(id), "not a YouTube video id");
-        // Held while fetching: a second request for the thumbnail waits for
-        // the first instead of fetching it again.
-        let mut entries = self.entries.lock();
-        match entries.get(id) {
+        let slot = {
+            let mut entries = self.entries.lock();
+            if !entries.contains_key(id) && entries.len() >= THUMB_CAP {
+                // Full: forget one other video (not one being fetched).
+                let victim = entries
+                    .iter()
+                    .find(|(_, s)| !s.is_locked())
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = victim {
+                    entries.remove(&k);
+                }
+            }
+            entries.entry(id.to_string()).or_default().clone()
+        };
+        // Held while fetching: a second request for the same thumbnail
+        // waits for the first instead of fetching it again.
+        let mut entry = slot.lock();
+        match &*entry {
             Some(Thumb::Ok(b)) => return Ok(b.clone()),
             Some(Thumb::Failed(at, why)) if at.elapsed() < THUMB_RETRY => {
                 anyhow::bail!("{why}")
@@ -589,15 +639,21 @@ impl ThumbCache {
         match got {
             Ok(b) => {
                 let b = Arc::new(b);
-                entries.insert(id.to_string(), Thumb::Ok(b.clone()));
+                *entry = Some(Thumb::Ok(b.clone()));
                 Ok(b)
             }
             Err(e) => {
                 let why = format!("{e:#}");
-                entries.insert(id.to_string(), Thumb::Failed(Instant::now(), why.clone()));
+                *entry = Some(Thumb::Failed(Instant::now(), why.clone()));
                 anyhow::bail!("{why}")
             }
         }
+    }
+
+    /// How many videos are cached.
+    #[cfg(test)]
+    pub fn cached(&self) -> usize {
+        self.entries.lock().len()
     }
 }
 
@@ -743,16 +799,24 @@ mod tests {
         let mut fake = b"\x89PNG\r\n\x1a\n".to_vec();
         fake.extend_from_slice(&[0u8; 64]);
         assert!(matches!(prepare_image(&fake), Err(ImageError::Bad(_))));
-        // 10000x10000: decoded and scaled down to fit 3840.
-        let huge = png_rgb(10_000, 10_000);
-        let p = prepare_image(&huge).unwrap();
-        assert!(
-            p.width <= 3840 && p.height <= 3840,
-            "{}x{}",
-            p.width,
-            p.height
-        );
+        // Too big: scaled down to fit (same code path as 10000x10000 -> 3840,
+        // which the ignored `image_upload_limits_real_10000` runs for real).
+        let p = prepare_image_with(&png_rgb(600, 400), 256, image_limits()).unwrap();
+        assert_eq!((p.width, p.height), (256, 171));
         assert_eq!((p.frame.width, p.frame.height), (p.width, p.height));
+        // A decode that would need more memory than allowed is refused.
+        let mut tight = image_limits();
+        tight.max_alloc = Some(100_000);
+        assert!(matches!(
+            prepare_image_with(&png_rgb(600, 400), 256, tight),
+            Err(ImageError::Bad(_))
+        ));
+        // Larger than the 16384 px side limit: refused before decoding.
+        let mut hdr = png_rgb(1, 1);
+        hdr[16..20].copy_from_slice(&20_000u32.to_be_bytes()); // IHDR width
+        assert!(matches!(prepare_image(&hdr), Err(ImageError::Bad(_))));
+        assert_eq!(image_limits().max_alloc, Some(512 * 1024 * 1024));
+        let p = prepare_image(&png_rgb(64, 32)).unwrap();
         // Opaque: re-encoded as JPEG, BGRA frame opaque with the colour swapped.
         assert_eq!(p.ext, "jpg");
         assert_eq!(sniff_image(&p.encoded), Some(image::ImageFormat::Jpeg));
@@ -772,6 +836,87 @@ mod tests {
             sniff_image(b"RIFF\0\0\0\0WEBPVP8 "),
             Some(image::ImageFormat::WebP)
         );
+    }
+
+    #[test]
+    #[ignore = "decodes a real 10000x10000 PNG (slow in debug builds)"]
+    fn image_upload_limits_real_10000() {
+        let p = prepare_image(&png_rgb(10_000, 10_000)).unwrap();
+        assert_eq!((p.width, p.height), (3840, 3840));
+        assert_eq!(p.ext, "jpg");
+    }
+
+    #[test]
+    fn decodes_run_one_at_a_time() {
+        // Two uploads at once: the second waits for the first's decode.
+        let held = DECODE.lock();
+        let t = std::thread::spawn(|| {
+            let at = Instant::now();
+            prepare_image(&png_rgb(8, 8)).unwrap();
+            at.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+        assert!(t.join().unwrap() >= Duration::from_millis(250));
+    }
+
+    #[test]
+    fn startup_page_url() {
+        let saved = "https://saved.test/x";
+        // No --url: the saved page wins over `url`.
+        assert_eq!(initial_page_url(false, saved, "https://cfg.test"), saved);
+        // --url given, or nothing usable saved: `url`.
+        assert_eq!(
+            initial_page_url(true, saved, "https://cli.test"),
+            "https://cli.test"
+        );
+        for bad in [
+            "",
+            "about:blank",
+            "http://127.0.0.1:8765/bg/abc/current.html",
+        ] {
+            assert_eq!(
+                initial_page_url(false, bad, "https://cfg.test"),
+                "https://cfg.test"
+            );
+        }
+    }
+
+    #[test]
+    fn youtube_iframe_is_sandboxed() {
+        let html = background_html(&FullBg::YouTube("dQw4w9WgXcQ".into()), None);
+        assert!(
+            html.contains(r#"sandbox="allow-scripts allow-same-origin allow-presentation""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn thumbnail_fetches_lock_per_id_and_cache_is_capped() {
+        // A slow fetch for one video doesn't hold up another.
+        let cache = Arc::new(ThumbCache::new(Box::new(|url| {
+            if url.contains("slowslowslo") {
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+            Ok(vec![0xff, 0xd8, 0xff, 0xd9])
+        })));
+        let c = cache.clone();
+        let slow = std::thread::spawn(move || c.get("slowslowslo").unwrap());
+        std::thread::sleep(Duration::from_millis(100));
+        let at = Instant::now();
+        cache.get("dQw4w9WgXcQ").unwrap();
+        assert!(
+            at.elapsed() < Duration::from_millis(700),
+            "{:?}",
+            at.elapsed()
+        );
+        slow.join().unwrap();
+        // At most THUMB_CAP videos are kept.
+        for i in 0..40 {
+            cache.get(&format!("vid{i:08}")).unwrap();
+        }
+        assert!(cache.cached() <= THUMB_CAP, "{}", cache.cached());
+        assert_eq!(THUMB_CAP, 32);
     }
 
     #[test]

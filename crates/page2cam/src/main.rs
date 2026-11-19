@@ -410,13 +410,11 @@ fn run() -> anyhow::Result<i32> {
     sinks.push(Box::new(stream.sink()));
 
     let layout = Arc::new(RwLock::new(cfg.pip_layout()?));
-    // Saved backgrounds. The page to restore: `--url` if given, else the
-    // saved `last_page_url`, else `url`.
-    let last_page_url = if cli.url.is_none() && background::is_user_page_url(&cfg.last_page_url) {
-        cfg.last_page_url.clone()
-    } else {
-        cfg.url.clone()
-    };
+    // Saved backgrounds. The user's page (opened at start-up unless a
+    // generated background is chosen): `--url` if given, else the saved
+    // `last_page_url`, else `url`.
+    let last_page_url =
+        background::initial_page_url(cli.url.is_some(), &cfg.last_page_url, &cfg.url);
     let (bg_state, bg_warnings) = background::BgState::from_config(&cfg, last_page_url);
     for w in &bg_warnings {
         tracing::warn!("background setting: {w}");
@@ -555,6 +553,7 @@ fn run() -> anyhow::Result<i32> {
         layout,
         backdrop,
         bg: Mutex::new(bg_state),
+        apply_lock: Mutex::new(()),
         bg_base: OnceLock::new(),
         data_dir: directories::ProjectDirs::from("", "", "page2cam")
             .map(|d| d.data_dir().to_path_buf()),
@@ -665,6 +664,8 @@ fn run() -> anyhow::Result<i32> {
                 let mut round = 0u32;
                 while !quit.load(std::sync::atomic::Ordering::Relaxed) {
                     app.update_mic_delay();
+                    // Back/Forward must not leave one of our background pages up.
+                    app.keep_page_off_background();
                     if round.is_multiple_of(4) {
                         app.sample_health();
                     }
@@ -724,7 +725,7 @@ fn run() -> anyhow::Result<i32> {
         Ok(a) => app.start_background(a.bg_url.clone()),
         Err(_) => None,
     }
-    .unwrap_or_else(|| cfg.url.clone());
+    .unwrap_or_else(|| app.bg.lock().last_page_url.clone());
 
     let result = if let Err(e) = admin {
         Err(e)

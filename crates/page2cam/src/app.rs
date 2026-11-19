@@ -27,6 +27,9 @@ pub struct App {
     /// The operator's background choices (full frame, in box, pictures,
     /// the page to restore).
     pub bg: Mutex<crate::background::BgState>,
+    /// Serializes background changes (and the Box style rule), so their
+    /// navigations and saves happen in order. Never held by `status()`.
+    pub apply_lock: Mutex<()>,
     /// `http://127.0.0.1:<port>/bg/<id>/` once the admin server is up.
     pub bg_base: OnceLock<String>,
     /// Where uploaded pictures are kept (`<data dir>/backgrounds/`).
@@ -330,6 +333,10 @@ impl App {
     }
 }
 
+/// How long our own navigation may take before a `/bg/` URL counts as
+/// reached through history.
+const NAV_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Note shown when a full-frame background switched the style to a cut-out.
 const NOTE_TO_CUTOUT: &str =
     "Style set to full-height cut-out: a full-frame background needs the person cut out";
@@ -352,8 +359,34 @@ struct BgChange {
 impl App {
     /// Load `url` in Chromium (or remember it until the browser exists).
     fn load_url(&self, url: &str) {
+        self.bg.lock().nav_at = Some(std::time::Instant::now());
         *self.fallback_url.lock() = url.to_string();
         self.with_browser(|b| b.navigate(url));
+    }
+
+    /// Back/Forward are ignored while a generated background shows (the
+    /// history behind it is the user's page or other backgrounds).
+    pub fn nav_allowed(&self, a: NavAction) -> bool {
+        a == NavAction::Reload || !self.bg.lock().full.is_generated()
+    }
+
+    /// If Chromium shows one of our background pages while none is chosen
+    /// (Back/Forward through history), load the user's page instead. Our
+    /// own navigations get [`NAV_SETTLE`] to finish first. Called every
+    /// ~250 ms.
+    pub fn keep_page_off_background(&self) {
+        let _apply = self.apply_lock.lock();
+        let shown = self.shown_url();
+        let url = {
+            let s = self.bg.lock();
+            let settling = s.nav_at.is_some_and(|t| t.elapsed() < NAV_SETTLE);
+            let on_bg = !crate::background::is_user_page_url(&shown) && shown.contains("/bg/");
+            (on_bg && !settling && !s.full.is_generated()).then(|| s.last_page_url.clone())
+        };
+        if let Some(u) = url.filter(|u| !u.is_empty()) {
+            tracing::info!(url = %u, "history reached a background page: back to the user's page");
+            self.load_url(&u);
+        }
     }
 
     /// The URL Chromium shows.
@@ -407,6 +440,7 @@ impl App {
     /// the URL Chromium should start on when a saved background is a
     /// generated page (and loads it if the browser already exists).
     pub fn start_background(&self, base: String) -> Option<String> {
+        let _held = self.apply_lock.lock();
         let _ = self.bg_base.set(base);
         let url = {
             let s = self.bg.lock();
@@ -425,7 +459,8 @@ impl App {
     /// Apply a background change: remember the user's page, navigate
     /// Chromium, apply the interplay rule (a full-frame background needs a
     /// cut-out style), update the compositor and save everything.
-    fn apply_background(&self, c: BgChange) {
+    /// Callers hold `apply_lock` (passed in) for the whole change.
+    fn apply_background(&self, _held: &parking_lot::MutexGuard<'_, ()>, c: BgChange) {
         use crate::background::{is_user_page_url, FullBg};
         let shown = self.shown_url();
         let style = self.layout.read().style;
@@ -578,12 +613,13 @@ impl App {
 impl Controls for App {
     fn navigate(&self, url: &str) {
         tracing::info!(url, "navigate");
+        let held = self.apply_lock.lock();
         if self.bg.lock().full.is_generated() {
             // The operator wants a page: the full frame goes back to Page.
             let mut c = self.change();
             c.full = crate::background::FullBg::Page;
             c.page_url = Some(url.to_string());
-            self.apply_background(c);
+            self.apply_background(&held, c);
             if !crate::background::is_user_page_url(url) {
                 self.load_url(url);
             }
@@ -593,6 +629,10 @@ impl Controls for App {
     }
 
     fn nav(&self, a: NavAction) {
+        if !self.nav_allowed(a) {
+            tracing::info!(action = ?a, "ignored while a background shows");
+            return;
+        }
         self.with_browser(|b| match a {
             NavAction::Back => b.back(),
             NavAction::Forward => b.forward(),
@@ -642,6 +682,9 @@ impl Controls for App {
     }
 
     fn set_pip(&self, l: PipLayout) {
+        // The style write and the Box rule as one step with background
+        // changes (no Box with a full-frame background left behind).
+        let held = self.apply_lock.lock();
         let old = std::mem::replace(&mut *self.layout.write(), l);
         if old.style != l.style {
             tracing::info!(style = l.style.as_str(), "overlay style");
@@ -652,7 +695,7 @@ impl Controls for App {
             tracing::info!("Box style chosen: full-frame background set back to Page");
             let mut c = self.change();
             c.full = crate::background::FullBg::Page;
-            self.apply_background(c);
+            self.apply_background(&held, c);
             self.bg.lock().note = Some((NOTE_TO_PAGE.into(), std::time::Instant::now()));
         }
         self.update_segmenter();
@@ -893,6 +936,7 @@ impl Controls for App {
     }
 
     fn set_background(&self, b: BackgroundDto) -> anyhow::Result<()> {
+        let held = self.apply_lock.lock();
         let change = self.parse_background(&b)?;
         tracing::info!(
             full = change.full.as_str(),
@@ -900,7 +944,7 @@ impl Controls for App {
             refined = change.refined,
             "background chosen"
         );
-        self.apply_background(change);
+        self.apply_background(&held, change);
         Ok(())
     }
 
@@ -913,6 +957,8 @@ impl Controls for App {
             h = p.height,
             "background image uploaded"
         );
+        // After the (slow) decode: store and show as one step.
+        let held = self.apply_lock.lock();
         let path = match &self.data_dir {
             Some(d) => {
                 let dir = d.join("backgrounds");
@@ -954,7 +1000,7 @@ impl Controls for App {
         if let Some(p) = &path {
             c.extra.push((key, p.display().to_string().into()));
         }
-        self.apply_background(c);
+        self.apply_background(&held, c);
         Ok(())
     }
 
@@ -1332,6 +1378,7 @@ mod tests {
                 )
                 .0,
             ),
+            apply_lock: Mutex::new(()),
             bg_base: OnceLock::new(),
             data_dir: None,
             thumbs: crate::background::ThumbCache::new(Box::new(|_| {
@@ -1734,6 +1781,107 @@ mod tests {
             *calls.lock(),
             vec!["https://img.youtube.com/vi/dQw4w9WgXcQ/mqdefault.jpg".to_string()]
         );
+    }
+
+    /// Shown page and choices agree: a generated page exactly when the full
+    /// frame is one, never Box with a full-frame background.
+    fn assert_consistent(app: &App) {
+        let full = app.bg.lock().full.clone();
+        let style = app.pip().style;
+        assert!(
+            !(style == OverlayStyle::Box && full != crate::background::FullBg::Page),
+            "Box with {full:?}"
+        );
+        let shown = shown(app);
+        if full.is_generated() {
+            assert!(shown.starts_with(BG_BASE), "{full:?} but showing {shown}");
+        } else {
+            assert_eq!(shown, app.bg.lock().last_page_url, "{full:?}");
+        }
+    }
+
+    #[test]
+    fn concurrent_background_changes_stay_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bg_app(dir.path());
+        app.settings_path = None; // speed: no file writes
+        let app = Arc::new(app);
+        app.navigate("https://user.test/a");
+        let youtube = BackgroundDto {
+            full_youtube: Some("dQw4w9WgXcQ".into()),
+            ..bg("youtube", "room")
+        };
+        for round in 0..300 {
+            app.set_pip(PipLayout {
+                style: OverlayStyle::CutoutSmall,
+                ..app.pip()
+            });
+            app.set_background(bg("page", "room")).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let (a, b1) = (app.clone(), barrier.clone());
+            let y = youtube.clone();
+            let t1 = std::thread::spawn(move || {
+                b1.wait();
+                a.set_background(y).unwrap();
+            });
+            let (a, b2) = (app.clone(), barrier.clone());
+            let t2 = std::thread::spawn(move || {
+                b2.wait();
+                a.set_pip(PipLayout {
+                    style: OverlayStyle::Box,
+                    ..a.pip()
+                });
+            });
+            let (a, b3) = (app.clone(), barrier);
+            let colour = BackgroundDto {
+                full_colour: Some("#123456".into()),
+                ..bg(if round % 2 == 0 { "colour" } else { "page" }, "room")
+            };
+            let t3 = std::thread::spawn(move || {
+                b3.wait();
+                a.set_background(colour).unwrap();
+            });
+            for t in [t1, t2, t3] {
+                t.join().unwrap();
+            }
+            assert_consistent(&app);
+        }
+    }
+
+    #[test]
+    fn back_and_forward_never_leave_a_background_page_showing() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bg_app(dir.path());
+        app.navigate("https://user.test/a");
+        app.set_background(BackgroundDto {
+            full_youtube: Some("dQw4w9WgXcQ".into()),
+            ..bg("youtube", "room")
+        })
+        .unwrap();
+        // While a background shows, Back/Forward are ignored (Reload isn't).
+        assert!(!app.nav_allowed(NavAction::Back));
+        assert!(!app.nav_allowed(NavAction::Forward));
+        assert!(app.nav_allowed(NavAction::Reload));
+        // On the page: allowed, but if history lands on a /bg/ page, the
+        // user's page is loaded instead.
+        app.set_background(bg("page", "room")).unwrap();
+        assert!(app.nav_allowed(NavAction::Back));
+        let back_landed = format!("{BG_BASE}current.html?v=2");
+        *app.fallback_url.lock() = back_landed.clone();
+        // Just after our own navigation: give it time to finish.
+        app.keep_page_off_background();
+        assert_eq!(shown(&app), back_landed);
+        app.bg.lock().nav_at = None;
+        app.keep_page_off_background();
+        assert_eq!(shown(&app), "https://user.test/a");
+        // A user page is left alone, and so is a generated page while chosen.
+        *app.fallback_url.lock() = "https://user.test/b".into();
+        app.keep_page_off_background();
+        assert_eq!(shown(&app), "https://user.test/b");
+        app.set_background(bg("blurred-room", "room")).unwrap();
+        app.bg.lock().nav_at = None;
+        app.keep_page_off_background();
+        assert_eq!(shown(&app), "https://user.test/b");
     }
 
     #[test]
