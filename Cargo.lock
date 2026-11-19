@@ -2541,6 +2541,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2c-tray"
+version = "0.3.0"
+dependencies = [
+ "p2c-admin",
+ "p2c-shm",
+ "serde_json",
+]
+
+[[package]]
 name = "p2c-update"
 version = "0.3.0"
 dependencies = [
