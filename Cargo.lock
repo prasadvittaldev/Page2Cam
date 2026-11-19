@@ -2585,6 +2585,7 @@ dependencies = [
  "jpeg-encoder",
  "nokhwa",
  "p2c-core",
+ "p2c-shm",
  "parking_lot",
  "tempfile",
  "tracing",

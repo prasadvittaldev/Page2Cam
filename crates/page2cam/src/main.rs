@@ -798,7 +798,7 @@ fn start_webcam(
         return None;
     };
     let slot = FrameSlot::new();
-    match WebcamCapture::start(&cam, slot.clone(), crop) {
+    match WebcamCapture::start(&cam, own_device, slot.clone(), crop) {
         Ok(cap) => {
             tracing::info!(webcam = %cam.name, "webcam on");
             Some((slot, WebcamSource::Real(cap), cam.name.clone()))

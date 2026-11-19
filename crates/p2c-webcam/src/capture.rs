@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -208,14 +208,18 @@ pub struct WebcamCapture {
 }
 
 impl WebcamCapture {
+    /// `own_device` is Page2Cam's output device (Linux loopback path), never
+    /// reopened on reconnect.
     pub fn start(
         cam: &CameraInfo,
+        own_device: Option<&Path>,
         slot: FrameSlot,
         crop: SharedCrop,
     ) -> anyhow::Result<WebcamCapture> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let cam = cam.clone();
+        let own_device = own_device.map(Path::to_path_buf);
         let status = WebcamStatus::new(&format!("ok: {}", cam.name));
         let status2 = status.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
@@ -241,7 +245,7 @@ impl WebcamCapture {
                 let mut first = true;
                 capture_loop(
                     camera,
-                    || open(&cam).map(NokhwaSource),
+                    || reopen(&cam, own_device.as_deref()).map(NokhwaSource),
                     &stop2,
                     reopen_due,
                     &cam.name,
@@ -317,6 +321,20 @@ fn join_within(handle: JoinHandle<()>, done: &Receiver<()>, timeout: Duration) -
             true
         }
     }
+}
+
+/// Reconnect: list the devices again and find the same camera by name (and
+/// path), since its enumeration index may now belong to another device, even
+/// to our own virtual camera.
+fn reopen(cam: &CameraInfo, own_device: Option<&Path>) -> anyhow::Result<Camera> {
+    let cams = list_cameras()?;
+    let Some(found) = crate::reselect(cam, &cams, own_device) else {
+        anyhow::bail!("webcam {} not found", cam.name);
+    };
+    if found.index != cam.index {
+        tracing::info!(camera = %cam.name, old = cam.index, new = found.index, "webcam moved to a new device index");
+    }
+    open(&found)
 }
 
 fn open(cam: &CameraInfo) -> anyhow::Result<Camera> {
