@@ -4,15 +4,21 @@
 //! textures. What to draw is decided by `p2c_compositor::plan_compose`, the
 //! same function the CPU compositor uses; [`crate::compose`] draws it.
 //!
-//! The shaders are compiled the first time a backdrop or refined edges are
-//! used, so Page + Room with LUT edges costs nothing extra.
+//! The shaders are compiled once per process on a background thread started
+//! when the first `GpuProducer` is created ([`compile_in_background`]), so
+//! turning a backdrop on later never stalls the output. The bytecode doesn't
+//! depend on the device; each producer only creates its shader objects.
+//!
+//! Textures that are only read with `Load` at explicit sizes grow and are
+//! never shrunk, so dragging the PIP's size doesn't reallocate them every
+//! tick; textures read through the bilinear sampler keep their exact size.
 
-use std::sync::Arc;
+use std::sync::{Arc, Once, OnceLock};
 
 use anyhow::{ensure, Context, Result};
 use p2c_compositor::{
     blur_kernel, blur_low_size, cover_crop, refined_size, GUIDED_EPS, GUIDED_RADIUS,
-    GUIDED_SUBSAMPLE,
+    GUIDED_SUBSAMPLE, REFINED_MAX_W,
 };
 use p2c_core::Frame;
 use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -22,12 +28,12 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_BUFFER_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R8_UNORM,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R8_UNORM,
 };
 
 use crate::compose::{use_sampler, viewport, PassConsts, COMPOSE_HLSL};
 use crate::device::{Gpu, Texture};
-use crate::shaders::ps;
+use crate::shaders::compile;
 
 pub(crate) const BLUR_HLSL: &str = include_str!("hlsl/blur.hlsl");
 pub(crate) const GUIDED_HLSL: &str = include_str!("hlsl/guided.hlsl");
@@ -57,9 +63,83 @@ struct GuidedConsts {
     eps: f32,
 }
 
-/// The source of a `Blur`/`GuidedConsts` constant buffer update.
-fn bytes<T>(v: &T) -> *const std::ffi::c_void {
-    v as *const T as _
+/// Entry points, in [`Blobs`] order: (blur file?, entry).
+const ENTRIES: [(bool, &str); 10] = [
+    (true, "ps_cover"),
+    (true, "ps_blur_h"),
+    (true, "ps_blur_v"),
+    (true, "ps_fill"),
+    (false, "ps_guide_luma"),
+    (false, "ps_guide_stats"),
+    (false, "ps_box_h"),
+    (false, "ps_box_v_ab"),
+    (false, "ps_box_v"),
+    (false, "ps_guided_out"),
+];
+
+/// Compiled bytecode of [`ENTRIES`] (device independent).
+pub(crate) struct Blobs {
+    code: Vec<Vec<u8>>,
+    /// How long compiling took (for the log).
+    pub(crate) ms: f64,
+}
+
+/// Compile every backdrop entry point (tens to hundreds of ms).
+pub(crate) fn compile_blobs() -> Result<Blobs> {
+    let t = std::time::Instant::now();
+    let blur = format!("{COMPOSE_HLSL}\n{BLUR_HLSL}");
+    let guided = format!("{COMPOSE_HLSL}\n{GUIDED_HLSL}");
+    let code = ENTRIES
+        .iter()
+        .map(|(is_blur, e)| {
+            if *is_blur {
+                compile(&blur, "blur.hlsl", e, "ps_5_0")
+            } else {
+                compile(&guided, "guided.hlsl", e, "ps_5_0")
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Blobs {
+        code,
+        ms: t.elapsed().as_secs_f64() * 1e3,
+    })
+}
+
+static BLOBS: OnceLock<Result<Blobs, String>> = OnceLock::new();
+static STARTED: Once = Once::new();
+
+fn init_blobs() -> Result<Blobs, String> {
+    let r = compile_blobs().map_err(|e| format!("{e:#}"));
+    match &r {
+        Ok(b) => tracing::info!(ms = b.ms, "GPU backdrop shaders compiled"),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "GPU backdrop shaders failed to compile; backgrounds and refined edges are off on the GPU"
+        ),
+    }
+    r
+}
+
+/// Start compiling the backdrop shaders on a background thread (once per
+/// process; later calls do nothing).
+pub(crate) fn compile_in_background() {
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("p2c-shader-compile".into())
+            .spawn(|| {
+                BLOBS.get_or_init(init_blobs);
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "can't start the shader compile thread; compiling on first use");
+        }
+    });
+}
+
+/// The compiled bytecode, waiting for the background compile if it is still
+/// running (it starts with the first producer, so by the time a backdrop is
+/// switched on it is normally long done).
+pub(crate) fn blobs() -> &'static Result<Blobs, String> {
+    BLOBS.get_or_init(init_blobs)
 }
 
 fn cbuffer(device: &ID3D11Device, size: usize) -> Result<ID3D11Buffer> {
@@ -77,7 +157,16 @@ fn cbuffer(device: &ID3D11Device, size: usize) -> Result<ID3D11Buffer> {
     b.context("CreateBuffer returned nothing")
 }
 
-/// Compiled backdrop / refined-edge shaders and their constant buffers.
+fn pixel_shader(device: &ID3D11Device, code: &[u8], entry: &str) -> Result<ID3D11PixelShader> {
+    let mut s = None;
+    // SAFETY: valid bytecode slice and out-pointer.
+    unsafe { device.CreatePixelShader(code, None, Some(&mut s)) }
+        .with_context(|| format!("CreatePixelShader {entry}"))?;
+    s.context("CreatePixelShader returned nothing")
+}
+
+/// Backdrop / refined-edge shader objects of one device and their constant
+/// buffers.
 pub(crate) struct BackdropShaders {
     pub(crate) cover: ID3D11PixelShader,
     blur_h: ID3D11PixelShader,
@@ -97,22 +186,19 @@ pub(crate) struct BackdropShaders {
 }
 
 impl BackdropShaders {
-    pub(crate) fn new(device: &ID3D11Device) -> Result<BackdropShaders> {
-        let blur = format!("{COMPOSE_HLSL}\n{BLUR_HLSL}");
-        let guided = format!("{COMPOSE_HLSL}\n{GUIDED_HLSL}");
-        let b = |e: &str| ps(device, &blur, "blur.hlsl", e);
-        let g = |e: &str| ps(device, &guided, "guided.hlsl", e);
+    pub(crate) fn new(device: &ID3D11Device, blobs: &Blobs) -> Result<BackdropShaders> {
+        let s = |i: usize| pixel_shader(device, &blobs.code[i], ENTRIES[i].1);
         Ok(BackdropShaders {
-            cover: b("ps_cover")?,
-            blur_h: b("ps_blur_h")?,
-            blur_v: b("ps_blur_v")?,
-            fill: b("ps_fill")?,
-            luma: g("ps_guide_luma")?,
-            stats: g("ps_guide_stats")?,
-            box_h: g("ps_box_h")?,
-            box_v_ab: g("ps_box_v_ab")?,
-            box_v: g("ps_box_v")?,
-            guided_out: g("ps_guided_out")?,
+            cover: s(0)?,
+            blur_h: s(1)?,
+            blur_v: s(2)?,
+            fill: s(3)?,
+            luma: s(4)?,
+            stats: s(5)?,
+            box_h: s(6)?,
+            box_v_ab: s(7)?,
+            box_v: s(8)?,
+            guided_out: s(9)?,
             cb_pass: cbuffer(device, std::mem::size_of::<PassConsts>())?,
             cb_blur: cbuffer(device, std::mem::size_of::<BlurConsts>())?,
             cb_guided: cbuffer(device, std::mem::size_of::<GuidedConsts>())?,
@@ -120,28 +206,37 @@ impl BackdropShaders {
     }
 }
 
-/// One fullscreen-triangle pass into `target` (whole texture), no blending.
-/// Takes the context lock itself: never call it while holding it.
+/// Upload `v` into the constant buffer `cb`.
+fn upload<T>(gpu: &Gpu, cb: &ID3D11Buffer, v: &T) {
+    let _lock = gpu.lock();
+    // SAFETY: `cb` was created with size_of::<T>() bytes; `v` outlives the call.
+    unsafe {
+        gpu.context()
+            .UpdateSubresource(cb, 0, None, v as *const T as _, 0, 0)
+    };
+}
+
+/// One fullscreen-triangle pass into the top-left `w` x `h` of `target`,
+/// no blending, `cb1` (already uploaded) bound at b1. Takes the context
+/// lock itself: never call it while holding it.
+#[allow(clippy::too_many_arguments)]
 fn pass(
     gpu: &Gpu,
     sh: &BackdropShaders,
     shader: &ID3D11PixelShader,
     target: &Texture,
+    (w, h): (u32, u32),
     c0: &PassConsts,
-    c1: Option<(&ID3D11Buffer, *const std::ffi::c_void)>,
+    cb1: Option<&ID3D11Buffer>,
     srvs: [Option<ID3D11ShaderResourceView>; 3],
 ) -> Result<()> {
     let rtv = target.rtv().cloned().context("pass target has no RTV")?;
-    let (w, h) = (target.width() as f32, target.height() as f32);
     let ctx = gpu.context();
     let s = gpu.shaders();
     let _lock = gpu.lock();
     // SAFETY: resources of this device; state sequence under the lock.
     unsafe {
-        ctx.UpdateSubresource(&sh.cb_pass, 0, None, bytes(c0), 0, 0);
-        if let Some((cb, data)) = c1 {
-            ctx.UpdateSubresource(cb, 0, None, data, 0, 0);
-        }
+        ctx.UpdateSubresource(&sh.cb_pass, 0, None, c0 as *const PassConsts as _, 0, 0);
         ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx.IASetInputLayout(None);
         ctx.VSSetShader(&s.vs_fullscreen, None);
@@ -149,13 +244,10 @@ fn pass(
         ctx.OMSetBlendState(None, None, 0xffff_ffff);
         ctx.RSSetState(None);
         ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
-        ctx.PSSetConstantBuffers(
-            0,
-            Some(&[Some(sh.cb_pass.clone()), c1.map(|(cb, _)| cb.clone())]),
-        );
+        ctx.PSSetConstantBuffers(0, Some(&[Some(sh.cb_pass.clone()), cb1.cloned()]));
         ctx.PSSetSamplers(0, Some(&[Some(s.linear_clamp.clone())]));
         ctx.PSSetShaderResources(0, Some(&srvs));
-        ctx.RSSetViewports(Some(&[viewport(0.0, 0.0, w, h)]));
+        ctx.RSSetViewports(Some(&[viewport(0.0, 0.0, w as f32, h as f32)]));
         ctx.Draw(3, 0);
         ctx.OMSetRenderTargets(None, None);
         ctx.PSSetShaderResources(0, Some(&[None, None, None]));
@@ -163,31 +255,47 @@ fn pass(
     Ok(())
 }
 
-fn rt(
+/// Make `slot` a render target of at least `w` x `h` (`exact`: exactly).
+/// Growing keeps the larger of the old and new sizes per axis, so a PIP
+/// resize drag reallocates only while it grows past the largest size yet.
+fn ensure_rt(
+    slot: &mut Option<Texture>,
     gpu: &Gpu,
-    w: u32,
-    h: u32,
-    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
-) -> Result<Texture> {
-    gpu.new_texture(
-        w,
-        h,
-        format,
-        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
-    )
+    (w, h): (u32, u32),
+    format: DXGI_FORMAT,
+    exact: bool,
+) -> Result<()> {
+    let fits = slot.as_ref().is_some_and(|t| {
+        let (tw, th) = (t.width(), t.height());
+        if exact {
+            (tw, th) == (w, h)
+        } else {
+            tw >= w && th >= h
+        }
+    });
+    if !fits {
+        let (aw, ah) = match (exact, slot.as_ref()) {
+            (false, Some(t)) => (t.width().max(w), t.height().max(h)),
+            _ => (w, h),
+        };
+        let bind = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        *slot = Some(gpu.new_texture(aw, ah, format, bind)?);
+    }
+    Ok(())
 }
 
-/// Scale `src` (its crop `crop`, in source pixels) into `dst` with the
-/// exact filter, opaque.
+/// Scale `src` (its crop `crop`, in source pixels) into the top-left `size`
+/// of `dst` with the exact filter, opaque.
 fn cover_pass(
     gpu: &Gpu,
     sh: &BackdropShaders,
     src: &Texture,
     crop: (f64, f64, f64, f64),
     dst: &Texture,
+    size: (u32, u32),
 ) -> Result<()> {
     let c0 = PassConsts {
-        rect: [0.0, 0.0, dst.width() as f32, dst.height() as f32],
+        rect: [0.0, 0.0, size.0 as f32, size.1 as f32],
         src_size: [src.width() as f32, src.height() as f32],
         ..Default::default()
     };
@@ -195,13 +303,15 @@ fn cover_pass(
         crop: [crop.0 as f32, crop.1 as f32, crop.2 as f32, crop.3 as f32],
         ..Default::default()
     };
+    upload(gpu, &sh.cb_blur, &c1);
     pass(
         gpu,
         sh,
         &sh.cover,
         dst,
+        size,
         &c0,
-        Some((&sh.cb_blur, bytes(&c1))),
+        Some(&sh.cb_blur),
         [src.srv().cloned(), None, None],
     )
 }
@@ -211,8 +321,10 @@ fn cover_pass(
 /// frame (Arc identity), another drawn size or another fit.
 pub(crate) struct GpuBlur {
     key: Option<(Arc<Frame>, (u32, u32), bool)>,
+    /// Scaled-down webcam and the horizontal pass (`Load` only: grow-only).
     small: Option<Texture>,
     tmp: Option<Texture>,
+    /// The result, sampled when drawn: exactly the reduced size.
     out: Option<Texture>,
     pub(crate) builds: u64,
 }
@@ -261,28 +373,28 @@ impl GpuBlur {
         (w, h): (u32, u32),
         cover: bool,
     ) -> Result<()> {
-        let (lw, lh) = blur_low_size(w, h);
-        let sized = |t: &Option<Texture>| {
-            t.as_ref()
-                .is_some_and(|t| (t.width(), t.height()) == (lw, lh))
-        };
-        if !sized(&self.small) {
-            self.small = Some(rt(gpu, lw, lh, DXGI_FORMAT_B8G8R8A8_UNORM)?);
-            self.tmp = Some(rt(gpu, lw, lh, DXGI_FORMAT_R32G32B32A32_FLOAT)?);
-            self.out = Some(rt(gpu, lw, lh, DXGI_FORMAT_B8G8R8A8_UNORM)?);
-        }
+        let low = blur_low_size(w, h);
+        ensure_rt(&mut self.small, gpu, low, DXGI_FORMAT_B8G8R8A8_UNORM, false)?;
+        ensure_rt(
+            &mut self.tmp,
+            gpu,
+            low,
+            DXGI_FORMAT_R32G32B32A32_FLOAT,
+            false,
+        )?;
+        ensure_rt(&mut self.out, gpu, low, DXGI_FORMAT_B8G8R8A8_UNORM, true)?;
         let (small, tmp, out) = (
             self.small.as_ref().context("blur small")?,
             self.tmp.as_ref().context("blur tmp")?,
             self.out.as_ref().context("blur out")?,
         );
         let crop = if cover {
-            cover_crop(cam.width, cam.height, lw, lh)
+            cover_crop(cam.width, cam.height, low.0, low.1)
         } else {
             (0.0, 0.0, cam.width as f64, cam.height as f64)
         };
-        cover_pass(gpu, sh, cam_tex, crop, small)?;
-        let kernel = blur_kernel(lw);
+        cover_pass(gpu, sh, cam_tex, crop, small, low)?;
+        let kernel = blur_kernel(low.0);
         ensure!(
             kernel.len() <= MAX_TAPS,
             "blur kernel of {} taps",
@@ -293,30 +405,15 @@ impl GpuBlur {
             ..Default::default()
         };
         c1.k[..kernel.len()].copy_from_slice(&kernel);
+        upload(gpu, &sh.cb_blur, &c1);
         let c0 = PassConsts {
-            rect: [0.0, 0.0, lw as f32, lh as f32],
-            src_size: [lw as f32, lh as f32],
+            rect: [0.0, 0.0, low.0 as f32, low.1 as f32],
             ..Default::default()
         };
-        let cb = Some((&sh.cb_blur, bytes(&c1)));
-        pass(
-            gpu,
-            sh,
-            &sh.blur_h,
-            tmp,
-            &c0,
-            cb,
-            [small.srv().cloned(), None, None],
-        )?;
-        pass(
-            gpu,
-            sh,
-            &sh.blur_v,
-            out,
-            &c0,
-            cb,
-            [tmp.srv().cloned(), None, None],
-        )
+        let cb = Some(&sh.cb_blur);
+        let srv = |t: &Texture| [t.srv().cloned(), None, None];
+        pass(gpu, sh, &sh.blur_h, tmp, low, &c0, cb, srv(small))?;
+        pass(gpu, sh, &sh.blur_v, out, low, &c0, cb, srv(tmp))
     }
 }
 
@@ -326,7 +423,10 @@ pub(crate) struct BoxImage {
     src: Arc<Frame>,
     /// `None` for an image that can't be shown (empty, malformed, too big).
     tex: Option<Texture>,
-    scaled: Option<((u32, u32), Texture)>,
+    /// The size scaled into the top-left of `scaled` (drawn 1:1 with `Load`,
+    /// so the texture only grows).
+    size: Option<(u32, u32)>,
+    scaled: Option<Texture>,
     pub(crate) uploads: u64,
 }
 
@@ -334,8 +434,9 @@ pub(crate) struct BoxImage {
 const MAX_SIDE: u32 = 16384;
 
 impl BoxImage {
-    /// The image cover-scaled to `w` x `h` (opaque), or `None` (draw black)
-    /// for an image that can't be shown.
+    /// The image cover-scaled to `w` x `h` (opaque) in the top-left of the
+    /// returned texture, or `None` (draw black) for an image that can't be
+    /// shown.
     pub(crate) fn scaled<'a>(
         slot: &'a mut Option<BoxImage>,
         gpu: &Gpu,
@@ -344,7 +445,7 @@ impl BoxImage {
         (w, h): (u32, u32),
     ) -> Result<Option<&'a Texture>> {
         if !slot.as_ref().is_some_and(|b| Arc::ptr_eq(&b.src, img)) {
-            let uploads = slot.as_ref().map_or(0, |b| b.uploads);
+            let (uploads, scaled) = slot.take().map_or((0, None), |b| (b.uploads, b.scaled));
             let valid = img.width > 0
                 && img.height > 0
                 && img.width <= MAX_SIDE
@@ -358,7 +459,8 @@ impl BoxImage {
             *slot = Some(BoxImage {
                 src: img.clone(),
                 tex,
-                scaled: None,
+                size: None,
+                scaled,
                 uploads: uploads + 1,
             });
         }
@@ -366,74 +468,88 @@ impl BoxImage {
         let Some(tex) = &b.tex else {
             return Ok(None);
         };
-        if !b.scaled.as_ref().is_some_and(|(size, _)| *size == (w, h)) {
-            let dst = match b.scaled.take() {
-                Some((_, t)) if (t.width(), t.height()) == (w, h) => t,
-                _ => rt(gpu, w, h, DXGI_FORMAT_B8G8R8A8_UNORM)?,
-            };
-            cover_pass(gpu, sh, tex, cover_crop(img.width, img.height, w, h), &dst)?;
-            b.scaled = Some(((w, h), dst));
+        if b.size != Some((w, h)) {
+            b.size = None;
+            ensure_rt(
+                &mut b.scaled,
+                gpu,
+                (w, h),
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                false,
+            )?;
+            let dst = b.scaled.as_ref().context("box image target")?;
+            let crop = cover_crop(img.width, img.height, w, h);
+            cover_pass(gpu, sh, tex, crop, dst, (w, h))?;
+            b.size = Some((w, h));
         }
-        Ok(b.scaled.as_ref().map(|(_, t)| t))
+        Ok(b.scaled.as_ref())
     }
 }
 
-/// Textures of the guided filter at one refined size.
+/// Textures of the guided filter. All but `out` are read with `Load` at
+/// explicit sizes and only grow; `out` grows too unless the matte is scaled
+/// up into the PIP (PIP wider than 960), where the sampler needs it exact.
+#[derive(Default)]
 pub(crate) struct Guided {
-    size: (u32, u32),
-    luma: Texture,
-    stats: Texture,
-    tmp: Texture,
-    ab: Texture,
-    out: Texture,
+    luma: Option<Texture>,
+    stats: Option<Texture>,
+    tmp: Option<Texture>,
+    ab: Option<Texture>,
+    out: Option<Texture>,
 }
 
 impl Guided {
-    /// The refined matte (R8) of a `w` x `h` PIP: the model mask `mask_tex`
-    /// upsampled with the webcam `cam_tex` as guide, at `refined_size(w, h)`.
+    /// The refined matte (R8) of a `w` x `h` PIP, in the top-left
+    /// `refined_size(w, h)` of the returned texture: the model mask
+    /// `mask_tex` upsampled with the webcam `cam_tex` as guide.
     pub(crate) fn run<'a>(
-        slot: &'a mut Option<Guided>,
+        &'a mut self,
         gpu: &Gpu,
         sh: &BackdropShaders,
         cam_tex: &Texture,
         mask_tex: &Texture,
         (w, h): (u32, u32),
     ) -> Result<&'a Texture> {
-        let (gw, gh) = refined_size(w, h);
+        let g = refined_size(w, h);
         let s = GUIDED_SUBSAMPLE as u32;
-        let (lw, lh) = (gw.div_ceil(s), gh.div_ceil(s));
-        if !slot.as_ref().is_some_and(|g| g.size == (gw, gh)) {
-            *slot = Some(Guided {
-                size: (gw, gh),
-                luma: rt(gpu, gw, gh, DXGI_FORMAT_R8_UNORM)?,
-                stats: rt(gpu, lw, lh, DXGI_FORMAT_R32G32B32A32_FLOAT)?,
-                tmp: rt(gpu, lw, lh, DXGI_FORMAT_R32G32B32A32_FLOAT)?,
-                ab: rt(gpu, lw, lh, DXGI_FORMAT_R32G32B32A32_FLOAT)?,
-                out: rt(gpu, gw, gh, DXGI_FORMAT_R8_UNORM)?,
-            });
-        }
-        let g = slot.as_ref().context("guided targets")?;
+        let low = (g.0.div_ceil(s), g.1.div_ceil(s));
+        let f32x4 = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        ensure_rt(&mut self.luma, gpu, g, DXGI_FORMAT_R8_UNORM, false)?;
+        ensure_rt(&mut self.stats, gpu, low, f32x4, false)?;
+        ensure_rt(&mut self.tmp, gpu, low, f32x4, false)?;
+        ensure_rt(&mut self.ab, gpu, low, f32x4, false)?;
+        let scaled_up = w > REFINED_MAX_W;
+        ensure_rt(&mut self.out, gpu, g, DXGI_FORMAT_R8_UNORM, scaled_up)?;
+        let t = |t: &'a Option<Texture>| t.as_ref().context("guided target");
+        let (luma, stats, tmp, ab, out) = (
+            t(&self.luma)?,
+            t(&self.stats)?,
+            t(&self.tmp)?,
+            t(&self.ab)?,
+            t(&self.out)?,
+        );
         let gc = GuidedConsts {
-            g_size: [gw as f32, gh as f32],
-            low_size: [lw as f32, lh as f32],
+            g_size: [g.0 as f32, g.1 as f32],
+            low_size: [low.0 as f32, low.1 as f32],
             mask_size: [mask_tex.width() as f32, mask_tex.height() as f32],
             radius: (GUIDED_RADIUS / s).max(1),
             eps: GUIDED_EPS,
         };
-        let cb = Some((&sh.cb_guided, bytes(&gc)));
+        upload(gpu, &sh.cb_guided, &gc);
+        let cb = Some(&sh.cb_guided);
         let (cw, ch) = (cam_tex.width(), cam_tex.height());
         let luma_c = PassConsts {
-            rect: [0.0, 0.0, gw as f32, gh as f32],
+            rect: [0.0, 0.0, g.0 as f32, g.1 as f32],
             src_size: [cw as f32, ch as f32],
-            cam_linear: u32::from(use_sampler(cw, ch, gw, gh)),
+            cam_linear: u32::from(use_sampler(cw, ch, g.0, g.1)),
             ..Default::default()
         };
-        let low = PassConsts {
-            rect: [0.0, 0.0, lw as f32, lh as f32],
+        let low_c = PassConsts {
+            rect: [0.0, 0.0, low.0 as f32, low.1 as f32],
             ..Default::default()
         };
-        let full = PassConsts {
-            rect: [0.0, 0.0, gw as f32, gh as f32],
+        let full_c = PassConsts {
+            rect: [0.0, 0.0, g.0 as f32, g.1 as f32],
             ..Default::default()
         };
         let srv = |t: &Texture| t.srv().cloned();
@@ -441,92 +557,79 @@ impl Guided {
             gpu,
             sh,
             &sh.luma,
-            &g.luma,
+            luma,
+            g,
             &luma_c,
             cb,
             [srv(cam_tex), None, None],
         )?;
+        let m = srv(mask_tex);
         pass(
             gpu,
             sh,
             &sh.stats,
-            &g.stats,
-            &low,
+            stats,
+            low,
+            &low_c,
             cb,
-            [srv(&g.luma), srv(mask_tex), None],
+            [srv(luma), m, None],
         )?;
         pass(
             gpu,
             sh,
             &sh.box_h,
-            &g.tmp,
-            &low,
+            tmp,
+            low,
+            &low_c,
             cb,
-            [srv(&g.stats), None, None],
+            [srv(stats), None, None],
         )?;
         pass(
             gpu,
             sh,
             &sh.box_v_ab,
-            &g.ab,
-            &low,
+            ab,
+            low,
+            &low_c,
             cb,
-            [srv(&g.tmp), None, None],
+            [srv(tmp), None, None],
         )?;
         pass(
             gpu,
             sh,
             &sh.box_h,
-            &g.tmp,
-            &low,
+            tmp,
+            low,
+            &low_c,
             cb,
-            [srv(&g.ab), None, None],
+            [srv(ab), None, None],
         )?;
         // Mean a / mean b into `stats` (no longer needed).
         pass(
             gpu,
             sh,
             &sh.box_v,
-            &g.stats,
-            &low,
+            stats,
+            low,
+            &low_c,
             cb,
-            [srv(&g.tmp), None, None],
+            [srv(tmp), None, None],
         )?;
-        pass(
-            gpu,
-            sh,
-            &sh.guided_out,
-            &g.out,
-            &full,
-            cb,
-            [srv(&g.luma), None, srv(&g.stats)],
-        )?;
-        Ok(&g.out)
+        let io = [srv(luma), None, srv(stats)];
+        pass(gpu, sh, &sh.guided_out, out, g, &full_c, cb, io)?;
+        Ok(out)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shaders::compile;
 
     #[test]
     fn backdrop_shaders_compile() {
-        let blur = format!("{COMPOSE_HLSL}\n{BLUR_HLSL}");
-        for e in ["ps_cover", "ps_blur_h", "ps_blur_v", "ps_fill"] {
-            compile(&blur, "blur.hlsl", e, "ps_5_0").unwrap();
-        }
-        let guided = format!("{COMPOSE_HLSL}\n{GUIDED_HLSL}");
-        for e in [
-            "ps_guide_luma",
-            "ps_guide_stats",
-            "ps_box_h",
-            "ps_box_v_ab",
-            "ps_box_v",
-            "ps_guided_out",
-        ] {
-            compile(&guided, "guided.hlsl", e, "ps_5_0").unwrap();
-        }
+        let b = compile_blobs().unwrap();
+        assert_eq!(b.code.len(), ENTRIES.len());
+        assert!(b.code.iter().all(|c| !c.is_empty()));
     }
 
     #[test]

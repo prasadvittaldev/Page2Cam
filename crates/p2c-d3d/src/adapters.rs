@@ -160,6 +160,38 @@ pub fn enumerate() -> Vec<AdapterInfo> {
     }
 }
 
+/// The adapter's user-mode driver version (`a.b.c.d`), if DXGI reports it.
+/// For diagnostics and for tests that pin driver-specific output.
+#[cfg(not(windows))]
+pub fn driver_version(_luid: u64) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+pub fn driver_version(luid: u64) -> Option<String> {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1};
+    // SAFETY: plain COM calls; returned interfaces are owned and released on drop.
+    unsafe {
+        let f = CreateDXGIFactory1::<IDXGIFactory1>().ok()?;
+        for i in 0.. {
+            let a = f.EnumAdapters1(i).ok()?;
+            let d = a.GetDesc1().ok()?;
+            let l = ((d.AdapterLuid.HighPart as u32 as u64) << 32) | d.AdapterLuid.LowPart as u64;
+            if l == luid {
+                let v = a.CheckInterfaceSupport(&IDXGIDevice::IID).ok()? as u64;
+                return Some(format!(
+                    "{}.{}.{}.{}",
+                    v >> 48,
+                    (v >> 32) & 0xffff,
+                    (v >> 16) & 0xffff,
+                    v & 0xffff
+                ));
+            }
+        }
+        None
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

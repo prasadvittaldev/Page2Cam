@@ -18,7 +18,7 @@ pub mod recover;
 #[cfg(windows)]
 pub mod shaders;
 
-pub use adapters::{choose, enumerate, AdapterInfo, GpuChoice, GpuSetting};
+pub use adapters::{choose, driver_version, enumerate, AdapterInfo, GpuChoice, GpuSetting};
 #[cfg(windows)]
 pub use compose::GpuProducer;
 #[cfg(windows)]

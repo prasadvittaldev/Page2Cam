@@ -1398,12 +1398,13 @@ fn today_cases() -> Vec<TodayCase> {
 }
 
 /// GPU output hashes of [`today_cases`] from the GPU compositor before
-/// backdrops (commit 5296130), per adapter name. A driver update may change
-/// them (the shaders are the same; rounding inside the driver is not ours):
-/// then re-capture with `P2C_PRINT_GPU_HASHES=1` on the old commit.
-const TODAY_GPU: &[(&str, &[u64])] = &[
+/// backdrops (commit 5296130), per (adapter name, user-mode driver version).
+/// Another driver may round differently inside the same shaders: an unknown
+/// adapter or driver prints its hashes and skips (never fails).
+const TODAY_GPU: &[(&str, &str, &[u64])] = &[
     (
         "Intel(R) UHD Graphics",
+        "32.0.101.7088",
         &[
             4025485033438984934,
             4025485033438984934,
@@ -1421,6 +1422,7 @@ const TODAY_GPU: &[(&str, &[u64])] = &[
     ),
     (
         "NVIDIA RTX 2000 Ada Generation Laptop GPU",
+        "32.0.15.9658",
         &[
             16729803995776210676,
             16729803995776210676,
@@ -1460,11 +1462,15 @@ fn gpu_refined_off_matches_previous_gpu_output() {
             got.push((label, fnv(&out.data)));
         }
         let hashes: Vec<u64> = got.iter().map(|(_, h)| *h).collect();
-        if std::env::var_os("P2C_PRINT_GPU_HASHES").is_some() {
-            println!("(\"{}\", &{hashes:?}),", a.name);
+        let driver = p2c_d3d::driver_version(a.luid).unwrap_or_else(|| "unknown".into());
+        let known = TODAY_GPU
+            .iter()
+            .find(|(n, d, _)| *n == a.name && *d == driver);
+        if known.is_none() || std::env::var_os("P2C_PRINT_GPU_HASHES").is_some() {
+            println!("(\"{}\", \"{driver}\", &{hashes:?}),", a.name);
         }
-        match TODAY_GPU.iter().find(|(n, _)| *n == a.name) {
-            Some((_, want)) => {
+        match known {
+            Some((_, _, want)) => {
                 for ((label, h), w) in got.iter().zip(want.iter()) {
                     assert_eq!(
                         h, w,
@@ -1473,10 +1479,14 @@ fn gpu_refined_off_matches_previous_gpu_output() {
                     );
                 }
                 assert_eq!(hashes.len(), want.len());
-                println!("refined off = previous GPU output on {} (exact)", a.name);
+                println!(
+                    "refined off = previous GPU output on {} {driver} (exact)",
+                    a.name
+                );
             }
             None => println!(
-                "{}: no previous GPU hashes for this adapter; only CPU parity (other tests)",
+                "{} driver {driver}: no previous GPU hashes for it; skipped \
+                 (CPU parity is checked by the other tests)",
                 a.name
             ),
         }
@@ -2043,4 +2053,77 @@ fn gpu_refined_and_blur_within_budget() {
         }
     }
     assert!(over.is_empty(), "over the 2 ms budget: {over:?}");
+}
+
+/// If the backdrop shaders can't be compiled, the GPU keeps drawing
+/// Page/Room (no error, so no fallback to the CPU) and says why in the note.
+#[test]
+fn gpu_backdrop_shader_failure_draws_page_room() {
+    let page = noise(640, 360, 91);
+    let cam = person_cam(320, 180);
+    let m = person_mask();
+    let inputs = ti(
+        &cam,
+        Some(&m),
+        layout(OverlayStyle::Box, 0.3, 0.5, 0.4),
+        backdrop(FullBackdrop::Page, BoxBackdrop::Blur, true),
+    );
+    let mut plain = inputs.clone();
+    plain.backdrop = Backdrop::default();
+    let (want, _) = cpu_compose(Some(&page), (640, 360), &plain);
+    for a in adapters_or_skip("gpu_backdrop_shader_failure_draws_page_room") {
+        let gpu = Gpu::new(a.luid).unwrap();
+        let mut p = producer(&gpu, Some(&page), (640, 360));
+        p.fail_backdrop_shaders_for_test();
+        for _ in 0..3 {
+            p.produce(&inputs, false).expect("no producer failure");
+        }
+        assert_eq!(
+            p.producer_note(),
+            Some(ComposeNote::BackdropUnavailable),
+            "{}",
+            a.name
+        );
+        let got = p.render_bgra_for_test(&inputs).unwrap();
+        let (mean, d, x, y) = mean_and_max(&want, &got);
+        println!("shader failure on {}: mean {mean:.3}, max {d}", a.name);
+        assert!(d <= 2, "{}: {d} at ({x},{y})", a.name);
+        // Page/Room inputs carry no note.
+        p.produce(&plain, false).unwrap();
+        assert_eq!(p.producer_note(), None, "{}", a.name);
+    }
+}
+
+/// Dragging the PIP's size (smaller, then larger again) reuses grown
+/// textures and still matches the CPU at every size.
+#[test]
+fn gpu_resize_drag_matches_cpu() {
+    let page = noise(640, 360, 92);
+    let cam = textured_person_cam(320, 180, 5);
+    let m = person_mask();
+    let img = Arc::new(gradient(90, 40, 7));
+    for a in adapters_or_skip("gpu_resize_drag_matches_cpu") {
+        let gpu = Gpu::new(a.luid).unwrap();
+        for in_box in [BoxBackdrop::Image(img.clone()), BoxBackdrop::Blur] {
+            let mut p = producer(&gpu, Some(&page), (640, 360));
+            for width in [0.6, 0.35, 0.45, 0.3, 0.62] {
+                let inputs = ti(
+                    &cam,
+                    Some(&m),
+                    layout(OverlayStyle::Box, 0.5, 0.5, width),
+                    backdrop(FullBackdrop::Page, in_box.clone(), true),
+                );
+                p.produce(&inputs, false).unwrap();
+                let got = p.render_bgra_for_test(&inputs).unwrap();
+                let (want, _) = cpu_compose(Some(&page), (640, 360), &inputs);
+                let (mean, d, x, y) = mean_and_max(&want, &got);
+                assert!(
+                    mean <= BACKDROP_MEAN && d <= BACKDROP_MAX,
+                    "{} width {width}: mean {mean:.3}, max {d} at ({x},{y})",
+                    a.name
+                );
+            }
+        }
+        println!("resize drag ok on {}", a.name);
+    }
 }

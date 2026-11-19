@@ -51,6 +51,9 @@ pub enum ComposeNote {
     /// The blurred room needs the webcam and there is no fresh frame: the
     /// page is showing instead.
     WebcamOff,
+    /// The producer can't draw backdrops or refined edges (the GPU's
+    /// backdrop shaders failed to compile): Page/Room with plain edges shows.
+    BackdropUnavailable,
 }
 
 impl ComposeNote {
@@ -78,6 +81,9 @@ impl ComposeNote {
             ComposeNote::None => "",
             ComposeNote::CutoutNotReady => "cut-out not ready",
             ComposeNote::WebcamOff => "webcam off: showing the page",
+            ComposeNote::BackdropUnavailable => {
+                "backgrounds unavailable on this GPU: showing the page and room"
+            }
         }
     }
 }

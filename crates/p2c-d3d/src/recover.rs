@@ -361,4 +361,8 @@ impl OutputProducer for RecoveringProducer {
     fn has_page(&self, inputs: &TickInputs) -> bool {
         self.producer.has_page(inputs)
     }
+
+    fn producer_note(&self) -> Option<p2c_compositor::ComposeNote> {
+        self.producer.producer_note()
+    }
 }

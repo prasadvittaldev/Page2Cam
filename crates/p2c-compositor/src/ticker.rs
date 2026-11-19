@@ -123,6 +123,11 @@ pub trait OutputProducer: Send {
     fn has_page(&self, inputs: &TickInputs) -> bool {
         inputs.page.is_some()
     }
+    /// A note from the producer itself that overrides the input-derived
+    /// [`ComposeNote`] (e.g. the GPU can't draw backdrops). Default: none.
+    fn producer_note(&self) -> Option<ComposeNote> {
+        None
+    }
 }
 
 /// How many ticks of the last `PIPELINE_WINDOW` ticks are looked at for the
@@ -410,6 +415,7 @@ fn note_code(n: ComposeNote) -> u8 {
         ComposeNote::None => 0,
         ComposeNote::CutoutNotReady => 1,
         ComposeNote::WebcamOff => 2,
+        ComposeNote::BackdropUnavailable => 3,
     }
 }
 
@@ -420,6 +426,7 @@ impl TickerStats {
         match self.note.load(Ordering::Relaxed) {
             1 => ComposeNote::CutoutNotReady,
             2 => ComposeNote::WebcamOff,
+            3 => ComposeNote::BackdropUnavailable,
             _ => ComposeNote::None,
         }
     }
@@ -631,6 +638,9 @@ impl Ticker {
                         // Warned (rate-limited) by the slot.
                         Ok(None) | Err(_) => true,
                     };
+                    if let Some(n) = slot.producer.producer_note() {
+                        stats_out.note.store(note_code(n), Ordering::Relaxed);
+                    }
                     // After the produce call, so a fallback this tick counts at once.
                     pipe_frames.push_back(slot.producer.pipeline_frames());
                     if pipe_frames.len() > PIPELINE_WINDOW {
@@ -1001,6 +1011,7 @@ mod tests {
             crate::ComposeNote::None,
             crate::ComposeNote::CutoutNotReady,
             crate::ComposeNote::WebcamOff,
+            crate::ComposeNote::BackdropUnavailable,
         ] {
             s.note.store(note_code(n), Ordering::Relaxed);
             assert_eq!(s.compose_note(), n);
@@ -1341,6 +1352,30 @@ mod tests {
             .map(|w| w[1].0.duration_since(w[0].0))
             .max()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn producer_note_overrides_the_input_note() {
+        struct Noted(Fake);
+        impl OutputProducer for Noted {
+            fn produce(&mut self, i: &TickInputs, p: bool) -> anyhow::Result<Option<Output>> {
+                self.0.produce(i, p)
+            }
+            fn name(&self) -> String {
+                "Noted".into()
+            }
+            fn producer_note(&self) -> Option<crate::ComposeNote> {
+                Some(crate::ComposeNote::BackdropUnavailable)
+            }
+        }
+        let (_samples, t, _rx) = spawn_fake(Box::new(Noted(Fake::new(|_| false))), red_page());
+        let stats = t.stats();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            stats.compose_note(),
+            crate::ComposeNote::BackdropUnavailable
+        );
+        t.stop();
     }
 
     #[test]

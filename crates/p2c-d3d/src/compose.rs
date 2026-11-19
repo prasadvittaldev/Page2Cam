@@ -22,12 +22,14 @@
 //! the exact filter is used (unscaled, downscaled, letterbox), within 8 (mean
 //! ≤ 1) where an upscaled webcam/mask uses the hardware bilinear sampler.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use p2c_compositor::{
-    fit_rect, pip_rect, plan_compose, Backdrop, BoxBackdrop, ComposePlan, Output, OutputFormat,
-    OutputProducer, OutputSpec, Pip, PipDraw, PipLayout, PlanBase, PlannedPip, TickInputs,
+    fit_rect, pip_rect, plan_compose, refined_size, Backdrop, BoxBackdrop, ComposeNote,
+    ComposePlan, FullBackdrop, Output, OutputFormat, OutputProducer, OutputSpec, Pip, PipDraw,
+    PipLayout, PlanBase, PlannedPip, TickInputs,
 };
 use p2c_core::{camera_size, EdgeRange, Frame, Mask, Nv12Frame};
 use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -312,13 +314,17 @@ pub struct GpuProducer {
     /// The cached PIP layer (R41) and how often it was built.
     layer: Option<Layer>,
     layer_builds: u64,
-    /// Backdrop / refined-edge shaders, compiled on first use.
+    /// Backdrop / refined-edge shaders (from the background compile).
     backdrop: Option<BackdropShaders>,
+    /// They failed to compile: backdrops are drawn as Page/Room.
+    backdrop_failed: bool,
+    /// The note for the status line while backdrops are off on this GPU.
+    note: Option<ComposeNote>,
     /// Blurred webcam for the box (in-box Blur) and for the whole frame.
     box_blur: GpuBlur,
     room_blur: GpuBlur,
     box_image: Option<BoxImage>,
-    guided: Option<Guided>,
+    guided: Guided,
     out_nv12: Nv12Targets,
     /// Camera-size targets when the camera size differs from the output size.
     cam_nv12: Option<Nv12Targets>,
@@ -367,6 +373,7 @@ impl GpuProducer {
         if w == 0 || h == 0 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
             bail!("NV12 output needs an even, non-zero size (got {w}x{h})");
         }
+        crate::backdrop::compile_in_background();
         let pipe = Pipeline::new(&gpu)?;
         let bind = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         let target = gpu.new_texture(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, bind)?;
@@ -400,10 +407,12 @@ impl GpuProducer {
             layer: None,
             layer_builds: 0,
             backdrop: None,
+            backdrop_failed: false,
+            note: None,
             box_blur: GpuBlur::new(),
             room_blur: GpuBlur::new(),
             box_image: None,
-            guided: None,
+            guided: Guided::default(),
             out_nv12,
             cam_nv12,
             camera_ok,
@@ -465,7 +474,8 @@ impl GpuProducer {
     /// readback rings.
     #[doc(hidden)]
     pub fn render_bgra_for_test(&mut self, inputs: &TickInputs) -> Result<Frame> {
-        self.composite(self.page.seq(), inputs)?;
+        let inputs = self.effective(inputs);
+        self.composite(self.page.seq(), &inputs)?;
         self.gpu.read_bgra(&self.target)
     }
 
@@ -556,12 +566,55 @@ impl GpuProducer {
         })
     }
 
-    /// The backdrop shaders (compiled on first use).
-    fn backdrop_shaders(&mut self) -> Result<&BackdropShaders> {
-        if self.backdrop.is_none() {
-            self.backdrop = Some(BackdropShaders::new(self.gpu.device())?);
+    /// Whether the backdrop shaders can be used, creating them from the
+    /// background-compiled bytecode on first need. A compile failure is
+    /// logged once and leaves backdrops off (Page/Room drawn, with a note).
+    fn backdrop_available(&mut self) -> bool {
+        if self.backdrop.is_some() {
+            return true;
         }
-        self.backdrop.as_ref().context("backdrop shaders")
+        if self.backdrop_failed {
+            return false;
+        }
+        let made = match crate::backdrop::blobs() {
+            Ok(blobs) => BackdropShaders::new(self.gpu.device(), blobs),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        };
+        match made {
+            Ok(s) => self.backdrop = Some(s),
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "GPU backdrop shaders unavailable; drawing the page and room without backgrounds"
+                );
+                self.backdrop_failed = true;
+            }
+        }
+        self.backdrop.is_some()
+    }
+
+    /// Tests: behave as if the backdrop shaders had failed to compile.
+    #[doc(hidden)]
+    pub fn fail_backdrop_shaders_for_test(&mut self) {
+        self.backdrop = None;
+        self.backdrop_failed = true;
+    }
+
+    /// The inputs actually drawn: without backdrop shaders, the backdrop
+    /// falls back to Page/Room with LUT edges and the producer note says so.
+    fn effective<'a>(&mut self, inputs: &'a TickInputs) -> Cow<'a, TickInputs> {
+        let b = &inputs.backdrop;
+        let wants =
+            b.full != FullBackdrop::Page || b.in_box != BoxBackdrop::Room || b.refined_edges;
+        self.note = None;
+        if !wants || self.backdrop_available() {
+            return Cow::Borrowed(inputs);
+        }
+        self.note = Some(ComposeNote::BackdropUnavailable);
+        Cow::Owned(TickInputs {
+            backdrop: Backdrop::default(),
+            ..inputs.clone()
+        })
     }
 
     /// Render webcam x mask into the layer texture (only when its inputs or
@@ -579,13 +632,16 @@ impl GpuProducer {
         let mut mask_srv = plan.mask_srv.clone();
         if plan.key.refined {
             // The guided matte replaces the scaled mask and its edge LUT.
-            self.backdrop_shaders()?;
             let (Some(sh), Some(cam), Some(mask)) = (&self.backdrop, &self.cam, &self.mask) else {
                 bail!("refined edges without webcam/mask textures");
             };
-            let m = Guided::run(&mut self.guided, &self.gpu, sh, &cam.tex, &mask.tex, (w, h))?;
-            c.mask_size = [m.width() as f32, m.height() as f32];
-            c.mask_linear = u32::from(use_sampler(m.width(), m.height(), w, h));
+            let m = self
+                .guided
+                .run(&self.gpu, sh, &cam.tex, &mask.tex, (w, h))?;
+            // The matte is in the top-left refined_size(w, h) of `m`.
+            let (gw, gh) = refined_size(w, h);
+            c.mask_size = [gw as f32, gh as f32];
+            c.mask_linear = u32::from(use_sampler(gw, gh, w, h));
             c.edge_full = 1;
             mask_srv = m.srv().cloned();
         }
@@ -633,7 +689,6 @@ impl GpuProducer {
     /// The blurred webcam for a `size` destination (`room`: the whole-frame
     /// blur, cover-cropped; else the box blur, stretched), cached per frame.
     fn blur(&mut self, cam: &Arc<Frame>, size: (u32, u32), room: bool) -> Result<Texture> {
-        self.backdrop_shaders()?;
         let (Some(sh), Some(up)) = (&self.backdrop, &self.cam) else {
             bail!("blur without a webcam texture");
         };
@@ -657,15 +712,11 @@ impl GpuProducer {
                 Some(BoxFill::Blur(self.blur(cam, (w, h), false)?))
             }
             PipDraw::Over(BoxBackdrop::Image(img)) => {
-                self.backdrop_shaders()?;
                 let sh = self.backdrop.as_ref().context("backdrop shaders")?;
                 let t = BoxImage::scaled(&mut self.box_image, &self.gpu, sh, img, (w, h))?;
                 Some(BoxFill::Image(t.cloned()))
             }
-            PipDraw::Over(BoxBackdrop::Colour(c)) => {
-                self.backdrop_shaders()?;
-                Some(BoxFill::Colour(*c))
-            }
+            PipDraw::Over(BoxBackdrop::Colour(c)) => Some(BoxFill::Colour(*c)),
             PipDraw::Over(BoxBackdrop::Room) | PipDraw::Opaque | PipDraw::Cutout => None,
         })
     }
@@ -1016,10 +1067,15 @@ impl OutputProducer for GpuProducer {
     fn has_page(&self, _inputs: &TickInputs) -> bool {
         self.page.seq() > 0
     }
+    fn producer_note(&self) -> Option<ComposeNote> {
+        self.note
+    }
 }
 
 impl GpuProducer {
     fn produce_inner(&mut self, inputs: &TickInputs, preview_due: bool) -> Result<Option<Output>> {
+        let eff = self.effective(inputs);
+        let inputs: &TickInputs = &eff;
         let key = Key::of(self.page.seq(), inputs);
         let changed = !self.last_key.as_ref().is_some_and(|k| k.same_as(&key));
         let fresh = if changed {
