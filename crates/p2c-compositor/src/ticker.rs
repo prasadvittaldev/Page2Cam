@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -322,9 +322,33 @@ impl OutputProducer for CpuProducer {
     }
 }
 
+/// Running totals for health views (readers take differences over time).
+#[derive(Default, Debug)]
+pub struct TickerStats {
+    ticks: AtomicU64,
+    skipped: AtomicU64,
+    output_ready: AtomicBool,
+}
+
+impl TickerStats {
+    /// Ticks run since start.
+    pub fn ticks(&self) -> u64 {
+        self.ticks.load(Ordering::Relaxed)
+    }
+    /// Ticks missed (deadline already past) since start.
+    pub fn skipped(&self) -> u64 {
+        self.skipped.load(Ordering::Relaxed)
+    }
+    /// True once the first output frame went to the sinks.
+    pub fn output_ready(&self) -> bool {
+        self.output_ready.load(Ordering::Acquire)
+    }
+}
+
 /// Runs compositing at a fixed rate on its own thread.
 pub struct Ticker {
     stop: Arc<AtomicBool>,
+    stats: Arc<TickerStats>,
     pipeline_ms: Arc<AtomicU32>,
     handle: JoinHandle<()>,
     trigger: FallbackTrigger,
@@ -447,6 +471,8 @@ impl Ticker {
         let trigger = FallbackTrigger::default();
         let pipeline_ms = Arc::new(AtomicU32::new(0));
         let pipeline_out = pipeline_ms.clone();
+        let stats = Arc::new(TickerStats::default());
+        let stats_out = stats.clone();
         let mut slot = ProducerSlot {
             spec,
             name: producer.name(),
@@ -532,10 +558,14 @@ impl Ticker {
                                 }
                             }
                         }
+                        if !stats_out.output_ready.load(Ordering::Relaxed) {
+                            stats_out.output_ready.store(true, Ordering::Release);
+                        }
                     }
                     // Absolute deadlines avoid drift; if we fell behind, skip missed ticks.
                     n += 1;
                     ticks += 1;
+                    stats_out.ticks.fetch_add(1, Ordering::Relaxed);
                     let now = Instant::now();
                     sinks_t.record(now - t1);
                     let mut deadline = start + period * n;
@@ -544,6 +574,9 @@ impl Ticker {
                             as u32
                             + 1;
                         skipped += next - n;
+                        stats_out
+                            .skipped
+                            .fetch_add(u64::from(next - n), Ordering::Relaxed);
                         n = next;
                         deadline = start + period * n;
                     }
@@ -568,10 +601,16 @@ impl Ticker {
             .expect("spawn ticker thread");
         Ticker {
             stop,
+            stats,
             pipeline_ms,
             handle,
             trigger,
         }
+    }
+
+    /// Running tick/skip totals and whether output has started.
+    pub fn stats(&self) -> Arc<TickerStats> {
+        self.stats.clone()
     }
 
     /// Time from the tick that composed a frame to the tick whose output
@@ -1005,6 +1044,28 @@ mod tests {
         t.stop();
         let c = n.load(Ordering::SeqCst);
         assert!((27..=33).contains(&c), "pushed {c} frames");
+    }
+
+    #[test]
+    fn stats_count_ticks_and_mark_output_ready() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let t = spawn(
+            SPEC,
+            FrameSlot::new(),
+            None,
+            None,
+            layout(),
+            vec![Box::new(Counter(n.clone()))],
+        );
+        let stats = t.stats();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(stats.output_ready(), "first output pushed");
+        let (ticks, skipped) = (stats.ticks(), stats.skipped());
+        t.stop();
+        assert!((10..=20).contains(&ticks), "ticks {ticks}");
+        assert!(skipped <= 2, "skipped {skipped}");
+        // A fresh stats object is not ready.
+        assert!(!TickerStats::default().output_ready());
     }
 
     #[test]

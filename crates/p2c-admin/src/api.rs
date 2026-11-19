@@ -217,6 +217,28 @@ pub struct Status {
     /// Where the cut-out model runs while it is in use: the GPU's name,
     /// "GPU", "CPU", or "" (cut-out not running).
     pub cutout_gpu: String,
+    /// Health over the last ~10 s, for the tray's icon.
+    pub health: Health,
+}
+
+/// Engine health for the tray (rates over a rolling ~10 s window).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Health {
+    /// The ticker has pushed its first output frame (the tray hands the
+    /// camera over to the engine after this).
+    pub output_ready: bool,
+    /// Output ticks missed (late) in percent of all due ticks.
+    pub output_skipped_pct: f32,
+    /// Webcam frames per second arriving (0 without a webcam).
+    pub webcam_fps: f32,
+    /// "ok" | "reconnecting" | "error" | "off" (no webcam in use).
+    pub webcam_state: String,
+    /// The cut-out is in use and fell back from Quality to Fast by itself.
+    pub cutout_auto_fallback: bool,
+    /// Video moved to the CPU compositor after a GPU failure.
+    pub video_fallback: bool,
+    /// The virtual camera's status line (same as `Status::vcam`).
+    pub camera_status: String,
 }
 
 /// One entry of the "Video processing" picker.
@@ -266,6 +288,8 @@ pub trait Controls: Send + Sync + 'static {
     fn set_gpu_choice(&self, choice: &str) -> anyhow::Result<()>;
     /// Close and start again (same command line); returns before closing.
     fn restart(&self) -> anyhow::Result<()>;
+    /// Close normally (as Ctrl-C does); returns before closing.
+    fn quit(&self);
     /// The webcam crop in use.
     fn crop(&self) -> CropDto;
     /// Apply a crop (clamped through `Crop::clamp`) from the next webcam

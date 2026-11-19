@@ -1,5 +1,9 @@
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod app;
 mod config;
+mod engine;
+mod health;
 mod instances;
 mod logging;
 mod pattern;
@@ -80,9 +84,37 @@ struct Cli {
     /// the saved setting is unchanged.
     #[arg(long, hide = true, value_name = "GPU")]
     gpu_override: Option<String>,
+    /// Run as the tray's video engine (admin token from P2C_ADMIN_TOKEN).
+    #[arg(long, hide = true, conflicts_with = "standalone")]
+    engine: bool,
+    /// Engine: the tray owns the virtual camera; only write frames to it.
+    #[arg(long, hide = true, requires = "engine")]
+    camera_from_tray: bool,
+    /// Engine: exit when this (tray) process is gone.
+    #[arg(long, hide = true, requires = "engine", value_name = "PID")]
+    parent_pid: Option<u32>,
+    /// Run on its own (own camera, console output), without the tray.
+    #[arg(long)]
+    standalone: bool,
 }
 
 impl Cli {
+    fn role(&self) -> engine::Role {
+        if self.engine {
+            engine::Role::Engine
+        } else {
+            engine::Role::Standalone
+        }
+    }
+
+    fn camera_mode(&self) -> p2c_vcam::CameraMode {
+        if self.camera_from_tray {
+            p2c_vcam::CameraMode::FromTray
+        } else {
+            p2c_vcam::CameraMode::Own
+        }
+    }
+
     fn apply(&self, mut c: Config) -> Config {
         if let Some(v) = &self.url {
             c.url = v.clone();
@@ -115,27 +147,93 @@ impl Cli {
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    // CEF re-launches this executable for its helper processes; handle that first.
+fn main() {
+    // CEF re-launches this executable for its helper processes; handle that
+    // first (they never attach a console or print).
     if let Some(code) = p2c_browser::maybe_run_subprocess() {
         std::process::exit(code);
     }
-    logging::init();
-    if let Err(e) = run() {
-        tracing::error!("{e:#}");
-        if cfg!(windows) {
-            // Keep the console open long enough to read the error when double-clicked.
-            eprintln!("\nPage2Cam stopped: {e:#}\nPress Enter to close.");
-            let _ = std::io::stdin().read_line(&mut String::new());
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let engine = is_engine_args(&args);
+    // GUI subsystem: started from a console, standalone still prints there
+    // (before any output). Double-clicked: no console, the log file only.
+    let console = !engine && attach_parent_console();
+    logging::init(!engine);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            tracing::error!("{e:#}");
+            if !engine {
+                eprintln!("\nPage2Cam stopped: {e:#}");
+                if !console {
+                    show_error(&format!("Page2Cam stopped: {e:#}"));
+                }
+            }
+            std::process::exit(engine::EXIT_CRASH);
         }
-        return Err(e);
     }
-    Ok(())
 }
 
-fn run() -> anyhow::Result<()> {
+/// `--engine` among the program's arguments (before clap parses them, to
+/// decide about the console and logging).
+fn is_engine_args(args: &[std::ffi::OsString]) -> bool {
+    args.iter().skip(1).any(|a| a == "--engine")
+}
+
+/// Attach to the console of the process that started us, if it has one.
+#[cfg(windows)]
+fn attach_parent_console() -> bool {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: no pointers; fails harmlessly without a parent console.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok()
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() -> bool {
+    true
+}
+
+/// A start-up error when there is no console to show it in (double-click).
+#[cfg(windows)]
+fn show_error(text: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    // SAFETY: valid NUL-terminated strings for the call's duration.
+    unsafe {
+        MessageBoxW(
+            None,
+            &HSTRING::from(text),
+            &HSTRING::from("Page2Cam"),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_error(_text: &str) {}
+
+/// Runs Page2Cam; returns the process exit code.
+fn run() -> anyhow::Result<i32> {
     let log_file = logging::current_path();
     let cli = Cli::parse();
+    let role = cli.role();
+    // Engine: the tray that started us is never stopped as a leftover.
+    let keep: Vec<u32> = cli.parent_pid.into_iter().collect();
+    // Engine: the tray's admin token, from the environment only. Removed
+    // from ours so Chromium's helpers and ffmpeg don't inherit it.
+    let admin_token = engine::admin_token(role, std::env::var(engine::TOKEN_ENV).ok());
+    std::env::remove_var(engine::TOKEN_ENV);
+    if role == engine::Role::Engine {
+        tracing::info!(
+            parent = ?cli.parent_pid,
+            camera_from_tray = cli.camera_from_tray,
+            injected_token = admin_token.is_some(),
+            "running as the tray's engine"
+        );
+    }
+    // Opened right away (a handle on Windows), so a pid reused later can't
+    // pass for the tray.
+    let parent = cli.parent_pid.map(|pid| (pid, engine::Parent::open(pid)));
     // A relaunch: let the old process release the camera, port and CEF
     // profile before opening any of them.
     if let Some(pid) = cli.wait_for_pid {
@@ -149,27 +247,32 @@ fn run() -> anyhow::Result<()> {
     }
     // Leftover instances (or their orphaned Chromium helpers) would hold the
     // camera, admin port and CEF profile: stop them before opening any.
-    instances::stop_others(std::process::id(), cli.wait_for_pid);
+    // In engine mode the tray (`keep`; also an ancestor) is spared.
+    instances::stop_others(std::process::id(), cli.wait_for_pid, &keep);
     // Only one engine at a time (two launches milliseconds apart). Held until
     // `run` returns; a relaunch's new process waits for our exit anyway.
-    let _engine_lock = match instances::take_engine_lock(std::process::id(), cli.wait_for_pid) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("{e:#}; this one exits");
-            std::process::exit(1);
-        }
-    };
+    let _engine_lock =
+        match instances::take_engine_lock(std::process::id(), cli.wait_for_pid, &keep) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("{e:#}; this one exits");
+                std::process::exit(engine::EXIT_CRASH);
+            }
+        };
     let started = std::time::Instant::now();
     // CEF can kill the whole process (e.g. "GPU process isn't usable.
     // Goodbye."), and then the relaunch at the end of `run` never happens:
     // let Windows restart us after a crash instead (R38). Undone in `finish`.
-    let wer_args = restart::wer_restart_args(&current_args(), cli.unexpected_exit_count);
-    match restart::register_crash_restart(&wer_args) {
-        Ok(()) if cfg!(windows) => {
-            tracing::info!(args = ?wer_args, "Windows restarts Page2Cam if it crashes after 60 s or more")
+    // Not in engine mode: the tray restarts the engine.
+    if role.register_crash_restart() {
+        let wer_args = restart::wer_restart_args(&current_args(), cli.unexpected_exit_count);
+        match restart::register_crash_restart(&wer_args) {
+            Ok(()) if cfg!(windows) => {
+                tracing::info!(args = ?wer_args, "Windows restarts Page2Cam if it crashes after 60 s or more")
+            }
+            Ok(()) => {}
+            Err(e) => tracing::warn!("no automatic restart after a crash: {e:#}"),
         }
-        Ok(()) => {}
-        Err(e) => tracing::warn!("no automatic restart after a crash: {e:#}"),
     }
     let cfg = cli.apply(Config::load(cli.config.as_deref())?);
     cfg.validate()?;
@@ -197,19 +300,20 @@ fn run() -> anyhow::Result<()> {
     let mut sinks: Vec<Box<dyn FrameSink>> = Vec::new();
     let mut own_device = None;
     let mut vcam_live = p2c_vcam::CameraStatus::default();
-    let vcam_status = match p2c_vcam::open_default(cfg.vcam_device.as_deref(), &spec) {
-        Ok(cam) => {
-            tracing::info!("virtual camera: {}", cam.description);
-            own_device = cam.own_device;
-            vcam_live = cam.status;
-            sinks.push(cam.sink);
-            format!("ok: {}", cam.description)
-        }
-        Err(e) => {
-            tracing::warn!("virtual camera unavailable: {e:#}");
-            format!("error: {e:#}")
-        }
-    };
+    let vcam_status =
+        match p2c_vcam::open_default_mode(cfg.vcam_device.as_deref(), &spec, cli.camera_mode()) {
+            Ok(cam) => {
+                tracing::info!("virtual camera: {}", cam.description);
+                own_device = cam.own_device;
+                vcam_live = cam.status;
+                sinks.push(cam.sink);
+                format!("ok: {}", cam.description)
+            }
+            Err(e) => {
+                tracing::warn!("virtual camera unavailable: {e:#}");
+                format!("error: {e:#}")
+            }
+        };
     let preview = FrameSlot::new();
     sinks.push(Box::new(PreviewSink::new(
         preview.clone(),
@@ -328,7 +432,8 @@ fn run() -> anyhow::Result<()> {
         update::is_installed(),
         Box::new(p2c_update::fetch_latest),
     ));
-    if cfg.check_updates {
+    // Engine mode: the tray checks for updates.
+    if role.check_updates(cfg.check_updates) {
         updater.spawn_checks();
     }
 
@@ -375,6 +480,8 @@ fn run() -> anyhow::Result<()> {
         cutout_gpu: cutout_adapter.as_ref().map(|a| a.name.clone()),
         exit: Arc::default(),
         quit_main: Mutex::new(None),
+        ticker_stats: ticker.stats(),
+        health_window: Mutex::new(Default::default()),
     });
 
     // Applies to the next stream start; a live stream is not restarted.
@@ -438,36 +545,88 @@ fn run() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("p2c-mic-delay".into())
             .spawn(move || {
+                // Also the health samples, every 4th round (~1 s).
+                let mut round = 0u32;
                 while !quit.load(std::sync::atomic::Ordering::Relaxed) {
                     app.update_mic_delay();
+                    if round.is_multiple_of(4) {
+                        app.sample_health();
+                    }
+                    round = round.wrapping_add(1);
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
             })?
     };
 
+    // Engine: shut down normally once the tray is gone (checked every 1 s).
+    match parent {
+        Some((pid, Some(p))) => {
+            let a = app.clone();
+            engine::spawn_parent_watchdog(
+                p,
+                quit.clone(),
+                Box::new(move || a.request_shutdown(std::time::Duration::ZERO)),
+            )?;
+            tracing::info!(pid, "watching the tray process");
+        }
+        Some((pid, None)) => {
+            tracing::warn!(pid, "the tray is already gone; shutting down");
+            app.request_shutdown(std::time::Duration::ZERO);
+        }
+        None => {}
+    }
+
+    // Engine: exactly the tray's port and token (exit 76 if the port is taken).
     let admin = p2c_admin::serve(
         AdminConfig {
             port: cfg.admin_port,
             width: cfg.width,
             height: cfg.height,
-            open_browser: cfg.open_admin && !cli.no_open,
+            open_browser: role.open_browser(cfg.open_admin, cli.no_open),
+            token: admin_token,
+            strict_port: role.strict_port(),
         },
         app.clone(),
         preview,
-    )?;
-    tracing::info!("admin page: {}", admin.url);
-    println!("\n  Page2Cam is running. Control it here:\n  {}\n  (Press Ctrl+C in this window to quit.)\n", admin.url);
+    );
+    let admin = match admin {
+        Ok(a) => Ok(a),
+        // Standalone: as before (no fallback port found is fatal at once).
+        Err(e) if role == engine::Role::Standalone => return Err(e),
+        Err(e) => Err(e),
+    };
+    let port_failed = admin
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.downcast_ref::<p2c_admin::PortUnavailable>().is_some());
+    match &admin {
+        Ok(admin) if role.print_admin_url() => {
+            tracing::info!("admin page: {}", admin.url);
+            println!("\n  Page2Cam is running. Control it here:\n  {}\n  (Press Ctrl+C in this window to quit.)\n", admin.url);
+        }
+        // Engine: the tray holds the token; keep it out of the log.
+        Ok(admin) => tracing::info!("admin page on 127.0.0.1:{}", admin.addr.port()),
+        Err(e) => tracing::error!(port_failed, "admin page: {e:#}"),
+    }
 
-    let result = if cli.test_pattern {
+    let result = if let Err(e) = admin {
+        Err(e)
+    } else if cli.test_pattern {
         pattern::spawn(PAGE.clone(), cfg.width, cfg.height);
         let (tx, rx) = mpsc::channel();
-        *app.quit_main.lock() = Some(tx.clone());
+        let already = {
+            let mut q = app.quit_main.lock();
+            *q = Some(tx.clone());
+            app.exit.user_shutdown.load(Ordering::SeqCst)
+        };
         let exit = app.exit.clone();
         ctrlc::set_handler(move || {
             exit.user_shutdown.store(true, Ordering::SeqCst);
             let _ = tx.send(());
         })?;
-        let _ = rx.recv();
+        if !already {
+            let _ = rx.recv();
+        }
         Ok(())
     } else {
         let profile_dir = directories::ProjectDirs::from("", "", "page2cam")
@@ -505,11 +664,19 @@ fn run() -> anyhow::Result<()> {
                 // A fallback before the browser existed: switch it now (see
                 // `fell_back`).
                 let f = fell_back2.lock();
+                // `quit_main` held: a shutdown requested before now (quit
+                // route, tray gone) is seen here, a later one sees the browser.
+                let q = app2.quit_main.lock();
                 let _ = app2.browser.set(handle.clone());
                 let _ = browser_cell.set(handle.clone());
                 if *f {
                     handle.recreate_cpu();
                 }
+                if app2.exit.user_shutdown.load(Ordering::SeqCst) {
+                    tracing::info!("shutdown requested during start-up; closing");
+                    handle.shutdown();
+                }
+                drop(q);
             }
             if let Some(stats) = watch {
                 spawn_watchdog(stats, fallback2, fell_back2, quit2);
@@ -530,13 +697,33 @@ fn run() -> anyhow::Result<()> {
     let _ = events_thread.join();
     stop_webcam(webcam);
     let user_shutdown = app.exit.user_shutdown.load(Ordering::SeqCst);
+    let restart_requested = app.exit.restart.load(Ordering::SeqCst);
+    if !role.self_relaunch() {
+        // Engine: no relaunch of our own; the exit code tells the tray.
+        let code = if port_failed {
+            engine::EXIT_PORT
+        } else {
+            engine::exit_code(restart_requested, user_shutdown, result.is_ok())
+        };
+        if let Err(e) = &result {
+            tracing::error!("engine stopped: {e:#}");
+        }
+        tracing::info!(
+            code,
+            user_shutdown,
+            restart_requested,
+            uptime_s = started.elapsed().as_secs(),
+            "engine exits"
+        );
+        return Ok(code);
+    }
     let action = restart::after_browser_exit(
         user_shutdown,
-        app.exit.restart.load(Ordering::SeqCst),
+        restart_requested,
         cli.unexpected_exit_count,
         started.elapsed(),
     );
-    finish(action, user_shutdown, &cli, started.elapsed(), result)
+    finish(action, user_shutdown, &cli, started.elapsed(), result).map(|()| engine::EXIT_OK)
 }
 
 /// Log the exit decision (R28) and start the new process if there is one.
@@ -894,4 +1081,56 @@ fn start_segmenter(
         Err(e) => anyhow::bail!("{e}"),
     });
     p2c_segment::Segmenter::spawn(opener, webcam, matte, choice)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_args_parse() {
+        let c = Cli::try_parse_from([
+            "page2cam",
+            "--engine",
+            "--camera-from-tray",
+            "--admin-port",
+            "8794",
+            "--parent-pid",
+            "4321",
+        ])
+        .unwrap();
+        assert!(c.engine && c.camera_from_tray && !c.standalone);
+        assert_eq!(c.admin_port, Some(8794));
+        assert_eq!(c.parent_pid, Some(4321));
+        assert_eq!(c.role(), engine::Role::Engine);
+        assert_eq!(c.camera_mode(), p2c_vcam::CameraMode::FromTray);
+
+        // No role flag: standalone, as before (until the tray is the default).
+        let c = Cli::try_parse_from(["page2cam", "--no-open"]).unwrap();
+        assert_eq!(c.role(), engine::Role::Standalone);
+        assert_eq!(c.camera_mode(), p2c_vcam::CameraMode::Own);
+        let c = Cli::try_parse_from(["page2cam", "--standalone"]).unwrap();
+        assert_eq!(c.role(), engine::Role::Standalone);
+
+        // Engine without the tray's camera: owns it.
+        let c = Cli::try_parse_from(["page2cam", "--engine"]).unwrap();
+        assert_eq!(c.camera_mode(), p2c_vcam::CameraMode::Own);
+
+        // Contradictions and engine-only flags without --engine are refused.
+        assert!(Cli::try_parse_from(["page2cam", "--engine", "--standalone"]).is_err());
+        assert!(Cli::try_parse_from(["page2cam", "--camera-from-tray"]).is_err());
+        assert!(Cli::try_parse_from(["page2cam", "--parent-pid", "1"]).is_err());
+        // The token never comes from the command line.
+        assert!(Cli::try_parse_from(["page2cam", "--engine", "--token", "x"]).is_err());
+    }
+
+    #[test]
+    fn engine_flag_seen_before_parsing() {
+        let a = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(is_engine_args(&a(&["page2cam", "--engine", "--fps", "30"])));
+        assert!(!is_engine_args(&a(&["page2cam", "--standalone"])));
+        assert!(!is_engine_args(&a(&["page2cam"])));
+        // Only the program's own args count, not a value that looks like it.
+        assert!(!is_engine_args(&a(&["--engine"])));
+    }
 }

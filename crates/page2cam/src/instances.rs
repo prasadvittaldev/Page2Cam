@@ -71,7 +71,7 @@ pub struct EngineLock(#[allow(dead_code)] Option<platform::Lock>);
 /// Take the engine lock (call right after `stop_others`). `Err` means another
 /// Page2Cam holds it even after stopping the others again: this one must
 /// exit. If the lock itself can't be created, run without it.
-pub fn take_engine_lock(me: u32, force: Option<u32>) -> anyhow::Result<EngineLock> {
+pub fn take_engine_lock(me: u32, force: Option<u32>, keep: &[u32]) -> anyhow::Result<EngineLock> {
     let begun = Instant::now();
     let mut stopped_again = false;
     let mut said_waiting = false;
@@ -96,7 +96,7 @@ pub fn take_engine_lock(me: u32, force: Option<u32>) -> anyhow::Result<EngineLoc
                 tracing::warn!(
                     "engine lock still held after 3 s; stopping other Page2Cam processes again"
                 );
-                stop_others(me, force);
+                stop_others(me, force, keep);
                 stopped_again = true;
             }
             LockNext::GiveUp => anyhow::bail!("another Page2Cam is starting"),
@@ -132,10 +132,18 @@ fn ancestors(procs: &[Proc], pid: u32) -> Vec<u32> {
 /// Pids of every Page2Cam process to stop: all named page2cam except `me`,
 /// descendants of `me` (our CEF helpers) and ancestors of `me`, except `force`
 /// (the old instance of a restart, which is our parent but must go if it hung).
+#[cfg(test)]
 pub fn to_stop(procs: &[Proc], me: u32, force: Option<u32>) -> Vec<u32> {
+    to_stop_keeping(procs, me, force, &[])
+}
+
+/// [`to_stop`], also sparing the pids in `keep` (engine mode: the tray that
+/// started us, even if the parent chain doesn't lead to it).
+pub fn to_stop_keeping(procs: &[Proc], me: u32, force: Option<u32>, keep: &[u32]) -> Vec<u32> {
     let keep_up: Vec<u32> = ancestors(procs, me)
         .into_iter()
         .filter(|a| Some(*a) != force)
+        .chain(keep.iter().copied())
         .collect();
     let my_start = procs.iter().find(|p| p.pid == me).and_then(|p| p.started);
     let racing = |p: &Proc| match (p.started, my_start) {
@@ -152,10 +160,11 @@ pub fn to_stop(procs: &[Proc], me: u32, force: Option<u32>) -> Vec<u32> {
         .collect()
 }
 
-/// Stop all other Page2Cam processes; returns the pids that were targeted.
-pub fn stop_others(me: u32, force: Option<u32>) -> Vec<u32> {
+/// Stop all other Page2Cam processes except those in `keep`; returns the
+/// pids that were targeted.
+pub fn stop_others(me: u32, force: Option<u32>, keep: &[u32]) -> Vec<u32> {
     let procs = platform::list();
-    let pids = to_stop(&procs, me, force);
+    let pids = to_stop_keeping(&procs, me, force, keep);
     if pids.is_empty() {
         return pids;
     }
@@ -517,6 +526,24 @@ mod tests {
             platform::try_lock(&name).unwrap().is_some(),
             "released on drop"
         );
+    }
+
+    #[test]
+    fn engine_keeps_its_tray_even_when_the_chain_is_broken() {
+        // Engine 20 started by tray 10; its recorded parent is a broker (5),
+        // so the tray is not an ancestor. `keep` still protects it, and
+        // only it: another leftover (30) is stopped.
+        let procs = [
+            p(10, 1, exe()),
+            p(5, 1, "broker.exe"),
+            p(20, 5, exe()),
+            p(30, 1, exe()),
+        ];
+        assert_eq!(to_stop_keeping(&procs, 20, None, &[10]), vec![30]);
+        assert_eq!(to_stop(&procs, 20, None), vec![10, 30]);
+        // An ancestor tray is kept as before.
+        let procs = [p(10, 1, exe()), p(20, 10, exe())];
+        assert!(to_stop_keeping(&procs, 20, None, &[10]).is_empty());
     }
 
     #[test]

@@ -29,11 +29,35 @@ const ICON_PNG: &[u8] = include_bytes!("../ui/icon.png");
 type Jpeg = Option<Arc<Vec<u8>>>;
 
 pub struct AdminConfig {
-    /// Preferred port; falls back to any free port if taken.
+    /// Preferred port; falls back to any free port if taken (unless `strict_port`).
     pub port: u16,
     pub width: u32,
     pub height: u32,
     pub open_browser: bool,
+    /// Access token to use (engine mode: given by the tray); `None` generates one.
+    pub token: Option<String>,
+    /// Fail with [`PortUnavailable`] instead of falling back to another port.
+    pub strict_port: bool,
+}
+
+/// `strict_port` was set and `port` could not be bound.
+#[derive(Debug)]
+pub struct PortUnavailable {
+    pub port: u16,
+    pub source: std::io::Error,
+}
+
+impl std::fmt::Display for PortUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The cause comes from `source` (`{:#}` prints the chain).
+        write!(f, "admin port 127.0.0.1:{} unavailable", self.port)
+    }
+}
+
+impl std::error::Error for PortUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 pub struct AdminServer {
@@ -86,6 +110,7 @@ pub(crate) fn router(st: State) -> Router {
         .route("/api/gpus", get(gpus))
         .route("/api/gpu", post(gpu))
         .route("/api/restart", post(restart))
+        .route("/api/quit", post(quit))
         .route("/api/stream/start", post(stream_start))
         .route("/api/stream/stop", post(stream_stop))
         .route("/api/audio", post(audio))
@@ -101,7 +126,7 @@ pub fn serve(
     controls: Arc<dyn Controls>,
     preview_frames: FrameSlot,
 ) -> anyhow::Result<AdminServer> {
-    let token = random_token();
+    let token = cfg.token.clone().unwrap_or_else(random_token);
     let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<SocketAddr>>();
     let token2 = token.clone();
     std::thread::Builder::new()
@@ -121,6 +146,14 @@ pub fn serve(
             rt.block_on(async move {
                 let listener = match tokio::net::TcpListener::bind(("127.0.0.1", cfg.port)).await {
                     Ok(l) => l,
+                    Err(e) if cfg.strict_port => {
+                        let _ = tx.send(Err(PortUnavailable {
+                            port: cfg.port,
+                            source: e,
+                        }
+                        .into()));
+                        return;
+                    }
                     Err(_) => match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
                         Ok(l) => l,
                         Err(e) => {
@@ -289,6 +322,12 @@ async fn restart(AxState(st): AxState<State>) -> Response {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
+}
+
+/// Close the app the normal way (as Ctrl-C does); answers before closing.
+async fn quit(AxState(st): AxState<State>) -> StatusCode {
+    st.controls.quit();
+    StatusCode::OK
 }
 
 async fn stream_start(AxState(st): AxState<State>, Json(b): Json<StreamRequest>) -> Response {
@@ -512,6 +551,7 @@ mod tests {
             pub updates: Mutex<u32>,
             pub gpu: Mutex<String>,
             pub restarts: Mutex<u32>,
+            pub quits: Mutex<u32>,
             pub crop: Mutex<CropDto>,
             /// The `save` flag of every `set_crop` call.
             pub crop_saves: Mutex<Vec<bool>>,
@@ -589,6 +629,9 @@ mod tests {
             fn restart(&self) -> anyhow::Result<()> {
                 *self.restarts.lock().unwrap() += 1;
                 Ok(())
+            }
+            fn quit(&self) {
+                *self.quits.lock().unwrap() += 1;
             }
             fn crop(&self) -> CropDto {
                 *self.crop.lock().unwrap()
@@ -922,6 +965,91 @@ mod tests {
         assert_eq!(*fake.restarts.lock().unwrap(), 1);
     }
 
+    #[tokio::test]
+    async fn quit_route_calls_controls() {
+        let fake = Arc::new(Fake::default());
+        assert_eq!(post(fake.clone(), "/api/quit", "{}").await, StatusCode::OK);
+        assert_eq!(*fake.quits.lock().unwrap(), 1);
+        // Guarded like every route: no token or a foreign host -> 403, no quit.
+        for (host, token) in [("127.0.0.1:8765", None), ("evil.test:8765", Some(TOKEN))] {
+            let r = app(fake.clone())
+                .oneshot(req("POST", "/api/quit", host, token, Some("{}")))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{host}");
+        }
+        assert_eq!(*fake.quits.lock().unwrap(), 1);
+    }
+
+    /// A plain HTTP/1.1 GET over a real socket; returns the status line.
+    fn http_get(port: u16, path: &str, token: &str) -> String {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-P2C-Token: {token}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out.lines().next().unwrap_or_default().to_string()
+    }
+
+    fn admin_cfg(port: u16, token: Option<&str>, strict_port: bool) -> AdminConfig {
+        AdminConfig {
+            port,
+            width: 1920,
+            height: 1080,
+            open_browser: false,
+            token: token.map(str::to_string),
+            strict_port,
+        }
+    }
+
+    #[test]
+    fn injected_token_and_strict_port() {
+        // Injected token: used as given (URL and guard).
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        let tok = "0123456789abcdef0123456789abcdef";
+        let srv = serve(
+            admin_cfg(port, Some(tok), true),
+            Arc::new(Fake::default()),
+            FrameSlot::new(),
+        )
+        .unwrap();
+        assert_eq!(srv.addr.port(), port);
+        assert_eq!(srv.url, format!("http://127.0.0.1:{port}/?t={tok}"));
+        assert!(http_get(port, "/api/state", tok).contains("200"));
+        assert!(http_get(port, "/api/state", "nope").contains("403"));
+
+        // Strict port in use: an error, not a fallback to another port.
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy_port = busy.local_addr().unwrap().port();
+        let e = serve(
+            admin_cfg(busy_port, Some(tok), true),
+            Arc::new(Fake::default()),
+            FrameSlot::new(),
+        )
+        .err()
+        .expect("strict port in use must fail");
+        let pu = e
+            .downcast_ref::<PortUnavailable>()
+            .expect("a PortUnavailable error");
+        assert_eq!(pu.port, busy_port);
+        // Not strict: falls back to a free port with a generated token.
+        let srv = serve(
+            admin_cfg(busy_port, None, false),
+            Arc::new(Fake::default()),
+            FrameSlot::new(),
+        )
+        .unwrap();
+        assert_ne!(srv.addr.port(), busy_port);
+        assert!(!srv.url.contains(tok));
+        drop(busy);
+    }
+
     /// Same guard as every route (it answers 403, not 401).
     #[tokio::test]
     async fn gpu_routes_need_token() {
@@ -967,6 +1095,33 @@ mod tests {
             "cutout_gpu",
         ] {
             assert!(v["status"].get(k).is_some(), "missing {k}");
+        }
+    }
+
+    #[tokio::test]
+    async fn state_includes_health() {
+        let r = app(Arc::new(Fake::default()))
+            .oneshot(req(
+                "GET",
+                "/api/state",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                None,
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        let h = &v["status"]["health"];
+        for k in [
+            "output_ready",
+            "output_skipped_pct",
+            "webcam_fps",
+            "webcam_state",
+            "cutout_auto_fallback",
+            "video_fallback",
+            "camera_status",
+        ] {
+            assert!(h.get(k).is_some(), "missing health.{k}");
         }
     }
 

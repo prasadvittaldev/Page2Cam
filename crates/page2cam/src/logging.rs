@@ -12,15 +12,15 @@ pub fn current_path() -> Option<PathBuf> {
     PATH.get().cloned().flatten()
 }
 
-/// Log to the console and to `page2cam.log`: next to the exe if writable
+/// Log to the console (if `console`) and to `page2cam.log`: next to the exe if writable
 /// (Windows zip folder), else in the app data dir. Returns the file in use.
-pub fn init() -> Option<PathBuf> {
-    let p = init_inner();
+pub fn init(console: bool) -> Option<PathBuf> {
+    let p = init_inner(console);
     let _ = PATH.set(p.clone());
     p
 }
 
-fn init_inner() -> Option<PathBuf> {
+fn init_inner(console: bool) -> Option<PathBuf> {
     // ONNX Runtime logs ~300 info lines per model load; keep its warnings only.
     let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,ort=warn".into());
     let path = log_path();
@@ -32,7 +32,8 @@ fn init_inner() -> Option<PathBuf> {
             .open(p)
             .ok()
     });
-    let console = fmt::layer().with_filter(filter());
+    // Engine mode: no console output (the tray reads the log file).
+    let console = console.then(|| fmt::layer().with_filter(filter()));
     match file {
         Some(f) => {
             let file_layer = fmt::layer()

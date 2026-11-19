@@ -8,9 +8,9 @@ mod preview;
 mod server;
 
 pub use api::{
-    AudioSettings, Controls, CropDto, GpuInfo, InputEvent, KeyAction, MouseBtn, NavAction, Status,
-    StreamRequest, UpdateInfo,
+    AudioSettings, Controls, CropDto, GpuInfo, Health, InputEvent, KeyAction, MouseBtn, NavAction,
+    Status, StreamRequest, UpdateInfo,
 };
 pub use input::{map_preview, normalize_url};
 pub use preview::PreviewSink;
-pub use server::{serve, AdminConfig, AdminServer};
+pub use server::{serve, AdminConfig, AdminServer, PortUnavailable};

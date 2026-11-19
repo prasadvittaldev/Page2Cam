@@ -67,7 +67,14 @@ pub struct App {
     /// Why the browser loop ended (read by `main` after it returns).
     pub exit: Arc<crate::restart::ExitFlags>,
     /// Ends the wait in `--test-pattern` mode (no browser to shut down).
+    /// Also held while the browser is set and the shutdown flag read in
+    /// `main`, and while a shutdown is requested (see [`App::request_shutdown`]),
+    /// so a request before the browser exists is never lost.
     pub quit_main: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// Output tick/skip totals and first-output flag (health).
+    pub ticker_stats: Arc<p2c_compositor::TickerStats>,
+    /// Recent samples for the health rates.
+    pub health_window: Mutex<crate::health::HealthWindow>,
 }
 
 /// Longest mic delay applied for the cut-out (ms).
@@ -211,6 +218,83 @@ impl App {
             *cur = want;
         }
     }
+
+    /// Record the running totals for the health rates (every ~1 s).
+    pub fn sample_health(&self) {
+        let s = crate::health::Sample {
+            at: std::time::Instant::now(),
+            ticks: self.ticker_stats.ticks(),
+            skipped: self.ticker_stats.skipped(),
+            webcam_frames: self.webcam_slot.as_ref().map_or(0, |s| s.seq()),
+        };
+        self.health_window.lock().push(s);
+    }
+
+    /// The health block of the status (rates over the last ~10 s).
+    pub fn health(&self) -> p2c_admin::Health {
+        use crate::health::{cutout_auto_fallback, video_fallback, webcam_state};
+        let l = *self.layout.read();
+        let in_use = l.visible && l.style.is_cutout();
+        let auto_fast = self.segmenter.as_ref().is_some_and(|s| {
+            let st = s.status();
+            cutout_auto_fallback(in_use, st.requested, st.active)
+        });
+        // One lock at a time (each released before the next is taken).
+        let (skipped_pct, fps) = {
+            let w = self.health_window.lock();
+            (w.skipped_pct(), w.webcam_fps())
+        };
+        let video_fallback = video_fallback(&self.video.lock().clone());
+        p2c_admin::Health {
+            output_ready: self.ticker_stats.output_ready(),
+            output_skipped_pct: skipped_pct,
+            webcam_fps: if self.webcam_slot.is_some() { fps } else { 0.0 },
+            webcam_state: webcam_state(Some(&self.webcam_status.get())),
+            cutout_auto_fallback: auto_fast,
+            video_fallback,
+            camera_status: self.camera_status(),
+        }
+    }
+
+    fn camera_status(&self) -> String {
+        self.vcam_live
+            .status()
+            .unwrap_or_else(|| self.vcam_status.clone())
+    }
+
+    /// What ends the main loop: the browser, or (test pattern) the wait.
+    /// Call with `quit_main` locked (passed in).
+    fn closer(
+        &self,
+        quit_main: &Option<std::sync::mpsc::Sender<()>>,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        match (self.browser.get().cloned(), quit_main.clone()) {
+            (Some(b), _) => Some(Box::new(move || b.shutdown())),
+            (None, Some(q)) => Some(Box::new(move || {
+                let _ = q.send(());
+            })),
+            (None, None) => None,
+        }
+    }
+
+    /// The normal shutdown (as Ctrl-C): set the flag and close the main
+    /// loop after `delay`. Before the main loop exists only the flag is set;
+    /// `main` checks it once the loop can be closed.
+    pub fn request_shutdown(&self, delay: std::time::Duration) {
+        let close = {
+            let q = self.quit_main.lock();
+            self.exit
+                .user_shutdown
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.closer(&q)
+        };
+        if let Some(close) = close {
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                close();
+            });
+        }
+    }
 }
 
 impl Controls for App {
@@ -351,15 +435,15 @@ impl Controls for App {
             s => s.to_string(),
         };
         let gpu_saved = self.gpu_saved.lock().clone();
+        // Before the literal: its temporaries (e.g. the `video` guard) live
+        // until the end of the statement, and `health` takes `video` too.
+        let health = self.health();
         Status {
             url,
             width: self.width,
             height: self.height,
             fps: self.fps,
-            vcam: self
-                .vcam_live
-                .status()
-                .unwrap_or_else(|| self.vcam_status.clone()),
+            vcam: self.camera_status(),
             webcam: self.webcam_status.get(),
             webcam_aspect,
             stream,
@@ -377,6 +461,7 @@ impl Controls for App {
             cutout_gpu: self.cutout_device(),
             gpu_choice: gpu_saved,
             gpu_running: self.gpu_running.clone(),
+            health,
         }
     }
 
@@ -414,17 +499,14 @@ impl Controls for App {
 
     fn restart(&self) -> anyhow::Result<()> {
         tracing::info!("restart requested from the admin page");
-        // What ends the main loop: the browser, or (test pattern) the wait.
-        let browser = self.browser.get().cloned();
-        let quit_main = self.quit_main.lock().clone();
-        let close: Option<Box<dyn FnOnce() + Send>> = match (browser, quit_main) {
-            (Some(b), _) => Some(Box::new(move || b.shutdown())),
-            (None, Some(q)) => Some(Box::new(move || {
-                let _ = q.send(());
-            })),
-            (None, None) => None,
-        };
+        let close = self.closer(&self.quit_main.lock());
         begin_restart(&self.exit, close)
+    }
+
+    fn quit(&self) {
+        tracing::info!("quit requested over the admin API");
+        // Answer the request first, then close.
+        self.request_shutdown(std::time::Duration::from_millis(200));
     }
 
     fn cutout_engine(&self) -> String {
