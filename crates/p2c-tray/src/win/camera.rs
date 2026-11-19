@@ -33,15 +33,17 @@ pub struct Camera {
     driver_problem: Option<String>,
 }
 
-// SAFETY: used only from the tray's controller thread after construction.
+// SAFETY: owned by one thread at a time: the controller, and at Quit the
+// thread that removes the camera (it is moved there whole). The mapping
+// pointer and COM objects inside are never used from two threads at once.
 unsafe impl Send for Camera {}
 
 impl Camera {
-    /// Register the camera (blocks for the first attempt). A missing driver
+    /// Register the camera in the background (returns at once). A missing driver
     /// is reported through [`Camera::problem`]; the tray keeps running.
     pub fn open() -> Camera {
         let status = CameraStatus::default();
-        let (owner, open_error) = match CameraOwner::open(status.clone()) {
+        let (owner, open_error) = match CameraOwner::open_background(status.clone()) {
             Ok(o) => (Some(o), None),
             Err(e) => {
                 tracing::error!("virtual camera: {e:#}");

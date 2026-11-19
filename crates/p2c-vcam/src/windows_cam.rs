@@ -445,6 +445,10 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A registration attempt running this long is reported (status: retrying).
+const SLOW_START: Duration = Duration::from_secs(10);
+const SLOW_STATUS: &str = "starting (retrying): the camera service is not answering";
+
 /// Status while the camera is registered again after Frame Server restarted.
 const SERVICE_RESTARTED: &str = "starting (retrying): camera service restarted";
 
@@ -460,6 +464,8 @@ pub struct CameraOwner {
     /// Result of a background start attempt in flight.
     pending: Option<std::sync::mpsc::Receiver<anyhow::Result<Owner>>>,
     last_start_try: Option<Instant>,
+    /// The attempt in flight was reported as slow already.
+    slow_reported: bool,
     status: CameraStatus,
     /// Frame Server samples (every 5 s, from `spawn_service_watch`).
     watch: std::sync::mpsc::Receiver<Observation>,
@@ -491,7 +497,38 @@ impl CameraOwner {
         )
     }
 
-    fn open_with(
+    fn open_background_with(
+        status: CameraStatus,
+        registered: bool,
+        start: StartFn,
+        watch: std::sync::mpsc::Receiver<Observation>,
+        present: PresentFn,
+    ) -> anyhow::Result<CameraOwner> {
+        let mut cam = Self::unstarted(status, registered, start, watch, present)?;
+        cam.spawn_start(None, Instant::now());
+        Ok(cam)
+    }
+
+    /// Like [`CameraOwner::open`], but the first attempt runs in the
+    /// background too: returns at once (the tray must stay responsive even
+    /// when Frame Server hangs). [`CameraOwner::poll`] picks the result up;
+    /// an attempt still running after 10 s is reported as retrying.
+    pub fn open_background(status: CameraStatus) -> anyhow::Result<CameraOwner> {
+        let registered = is_registered();
+        Self::open_background_with(
+            status,
+            registered,
+            std::sync::Arc::new(Owner::start),
+            if registered {
+                spawn_service_watch()
+            } else {
+                std::sync::mpsc::channel().1
+            },
+            std::sync::Arc::new(our_camera_present),
+        )
+    }
+
+    fn unstarted(
         status: CameraStatus,
         registered: bool,
         start: StartFn,
@@ -499,17 +536,28 @@ impl CameraOwner {
         present: PresentFn,
     ) -> anyhow::Result<CameraOwner> {
         anyhow::ensure!(registered, NOT_INSTALLED);
-        let mut cam = CameraOwner {
+        Ok(CameraOwner {
             owner: None,
             start,
             pending: None,
             last_start_try: Some(Instant::now()),
+            slow_reported: false,
             status,
             watch,
             owner_since: Instant::now(),
             service_pid: None,
             present,
-        };
+        })
+    }
+
+    fn open_with(
+        status: CameraStatus,
+        registered: bool,
+        start: StartFn,
+        watch: std::sync::mpsc::Receiver<Observation>,
+        present: PresentFn,
+    ) -> anyhow::Result<CameraOwner> {
+        let mut cam = Self::unstarted(status, registered, start, watch, present)?;
         match (cam.start)() {
             Ok(o) => cam.set_owner(o),
             Err(e) => cam.start_failed(&e),
@@ -602,6 +650,7 @@ impl CameraOwner {
     /// stop the retries).
     fn spawn_start(&mut self, old: Option<Owner>, now: Instant) {
         self.last_start_try = Some(now);
+        self.slow_reported = false;
         let (tx, rx) = std::sync::mpsc::channel();
         let start = self.start.clone();
         // Shared so a failed spawn hands `old` back instead of dropping it
@@ -681,7 +730,16 @@ impl CameraOwner {
                     self.pending = None;
                     self.start_failed(&e);
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    let slow = self
+                        .last_start_try
+                        .is_some_and(|t| now.saturating_duration_since(t) >= SLOW_START);
+                    if slow && !self.slow_reported {
+                        self.slow_reported = true;
+                        tracing::warn!("registering the virtual camera takes over 10 s (camera service not answering?); still waiting");
+                        self.status.set(Some(SLOW_STATUS.into()));
+                    }
+                }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     tracing::warn!("virtual camera start attempt ended without a result (panicked?); will retry");
                     self.pending = None;
@@ -1006,6 +1064,54 @@ mod tests {
         assert!(!cam.poll_health());
         assert!(cam.owner.is_some());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn background_open_does_not_wait_for_a_hung_start() {
+        // A start that hangs until released (Frame Server wedged at sign-in).
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let start: StartFn = Arc::new(move || {
+            let _ = gate.lock().unwrap().recv();
+            Ok(Owner::dummy())
+        });
+        let status = CameraStatus::default();
+        let begun = Instant::now();
+        let mut cam =
+            CameraOwner::open_background_with(status.clone(), true, start, no_watch(), gone())
+                .unwrap();
+        assert!(
+            begun.elapsed() < Duration::from_secs(1),
+            "open returned at once"
+        );
+        assert!(!cam.is_registered());
+        // Still hanging after 10 s: reported as retrying (amber), no second attempt.
+        cam.poll(Instant::now() + Duration::from_secs(11));
+        let s = status.status().expect("slow start reported");
+        assert!(s.starts_with("starting (retrying)"), "{s}");
+        // Released: picked up by poll, status cleared.
+        release.send(()).unwrap();
+        for _ in 0..200 {
+            cam.poll(Instant::now());
+            if cam.is_registered() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(cam.is_registered());
+        assert_eq!(status.status(), None);
+    }
+
+    #[test]
+    fn background_open_still_refuses_a_missing_driver() {
+        let r = CameraOwner::open_background_with(
+            CameraStatus::default(),
+            false,
+            failing(),
+            no_watch(),
+            gone(),
+        );
+        assert!(r.err().unwrap().to_string().contains("not installed"));
     }
 
     #[test]

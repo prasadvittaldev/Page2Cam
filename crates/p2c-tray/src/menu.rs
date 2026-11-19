@@ -102,6 +102,21 @@ pub fn entries(
     v
 }
 
+/// The menu once Quit was chosen: only the status line and a greyed
+/// "Quitting…" (Start, Stop and Force restart are no longer offered).
+pub fn quitting(status: &str) -> Vec<Entry> {
+    vec![
+        Entry::Item {
+            id: None,
+            label: status.into(),
+            enabled: false,
+            checked: false,
+        },
+        Entry::Separator,
+        item(MenuId::Quit, "Quitting…", false),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +196,14 @@ mod tests {
             .any(|(id, _)| *id == MenuId::Update));
         assert_eq!(MenuId::from_u32(5), Some(MenuId::Update));
         assert_eq!(MenuId::from_u32(99), None);
+    }
+
+    #[test]
+    fn quitting_menu_offers_nothing() {
+        let e = quitting("Page2Cam — stopping…");
+        assert!(ids(&e).iter().all(|(_, enabled)| !enabled), "{e:?}");
+        assert!(e
+            .iter()
+            .any(|x| matches!(x, Entry::Item { label, .. } if label == "Quitting…")));
     }
 }

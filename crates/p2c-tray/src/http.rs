@@ -117,6 +117,11 @@ mod tests {
                 head.push_str(&line);
             }
             s.write_all(answer.as_bytes()).unwrap();
+            // Close gracefully (FIN, then wait for the client's close):
+            // dropping at once can make Windows send a reset that the
+            // client sees before the answer (os error 10054).
+            let _ = s.shutdown(std::net::Shutdown::Write);
+            let _ = std::io::copy(&mut r, &mut std::io::sink());
             head
         });
         (port, t)

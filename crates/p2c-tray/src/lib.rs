@@ -8,6 +8,7 @@ pub mod http;
 pub mod icon;
 pub mod launch;
 pub mod menu;
+pub mod notify;
 pub mod settings;
 pub mod single;
 pub mod standby;

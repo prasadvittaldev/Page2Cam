@@ -29,9 +29,10 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    FindWindowW, GetMessageW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, TranslateMessage, MSG, WINDOW_EX_STYLE, WM_APP, WM_CLOSE,
-    WM_CONTEXTMENU, WM_DESTROY, WNDCLASSEXW, WS_OVERLAPPED,
+    FindWindowW, GetMessageW, KillTimer, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SetTimer, TranslateMessage, MSG, WINDOW_EX_STYLE, WM_APP, WM_CLOSE,
+    WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_QUERYENDSESSION, WM_TIMER, WNDCLASSEXW,
+    WS_OVERLAPPED,
 };
 
 use crate::health::Level;
@@ -46,6 +47,14 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_REFRESH: u32 = WM_APP + 2;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const ICON_ID: u32 = 1;
+/// Balloon notifications (NOTIFYICON_VERSION_4 events in LOWORD(lParam)).
+const NIN_BALLOONHIDE: u32 = 0x0403;
+const NIN_BALLOONTIMEOUT: u32 = 0x0404;
+const NIN_BALLOONUSERCLICK: u32 = 0x0405;
+const BALLOON_TIMER: usize = 1;
+const BALLOON_MAX_MS: u32 = 10_000;
+/// How long sign-out waits for the engine stop and camera removal.
+const END_SESSION_WAIT: std::time::Duration = std::time::Duration::from_secs(7);
 
 /// Window-thread state (the window procedure has no other context).
 struct Wnd {
@@ -56,6 +65,9 @@ struct Wnd {
     tooltip: String,
     taskbar_created: u32,
     show_msg: u32,
+    /// Balloons waiting for the one on screen to go.
+    balloons: Vec<crate::notify::Balloon>,
+    balloon_showing: bool,
 }
 
 thread_local! {
@@ -121,6 +133,8 @@ pub fn run() -> anyhow::Result<()> {
                 tooltip: String::new(),
                 taskbar_created: RegisterWindowMessageW(&HSTRING::from("TaskbarCreated")),
                 show_msg: RegisterWindowMessageW(&HSTRING::from(SHOW_MSG)),
+                balloons: Vec::new(),
+                balloon_showing: false,
             })
         });
         add_icon(hwnd);
@@ -263,18 +277,14 @@ fn refresh(hwnd: HWND) {
             w.tooltip = tip;
         }
     });
-    for b in balloons {
-        tracing::info!(warning = b.warning, "balloon: {}", b.text);
-        let mut d = nid(hwnd);
-        d.uFlags = NIF_INFO;
-        copy_wide(&mut d.szInfoTitle, "Page2Cam");
-        copy_wide(&mut d.szInfo, &b.text);
-        d.dwInfoFlags = if b.warning { NIIF_WARNING } else { NIIF_INFO };
-        // SAFETY: valid struct.
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
+    WND.with(|w| {
+        if let Ok(mut w) = w.try_borrow_mut() {
+            if let Some(w) = w.as_mut() {
+                w.balloons.extend(balloons);
+            }
         }
-    }
+    });
+    pump_balloons(hwnd);
     if show_menu {
         popup(hwnd, None);
     }
@@ -318,6 +328,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     y: ((wp.0 >> 16) & 0xffff) as u16 as i16 as i32,
                 };
                 popup(hwnd, Some(at));
+            } else if matches!(
+                event,
+                NIN_BALLOONHIDE | NIN_BALLOONTIMEOUT | NIN_BALLOONUSERCLICK
+            ) {
+                balloon_done(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == BALLOON_TIMER => {
+            balloon_done(hwnd);
+            LRESULT(0)
+        }
+        // Sign-out or shutdown: agree, then close gracefully when it happens.
+        WM_QUERYENDSESSION => LRESULT(1),
+        WM_ENDSESSION => {
+            if wp.0 != 0 {
+                end_session();
             }
             LRESULT(0)
         }
@@ -346,4 +373,64 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // SAFETY: default handling.
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
+}
+
+/// Show the queued balloons (merged into one) unless one is on screen.
+/// Windows replaces a balloon that is still showing, so the next one waits
+/// for the hide/timeout notification, or 10 s at most (Focus Assist may
+/// swallow both).
+fn pump_balloons(hwnd: HWND) {
+    let next = WND.with(|w| {
+        let Ok(mut w) = w.try_borrow_mut() else {
+            return None;
+        };
+        let w = w.as_mut()?;
+        if w.balloon_showing {
+            return None;
+        }
+        let b = crate::notify::merge(&std::mem::take(&mut w.balloons))?;
+        w.balloon_showing = true;
+        Some(b)
+    });
+    let Some(b) = next else { return };
+    tracing::info!(warning = b.warning, "balloon: {}", b.text);
+    let mut d = nid(hwnd);
+    d.uFlags = NIF_INFO;
+    copy_wide(&mut d.szInfoTitle, "Page2Cam");
+    copy_wide(&mut d.szInfo, &b.text);
+    d.dwInfoFlags = if b.warning { NIIF_WARNING } else { NIIF_INFO };
+    // SAFETY: valid struct; our window.
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
+        SetTimer(Some(hwnd), BALLOON_TIMER, BALLOON_MAX_MS, None);
+    }
+}
+
+/// The balloon on screen is gone (or assumed gone): show the next.
+fn balloon_done(hwnd: HWND) {
+    // SAFETY: our window and timer.
+    unsafe {
+        let _ = KillTimer(Some(hwnd), BALLOON_TIMER);
+    }
+    WND.with(|w| {
+        if let Ok(mut w) = w.try_borrow_mut() {
+            if let Some(w) = w.as_mut() {
+                w.balloon_showing = false;
+            }
+        }
+    });
+    pump_balloons(hwnd);
+}
+
+/// Sign-out: ask the controller for a graceful stop and wait (bounded) for
+/// it, since Windows ends the process once this message returns.
+fn end_session() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    send(Cmd::EndSession(tx));
+    let begun = std::time::Instant::now();
+    let _ = rx.recv_timeout(END_SESSION_WAIT);
+    tracing::info!(
+        waited_ms = begun.elapsed().as_millis() as u64,
+        "session ending: tray closed"
+    );
 }

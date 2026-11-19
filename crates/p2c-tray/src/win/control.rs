@@ -42,13 +42,12 @@ pub enum Cmd {
     },
     /// A message from a worker thread (shown as a balloon).
     Notify(String),
+    /// Windows is ending the session: stop the engine gracefully (short
+    /// bounded wait), remove the camera, then signal the sender.
+    EndSession(Sender<()>),
 }
 
-/// A balloon notification.
-pub struct Balloon {
-    pub text: String,
-    pub warning: bool,
-}
+pub use crate::notify::Balloon;
 
 /// What the UI thread shows; written by the controller, read on `WM_REFRESH`.
 pub struct UiState {
@@ -111,6 +110,8 @@ const TICK: Duration = Duration::from_secs(1);
 const UNRESPONSIVE_AFTER: Duration = Duration::from_secs(5);
 /// Quit gives the engine this long in total, then ends it.
 const QUIT_LIMIT: Duration = Duration::from_secs(15);
+/// At sign-out Windows waits only a few seconds for us.
+const END_SESSION_LIMIT: Duration = Duration::from_secs(2);
 const SYSLOAD_EVERY: Duration = Duration::from_secs(2);
 const FIRST_RUN: &str = "Page2Cam is in your tray. Click Start when you need it.";
 
@@ -136,6 +137,10 @@ struct Controller {
     tx: Sender<Cmd>,
     ui: Arc<Ui>,
     quitting: Option<Instant>,
+    /// How long Quit waits for the engine (shorter at sign-out).
+    quit_limit: Duration,
+    /// Sign-out: told when everything is closed.
+    end_session: Option<Sender<()>>,
     done: bool,
     level: Level,
 }
@@ -152,14 +157,6 @@ fn random_token() -> String {
 /// The controller thread's body. Returns when the tray quits.
 pub fn run(rx: Receiver<Cmd>, tx: Sender<Cmd>, ui: Arc<Ui>) {
     let me = std::process::id();
-    // Leftovers (old engines, a standalone Page2Cam, orphaned helpers) would
-    // hold the camera: stop them before registering it. Our ancestors and
-    // our own children are spared.
-    let stopped = p2c_proc::stop_others(me, None, &[]);
-    if !stopped.is_empty() {
-        tracing::info!(?stopped, "stopped leftover Page2Cam processes");
-    }
-    let cam = Camera::open();
     let exe = std::env::current_exe().unwrap_or_default();
     let mut c = Controller {
         sup: Supervisor::new(),
@@ -170,7 +167,7 @@ pub fn run(rx: Receiver<Cmd>, tx: Sender<Cmd>, ui: Arc<Ui>) {
         port: None,
         token: random_token(),
         last_answer: None,
-        cam,
+        cam: Camera::closed(),
         sampler: None,
         sys: SysLoad::default(),
         next_sys: Instant::now(),
@@ -181,9 +178,23 @@ pub fn run(rx: Receiver<Cmd>, tx: Sender<Cmd>, ui: Arc<Ui>) {
         tx,
         ui,
         quitting: None,
+        quit_limit: QUIT_LIMIT,
+        end_session: None,
         done: false,
         level: Level::Grey,
     };
+    // Menu first, so the tray is usable while the rest starts.
+    c.refresh_ui();
+    // Leftovers (old engines, a standalone Page2Cam, orphaned helpers) would
+    // hold the camera: stop them before registering it. Only the tray and
+    // its ancestors are spared.
+    let stopped = p2c_proc::stop_others_for_tray(me);
+    if !stopped.is_empty() {
+        tracing::info!(?stopped, "stopped leftover Page2Cam processes");
+    }
+    // Registers in the background: a wedged Frame Server can't block the
+    // menu, Start/Stop or Quit.
+    c.cam = Camera::open();
     if !crate::settings::tray_seen() {
         c.ui.balloon(FIRST_RUN, false);
         if let Err(e) = crate::settings::set_tray_seen() {
@@ -247,12 +258,23 @@ impl Controller {
             }
             Cmd::Poll { gen, result } => self.poll_result(gen, result, now),
             Cmd::Notify(text) => self.ui.balloon(text, true),
+            Cmd::EndSession(done) => {
+                tracing::info!("Windows is ending the session; closing");
+                self.end_session = Some(done);
+                self.quit_limit = END_SESSION_LIMIT;
+                self.begin_quit(now);
+            }
         }
         self.refresh_ui();
     }
 
     fn menu(&mut self, id: MenuId, now: Instant) {
         tracing::info!(?id, "tray menu");
+        // Quit is final: nothing else is carried out once it was chosen.
+        if self.quitting.is_some() && id != MenuId::Quit {
+            tracing::info!(?id, "ignored while quitting");
+            return;
+        }
         match id {
             MenuId::Start => self.feed(Event::StartClicked, now),
             MenuId::Stop => self.feed(Event::StopClicked, now),
@@ -271,15 +293,18 @@ impl Controller {
                         .balloon(format!("Could not change Start with Windows: {e:#}"), true),
                 }
             }
-            MenuId::Quit => {
-                if self.quitting.is_none() {
-                    tracing::info!("quitting");
-                    self.quitting = Some(now);
-                    self.feed(Event::StopClicked, now);
-                    self.check_quit(now);
-                }
-            }
+            MenuId::Quit => self.begin_quit(now),
         }
+    }
+
+    /// Stop the engine (bounded by `quit_limit`), then `finish`.
+    fn begin_quit(&mut self, now: Instant) {
+        if self.quitting.is_none() {
+            tracing::info!("quitting");
+            self.quitting = Some(now);
+            self.feed(Event::StopClicked, now);
+        }
+        self.check_quit(now);
     }
 
     fn poll_result(&mut self, gen: u64, result: Result<Health, String>, now: Instant) {
@@ -427,7 +452,7 @@ impl Controller {
         };
         let idle = matches!(self.sup.state(), TrayState::Stopped | TrayState::Error(_))
             && self.engine.is_none();
-        if idle || now.saturating_duration_since(since) >= QUIT_LIMIT {
+        if idle || now.saturating_duration_since(since) >= self.quit_limit {
             self.done = true;
         }
     }
@@ -459,6 +484,8 @@ impl Controller {
         drop(s);
         self.ui.poke();
         tracing::info!("tray stopped");
+        // Sign-out: everything is closed; let the window thread return.
+        drop(self.end_session.take());
     }
 
     fn open_page(&self) {
@@ -523,7 +550,11 @@ impl Controller {
                 );
             }
         }
-        let entries = crate::menu::entries(&state, &tip, offer.as_ref(), self.autostart);
+        let entries = if self.quitting.is_some() {
+            crate::menu::quitting(&tip)
+        } else {
+            crate::menu::entries(&state, &tip, offer.as_ref(), self.autostart)
+        };
         let mut s = self.ui.state.lock();
         if s.level != level || s.tooltip != tip || s.entries != entries {
             s.level = level;
@@ -535,21 +566,37 @@ impl Controller {
     }
 }
 
-/// Open `url` in the default browser.
+/// Open `url` in the default browser. ShellExecute wants COM initialised
+/// (STA): done on a short-lived thread of its own, never the controller.
 fn open_url(url: &str) {
-    // SAFETY: valid strings for the call.
-    let r = unsafe {
-        ShellExecuteW(
-            None,
-            &HSTRING::from("open"),
-            &HSTRING::from(url),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
-    };
-    // ShellExecute returns a value > 32 on success.
-    if (r.0 as isize) <= 32 {
-        tracing::warn!(code = r.0 as isize, "could not open the browser");
+    let url = url.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("p2c-tray-open".into())
+        .spawn(move || {
+            use windows::Win32::System::Com::{
+                CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+            };
+            // SAFETY: COM init/uninit paired on this thread; valid strings.
+            unsafe {
+                let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+                let r = ShellExecuteW(
+                    None,
+                    &HSTRING::from("open"),
+                    &HSTRING::from(url.as_str()),
+                    PCWSTR::null(),
+                    PCWSTR::null(),
+                    SW_SHOWNORMAL,
+                );
+                // ShellExecute returns a value > 32 on success.
+                if (r.0 as isize) <= 32 {
+                    tracing::warn!(code = r.0 as isize, "could not open the browser");
+                }
+                if com.is_ok() {
+                    CoUninitialize();
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("could not open the browser: {e}");
     }
 }

@@ -72,10 +72,19 @@ pub fn spawn(gen: u64, port: u16, token: &str, tx: Sender<Cmd>) -> anyhow::Resul
     };
     tracing::info!(gen, pid, port, args = ?cmd.args, "engine started");
     let stop = Arc::new(AtomicBool::new(false));
+    // Owns the process handle and the job from here on: any early return
+    // below closes both (and the job takes the engine down with it).
+    let engine = Engine {
+        gen,
+        port,
+        job,
+        process,
+        stop: stop.clone(),
+    };
     {
         let stop = stop.clone();
         let tx = tx.clone();
-        std::thread::Builder::new()
+        let waiter = std::thread::Builder::new()
             .name("p2c-tray-engine-wait".into())
             .spawn(move || {
                 let code = match child.wait() {
@@ -88,8 +97,11 @@ pub fn spawn(gen: u64, port: u16, token: &str, tx: Sender<Cmd>) -> anyhow::Resul
                 stop.store(true, Ordering::Release);
                 tracing::info!(gen, pid, code, "engine exited");
                 let _ = tx.send(Cmd::EngineExited { gen, code });
-            })
-            .context("starting the engine watcher")?;
+            });
+        if let Err(e) = waiter {
+            engine.kill();
+            return Err(anyhow::Error::from(e).context("starting the engine watcher"));
+        }
     }
     {
         let stop = stop.clone();
@@ -110,13 +122,7 @@ pub fn spawn(gen: u64, port: u16, token: &str, tx: Sender<Cmd>) -> anyhow::Resul
             tracing::warn!("cannot poll the engine: {e}");
         }
     }
-    Ok(Engine {
-        gen,
-        port,
-        job,
-        process,
-        stop,
-    })
+    Ok(engine)
 }
 
 impl Engine {

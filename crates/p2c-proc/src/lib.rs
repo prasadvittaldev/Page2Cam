@@ -182,6 +182,20 @@ pub fn to_stop_keeping(procs: &[Proc], me: u32, force: Option<u32>, keep: &[u32]
         .collect()
 }
 
+/// The tray's leftover rule: every Page2Cam process except the tray (`me`)
+/// and its ancestors. Unlike [`to_stop`], its own descendants (an engine it
+/// gave up on, and that engine's helpers) are stopped too, and there is no
+/// race window (the tray holds its lock; a racing launch backs off itself).
+pub fn to_stop_for_tray(procs: &[Proc], me: u32) -> Vec<u32> {
+    let up = ancestors(procs, me);
+    procs
+        .iter()
+        .filter(|p| is_page2cam(&p.name))
+        .filter(|p| p.pid != me && !up.contains(&p.pid))
+        .map(|p| p.pid)
+        .collect()
+}
+
 /// Every running process (pid, parent, name; path and start time for
 /// page2cam processes).
 pub fn list_processes() -> Vec<Proc> {
@@ -193,6 +207,17 @@ pub fn list_processes() -> Vec<Proc> {
 pub fn stop_others(me: u32, force: Option<u32>, keep: &[u32]) -> Vec<u32> {
     let procs = platform::list();
     let pids = to_stop_keeping(&procs, me, force, keep);
+    stop_pids(&procs, pids)
+}
+
+/// The tray's leftover stop ([`to_stop_for_tray`]); returns the pids targeted.
+pub fn stop_others_for_tray(me: u32) -> Vec<u32> {
+    let procs = platform::list();
+    let pids = to_stop_for_tray(&procs, me);
+    stop_pids(&procs, pids)
+}
+
+fn stop_pids(procs: &[Proc], pids: Vec<u32>) -> Vec<u32> {
     if pids.is_empty() {
         return pids;
     }
@@ -593,6 +618,24 @@ mod tests {
         // An ancestor tray is kept as before.
         let procs = [p(10, 1, exe()), p(20, 10, exe())];
         assert!(to_stop_keeping(&procs, 20, None, &[10]).is_empty());
+    }
+
+    #[test]
+    fn tray_stops_its_own_engine_tree_but_not_its_ancestors() {
+        // explorer(1) -> launcher page2cam(5) -> tray(10) -> engine(20) ->
+        // helper(21); plus an unrelated leftover (30) started right after
+        // the tray (no race window for the tray: it holds its lock).
+        let procs = [
+            p(1, 0, "explorer.exe"),
+            started(p(5, 1, exe()), 90),
+            started(p(10, 5, exe()), 100),
+            started(p(20, 10, exe()), 101),
+            started(p(21, 20, exe()), 102),
+            started(p(30, 1, exe()), 103),
+        ];
+        assert_eq!(to_stop_for_tray(&procs, 10), vec![20, 21, 30]);
+        // The engine-side rule spares descendants; the tray's does not.
+        assert_eq!(to_stop(&procs, 10, None), vec![] as Vec<u32>);
     }
 
     #[test]
