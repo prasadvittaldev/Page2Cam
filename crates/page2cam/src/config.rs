@@ -189,37 +189,39 @@ fn config_path(
 /// Set one top-level `key = "value"` in the TOML file at `path`, keeping its
 /// comments and other settings. Creates the file (and folder) if missing.
 pub fn save_choice(path: &Path, key: &str, value: &str) -> anyhow::Result<()> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let mut doc: toml_edit::DocumentMut = text
-        .parse()
-        .with_context(|| format!("parsing {}", path.display()))?;
-    doc[key] = toml_edit::value(value);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
-    std::fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+    edit_settings(path, |doc| doc[key] = toml_edit::value(value))
 }
 
 /// Save the webcam crop as `webcam_crop = [x, y, w, h]`, keeping comments.
 pub fn save_crop(path: &Path, crop: p2c_core::Crop) -> anyhow::Result<()> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let mut doc: toml_edit::DocumentMut = text
-        .parse()
-        .with_context(|| format!("parsing {}", path.display()))?;
     let mut arr = toml_edit::Array::new();
     for v in [crop.x, crop.y, crop.w, crop.h] {
         // f32 -> f64 would print 0.10000000149; round-trip through the short decimal form.
         arr.push(v.to_string().parse::<f64>().unwrap_or(0.0));
     }
-    doc["webcam_crop"] = toml_edit::value(arr);
+    edit_settings(path, |doc| doc["webcam_crop"] = toml_edit::value(arr))
+}
+
+/// Serializes settings writes: the admin page saves from several threads,
+/// and two read-modify-writes of the same file would lose one change.
+static SETTINGS_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read-modify-write the settings file under `SETTINGS_WRITE`, keeping its
+/// comments. Creates the file (and folder) if missing.
+fn edit_settings(
+    path: &Path,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut),
+) -> anyhow::Result<()> {
+    let _guard = SETTINGS_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    edit(&mut doc);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -314,6 +316,41 @@ mod tests {
         assert!(text.contains("# my comment"), "{text}");
         let c: Config = toml::from_str(&text).unwrap();
         assert_eq!((c.fps, c.crop()), (25, k));
+    }
+
+    #[test]
+    fn concurrent_saves_lose_nothing() {
+        // The admin page saves from several threads (style, engine, crop...).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("page2cam.toml");
+        std::fs::write(&p, "# keep\n").unwrap();
+        let k = p2c_core::Crop {
+            x: 0.25,
+            y: 0.5,
+            w: 0.5,
+            h: 0.5,
+        };
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let p = &p;
+                s.spawn(move || {
+                    for n in 0..25 {
+                        if t == 0 {
+                            save_crop(p, k).unwrap();
+                        } else {
+                            save_choice(p, &format!("k{t}"), &n.to_string()).unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        let text = std::fs::read_to_string(&p).unwrap();
+        let doc: toml_edit::DocumentMut = text.parse().unwrap();
+        for t in 1..8 {
+            assert_eq!(doc[&format!("k{t}")].as_str(), Some("24"), "{text}");
+        }
+        assert!(doc.contains_key("webcam_crop"), "{text}");
+        assert!(text.contains("# keep"), "{text}");
     }
 
     #[test]
