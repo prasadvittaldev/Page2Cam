@@ -1,5 +1,5 @@
 //! Cached blur of the webcam picture (room background behind a cut-out).
-use crate::compose::resize_into;
+use crate::compose::{resize_cover_into, resize_into};
 use fast_image_resize::Resizer;
 use p2c_core::Frame;
 use std::sync::Arc;
@@ -18,6 +18,8 @@ const SIGMA_FRAC: f32 = 0.02;
 pub struct BlurCache {
     src: Option<Arc<Frame>>,
     size: (u32, u32),
+    /// Built cover-scaled ([`BlurCache::get_cover`]) rather than stretched.
+    cover: bool,
     out: Vec<u8>,
     builds: u32,
     resizer: Option<Resizer>,
@@ -39,17 +41,31 @@ impl BlurCache {
 
     /// Opaque BGRA, `w * h * 4` bytes: the webcam stretched to `w` x `h` and blurred.
     pub fn get(&mut self, cam: &Arc<Frame>, w: u32, h: u32) -> &[u8] {
-        let fresh = self.src.as_ref().is_some_and(|s| Arc::ptr_eq(s, cam)) && self.size == (w, h);
+        self.get_fitted(cam, w, h, false)
+    }
+
+    /// Like [`BlurCache::get`], but the webcam is cover-scaled: its centre is
+    /// cropped to the `w` x `h` aspect ratio while scaling down, so nothing is
+    /// squeezed and the blur is still built at the requested size.
+    pub fn get_cover(&mut self, cam: &Arc<Frame>, w: u32, h: u32) -> &[u8] {
+        self.get_fitted(cam, w, h, true)
+    }
+
+    fn get_fitted(&mut self, cam: &Arc<Frame>, w: u32, h: u32, cover: bool) -> &[u8] {
+        let fresh = self.src.as_ref().is_some_and(|s| Arc::ptr_eq(s, cam))
+            && self.size == (w, h)
+            && self.cover == cover;
         if !fresh {
-            self.rebuild(cam, w, h);
+            self.rebuild(cam, w, h, cover);
             self.src = Some(Arc::clone(cam));
             self.size = (w, h);
+            self.cover = cover;
             self.builds += 1;
         }
         &self.out
     }
 
-    fn rebuild(&mut self, cam: &Frame, w: u32, h: u32) {
+    fn rebuild(&mut self, cam: &Frame, w: u32, h: u32, cover: bool) {
         self.out.clear();
         if w == 0 || h == 0 {
             return;
@@ -68,7 +84,11 @@ impl BlurCache {
         let (lwu, lhu) = (lw as usize, lh as usize);
         let resizer = self.resizer.get_or_insert_with(Resizer::new);
         self.small.resize(lwu * lhu * 4, 0);
-        resize_into(resizer, cam, &mut self.small, lw, lh, false);
+        if cover {
+            resize_cover_into(resizer, cam, &mut self.small, lw, lh);
+        } else {
+            resize_into(resizer, cam, &mut self.small, lw, lh, false);
+        }
         // Sigma in low-resolution pixels.
         let sigma = (SIGMA_FRAC * lw as f32).max(1.0);
         gaussian(

@@ -409,6 +409,7 @@ fn note_code(n: ComposeNote) -> u8 {
     match n {
         ComposeNote::None => 0,
         ComposeNote::CutoutNotReady => 1,
+        ComposeNote::WebcamOff => 2,
     }
 }
 
@@ -418,6 +419,7 @@ impl TickerStats {
     pub fn compose_note(&self) -> ComposeNote {
         match self.note.load(Ordering::Relaxed) {
             1 => ComposeNote::CutoutNotReady,
+            2 => ComposeNote::WebcamOff,
             _ => ComposeNote::None,
         }
     }
@@ -990,6 +992,19 @@ mod tests {
             !seen.is_empty() && seen.iter().all(|p| *p == RED),
             "{seen:?}"
         );
+    }
+
+    #[test]
+    fn every_note_survives_the_stats_cell() {
+        let s = TickerStats::default();
+        for n in [
+            crate::ComposeNote::None,
+            crate::ComposeNote::CutoutNotReady,
+            crate::ComposeNote::WebcamOff,
+        ] {
+            s.note.store(note_code(n), Ordering::Relaxed);
+            assert_eq!(s.compose_note(), n);
+        }
     }
 
     #[test]

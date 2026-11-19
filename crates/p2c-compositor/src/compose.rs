@@ -9,7 +9,9 @@ use crate::{
     PipLayout,
 };
 
-/// Guided-filter window radius, in pixels of the refined matte.
+/// Guided-filter window radius, in pixels of the refined matte as computed:
+/// for a PIP wider than [`REFINED_MAX_W`] that is the capped size, so the
+/// radius covers proportionally more of the drawn PIP.
 const GUIDED_RADIUS: u32 = 40;
 /// Guided-filter regularisation (guide and mask in 0..1).
 const GUIDED_EPS: f32 = 1e-4;
@@ -35,21 +37,24 @@ pub enum ComposeNote {
     /// A backdrop needs the person mask and there is no fresh one: the
     /// fallback (raw room, or everything blurred) is showing.
     CutoutNotReady,
+    /// The blurred room needs the webcam and there is no fresh frame: the
+    /// page is showing instead.
+    WebcamOff,
 }
 
 impl ComposeNote {
     /// The note for these inputs (the same on every producer).
     /// `cam`/`mask`: a fresh webcam frame / mask is available.
     pub fn of(backdrop: &Backdrop, layout: &PipLayout, cam: bool, mask: bool) -> ComposeNote {
+        let blurred_room = backdrop.full == FullBackdrop::BlurredRoom;
+        if blurred_room && !cam {
+            return ComposeNote::WebcamOff;
+        }
         if !cam || !layout.visible || mask {
             return ComposeNote::None;
         }
-        let blurred_room = backdrop.full == FullBackdrop::BlurredRoom;
-        let box_needs_mask = layout.style == OverlayStyle::Box
-            && matches!(
-                backdrop.in_box,
-                BoxBackdrop::Image(_) | BoxBackdrop::Colour(_)
-            );
+        let box_needs_mask =
+            layout.style == OverlayStyle::Box && backdrop.in_box != BoxBackdrop::Room;
         if blurred_room || box_needs_mask {
             ComposeNote::CutoutNotReady
         } else {
@@ -61,6 +66,7 @@ impl ComposeNote {
         match self {
             ComposeNote::None => "",
             ComposeNote::CutoutNotReady => "cut-out not ready",
+            ComposeNote::WebcamOff => "webcam off: showing the page",
         }
     }
 }
@@ -139,8 +145,6 @@ enum Base<'a> {
     Page(Option<&'a Arc<Frame>>),
     /// The webcam, cover-scaled and blurred.
     BlurredRoom(&'a Arc<Frame>),
-    /// Blurred room without a webcam: nothing to blur, and not the page.
-    Black,
 }
 
 /// How the PIP rectangle is filled.
@@ -172,12 +176,16 @@ struct Plan<'a> {
     pip: Option<EffectivePip<'a>>,
 }
 
+/// In-box Blur, for a Box under a blurred room.
+static BLUR: BoxBackdrop = BoxBackdrop::Blur;
+
 /// Works out what to draw, including every fallback for a missing mask.
 fn plan<'a>(page: Option<&'a Arc<Frame>>, pip: Option<Pip<'a>>, b: &'a Backdrop) -> Plan<'a> {
     let base = match (b.full, pip) {
         (FullBackdrop::Page, _) => Base::Page(page),
         (FullBackdrop::BlurredRoom, Some(p)) => Base::BlurredRoom(p.cam),
-        (FullBackdrop::BlurredRoom, None) => Base::Black,
+        // Nothing to blur: the page, with a note (`ComposeNote::WebcamOff`).
+        (FullBackdrop::BlurredRoom, None) => Base::Page(page),
     };
     let pip = pip.and_then(|p| {
         // Blurred room without a mask: the whole frame stays blurred.
@@ -193,7 +201,14 @@ fn plan<'a>(page: Option<&'a Arc<Frame>>, pip: Option<Pip<'a>>, b: &'a Backdrop)
                 Draw::Opaque
             }
         } else {
-            match (&b.in_box, p.mask) {
+            // Under a blurred room the box's room is blurred too, even if the
+            // backdrop says Room (layout and backdrop are read separately, so
+            // a Box can meet a blurred room for a tick): never the sharp room.
+            let in_box = match (&b.in_box, b.full) {
+                (BoxBackdrop::Room, FullBackdrop::BlurredRoom) => &BLUR,
+                (bg, _) => bg,
+            };
+            match (in_box, p.mask) {
                 (BoxBackdrop::Room, _) => Draw::Opaque,
                 (BoxBackdrop::Blur, None) => Draw::BlurAll,
                 // Image/Colour without a mask: the raw room (and a note).
@@ -219,7 +234,7 @@ fn plan<'a>(page: Option<&'a Arc<Frame>>, pip: Option<Pip<'a>>, b: &'a Backdrop)
 fn base_page<'a>(plan: &Plan<'a>) -> Option<&'a Arc<Frame>> {
     match plan.base {
         Base::Page(p) => p,
-        Base::BlurredRoom(_) | Base::Black => None,
+        Base::BlurredRoom(_) => None,
     }
 }
 
@@ -227,7 +242,7 @@ fn base_page<'a>(plan: &Plan<'a>) -> Option<&'a Arc<Frame>> {
 fn base_cam<'a>(plan: &Plan<'a>) -> Option<&'a Arc<Frame>> {
     match plan.base {
         Base::BlurredRoom(cam) => Some(cam),
-        Base::Page(_) | Base::Black => plan.pip.map(|p| p.cam),
+        Base::Page(_) => plan.pip.map(|p| p.cam),
     }
 }
 
@@ -253,7 +268,9 @@ impl Compositor {
         }
     }
 
-    /// The note for the last compose.
+    /// The note for the last compose that redrew (it is not updated when
+    /// `compose` returns false). For the live note use the ticker's
+    /// `TickerStats::compose_note`, which is computed on every tick.
     pub fn note(&self) -> ComposeNote {
         self.note
     }
@@ -278,7 +295,6 @@ impl Compositor {
         match plan.base {
             Base::Page(page) => self.draw_page(page, out),
             Base::BlurredRoom(cam) => self.draw_blurred_room(cam, out),
-            Base::Black => fill_black(out),
         }
         if let Some(p) = plan.pip {
             let (cam, mask, refined) = (p.cam, p.mask, backdrop.refined_edges);
@@ -297,10 +313,12 @@ impl Compositor {
                 }
             }
         }
-        self.note = match pip {
-            Some(p) => ComposeNote::of(backdrop, p.layout, true, p.mask.is_some()),
-            None => ComposeNote::None,
-        };
+        self.note = ComposeNote::of(
+            backdrop,
+            pip.map_or(&PipLayout::default(), |p| p.layout),
+            pip.is_some(),
+            pip.is_some_and(|p| p.mask.is_some()),
+        );
         self.last = Some(Inputs {
             page: base_page(&plan).cloned(),
             cam: base_cam(&plan).cloned(),
@@ -380,14 +398,9 @@ impl Compositor {
             fill_black(out);
             return;
         }
-        let (cw, ch) = cover_size(cam.width, cam.height, ow, oh);
-        let blurred = self.room_blur.get(cam, cw, ch);
-        let (x0, y0) = (((cw - ow) / 2) as usize, ((ch - oh) / 2) as usize);
-        let (src_row, row) = (cw as usize * 4, ow as usize * 4);
-        for (y, dst) in out.data.chunks_exact_mut(row).enumerate() {
-            let s = (y0 + y) * src_row + x0 * 4;
-            dst.copy_from_slice(&blurred[s..s + row]);
-        }
+        // Cover-cropped while scaling down, blurred small, upscaled to the output.
+        let blurred = self.room_blur.get_cover(cam, ow, oh);
+        out.data.copy_from_slice(blurred);
     }
 
     /// Fill the box with its backdrop (opaque), before the person is drawn.
@@ -581,18 +594,9 @@ const IDENTITY_LUT: [u8; 256] = {
     t
 };
 
-/// Smallest size with the source's aspect ratio that covers `ow` x `oh`
-/// (at least that big in both directions).
-fn cover_size(sw: u32, sh: u32, ow: u32, oh: u32) -> (u32, u32) {
-    let scale = (ow as f64 / sw as f64).max(oh as f64 / sh as f64);
-    let w = ((sw as f64 * scale).round() as u32).max(ow);
-    let h = ((sh as f64 * scale).round() as u32).max(oh);
-    (w, h)
-}
-
 /// Scale `src` to fill `dw` x `dh` exactly, cropping its centre to the
 /// target's aspect ratio (CSS `object-fit: cover`). Alpha is plain data.
-fn resize_cover_into(r: &mut Resizer, src: &Frame, dst: &mut [u8], dw: u32, dh: u32) {
+pub(crate) fn resize_cover_into(r: &mut Resizer, src: &Frame, dst: &mut [u8], dw: u32, dh: u32) {
     let (sw, sh) = (src.width as f64, src.height as f64);
     let target = dw as f64 / dh as f64;
     let (cw, ch) = if sw / sh > target {
@@ -1338,7 +1342,7 @@ mod tests {
             (Room, true, red, sharp, ComposeNote::None),
             (Room, false, red, sharp, ComposeNote::None),
             (Blur, true, red, blurred, ComposeNote::None),
-            (Blur, false, red, blurred, ComposeNote::None),
+            (Blur, false, red, blurred, ComposeNote::CutoutNotReady),
             (
                 Image(image.clone()),
                 true,
@@ -1464,27 +1468,57 @@ mod tests {
                 };
                 for fresh in [true, false] {
                     for refined in [false, true] {
-                        let b = Backdrop {
-                            full: FullBackdrop::BlurredRoom,
-                            // A Box under a blurred room blurs its room too.
-                            in_box: BoxBackdrop::Blur,
-                            refined_edges: refined,
-                        };
-                        let (out, _) = draw(&cam, fresh.then_some(&m), &l, &b);
-                        let sharp = out
-                            .data
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .filter(|p| sharp_room(**p))
-                            .count();
-                        assert_eq!(sharp, 0, "{style:?} x={x} fresh={fresh} refined={refined}");
-                        assert!(out.data.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
+                        // In-box Room too: the app forbids Box under a blurred
+                        // room, but layout and backdrop are read separately.
+                        for in_box in [BoxBackdrop::Blur, BoxBackdrop::Room] {
+                            let b = Backdrop {
+                                full: FullBackdrop::BlurredRoom,
+                                in_box: in_box.clone(),
+                                refined_edges: refined,
+                            };
+                            let (out, _) = draw(&cam, fresh.then_some(&m), &l, &b);
+                            let sharp = out
+                                .data
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .filter(|p| sharp_room(**p))
+                                .count();
+                            assert_eq!(
+                                sharp, 0,
+                                "{style:?} x={x} fresh={fresh} refined={refined} {in_box:?}"
+                            );
+                            assert!(out.data.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
+                        }
                     }
                 }
             }
         }
-        // No webcam at all: nothing to blur, and never the page either.
+        // A Box drawn 1:1 (so a sharp room would be detected exactly), in-box
+        // Room, fresh mask: the person over the blurred room.
+        let cam = person_cam(256, 144);
+        let l = crate::PipLayout {
+            visible: true,
+            x: 0.0,
+            y: 0.0,
+            width: 0.8,
+            style: OverlayStyle::Box,
+        };
+        let (bx, by, bw, bh) = pip_rect(&l, 256, 144, 320, 180).unwrap();
+        assert_eq!((bw, bh), (256, 144));
+        for in_box in [BoxBackdrop::Room, BoxBackdrop::Blur] {
+            let b = backdrop(FullBackdrop::BlurredRoom, in_box.clone());
+            let (out, _) = draw(&cam, Some(&m), &l, &b);
+            let bx = bx as u32;
+            assert!(is_person(out.pixel(bx + bw / 4, by + bh / 2)), "{in_box:?}");
+            assert!(
+                blurred_room(out.pixel(bx + bw * 3 / 4, by + bh / 2)),
+                "{in_box:?}: {:?}",
+                out.pixel(bx + bw * 3 / 4, by + bh / 2)
+            );
+            assert!(!out.data.as_chunks::<4>().0.iter().any(|p| sharp_room(*p)));
+        }
+        // No webcam at all: nothing to blur; the page shows, with a note.
         let mut out = Frame::new_black(32, 18);
         let mut c = Compositor::new();
         c.compose(
@@ -1493,7 +1527,43 @@ mod tests {
             &backdrop(FullBackdrop::BlurredRoom, BoxBackdrop::Room),
             &mut out,
         );
-        assert!(out.data.as_chunks::<4>().0.iter().all(|p| *p == BLACK));
+        assert!(out.data.as_chunks::<4>().0.iter().all(|p| *p == WHITE));
+        assert_eq!(c.note(), ComposeNote::WebcamOff);
+    }
+
+    #[test]
+    fn blurred_room_is_cover_cropped() {
+        // A 4:3 webcam on a 16:9 output: the top and bottom 1/8 are cropped
+        // away (cover), not squeezed in. Those bands are the person colour.
+        let (w, h) = (160u32, 120u32);
+        let mut d = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let px = if y < 15 || y >= h - 15 {
+                    PERSON
+                } else if (x / 2 + y / 2) % 2 == 0 {
+                    GREEN
+                } else {
+                    BLUE
+                };
+                d.extend_from_slice(&px);
+            }
+        }
+        let cam = Arc::new(Frame::from_bgra(w, h, d).unwrap());
+        let hidden = crate::PipLayout {
+            visible: false,
+            ..crate::PipLayout::default()
+        };
+        let b = backdrop(FullBackdrop::BlurredRoom, BoxBackdrop::Room);
+        let (out, note) = draw(&cam, None, &hidden, &b);
+        assert_eq!(note, ComposeNote::None);
+        for (x, y) in [(160, 12), (160, 90), (40, 168)] {
+            assert!(
+                blurred_room(out.pixel(x, y)),
+                "({x},{y}) {:?}",
+                out.pixel(x, y)
+            );
+        }
     }
 
     #[test]
