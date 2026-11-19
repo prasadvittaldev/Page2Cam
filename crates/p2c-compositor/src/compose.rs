@@ -264,7 +264,14 @@ fn bilinear() -> ResizeOptions {
 
 /// Scale a BGRA frame into `dst` (`dw * dh * 4` bytes). With `use_alpha`
 /// false the alpha byte is scaled as plain data.
-fn resize_into(r: &mut Resizer, src: &Frame, dst: &mut [u8], dw: u32, dh: u32, use_alpha: bool) {
+pub(crate) fn resize_into(
+    r: &mut Resizer,
+    src: &Frame,
+    dst: &mut [u8],
+    dw: u32,
+    dh: u32,
+    use_alpha: bool,
+) {
     let src_img = ImageRef::new(src.width, src.height, &src.data, PixelType::U8x4)
         .expect("Frame invariant: len == w*h*4");
     let mut dst_img =

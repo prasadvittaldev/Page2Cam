@@ -1,21 +1,29 @@
 //! Cached blur of the webcam picture (room background behind a cut-out).
-use crate::scale_frame_straight;
+use crate::compose::resize_into;
+use fast_image_resize::Resizer;
 use p2c_core::Frame;
 use std::sync::Arc;
 
-/// Blur works at no more than 1/4 of the output size.
-const DOWN: u32 = 4;
+/// Blur works at no more than 1/4 of the output size, and never wider than this.
+/// The blur is very smooth, so a larger output only needs a larger upscale, not
+/// a bigger kernel: the cost stays flat from 960x540 up to 1920x1080.
+const MAX_LOW_W: u32 = 160;
 /// Gaussian sigma as a fraction of the output width.
 const SIGMA_FRAC: f32 = 0.02;
 
 /// A blurred copy of the webcam frame at output size, rebuilt only when the
-/// source frame (by identity) or the requested size changes.
+/// source frame (by identity) or the requested size changes. Buffers and the
+/// resizer are kept between rebuilds.
 #[derive(Default)]
 pub struct BlurCache {
     src: Option<Arc<Frame>>,
     size: (u32, u32),
     out: Vec<u8>,
     builds: u32,
+    resizer: Option<Resizer>,
+    small: Vec<u8>,
+    blurred: Vec<u8>,
+    tmp: Vec<f32>,
 }
 
 impl BlurCache {
@@ -33,35 +41,56 @@ impl BlurCache {
     pub fn get(&mut self, cam: &Arc<Frame>, w: u32, h: u32) -> &[u8] {
         let fresh = self.src.as_ref().is_some_and(|s| Arc::ptr_eq(s, cam)) && self.size == (w, h);
         if !fresh {
-            self.out = blur_frame(cam, w, h);
+            self.rebuild(cam, w, h);
             self.src = Some(Arc::clone(cam));
             self.size = (w, h);
             self.builds += 1;
         }
         &self.out
     }
-}
 
-fn blur_frame(cam: &Frame, w: u32, h: u32) -> Vec<u8> {
-    if w == 0 || h == 0 {
-        return Vec::new();
+    fn rebuild(&mut self, cam: &Frame, w: u32, h: u32) {
+        self.out.clear();
+        if w == 0 || h == 0 {
+            return;
+        }
+        let n = w as usize * h as usize;
+        if cam.width == 0
+            || cam.height == 0
+            || cam.data.len() != cam.width as usize * cam.height as usize * 4
+        {
+            self.out.resize(n * 4, 0);
+            self.out.as_chunks_mut::<4>().0.fill([0, 0, 0, 255]);
+            return;
+        }
+        let lw = (w / 4).clamp(1, MAX_LOW_W);
+        let lh = ((h as u64 * lw as u64 / w as u64) as u32).max(1);
+        let (lwu, lhu) = (lw as usize, lh as usize);
+        let resizer = self.resizer.get_or_insert_with(Resizer::new);
+        self.small.resize(lwu * lhu * 4, 0);
+        resize_into(resizer, cam, &mut self.small, lw, lh, false);
+        // Sigma in low-resolution pixels.
+        let sigma = (SIGMA_FRAC * lw as f32).max(1.0);
+        gaussian(
+            &self.small,
+            &mut self.blurred,
+            &mut self.tmp,
+            lwu,
+            lhu,
+            sigma,
+        );
+        self.out.resize(n * 4, 0);
+        let blurred = Frame {
+            width: lw,
+            height: lh,
+            data: std::mem::take(&mut self.blurred),
+        };
+        resize_into(resizer, &blurred, &mut self.out, w, h, false);
+        self.blurred = blurred.data;
+        for px in self.out.as_chunks_mut::<4>().0 {
+            px[3] = 255;
+        }
     }
-    if cam.width == 0
-        || cam.height == 0
-        || cam.data.len() != cam.width as usize * cam.height as usize * 4
-    {
-        return [0u8, 0, 0, 255].repeat(w as usize * h as usize);
-    }
-    let (lw, lh) = ((w / DOWN).max(1), (h / DOWN).max(1));
-    let mut small = scale_frame_straight(cam, lw, lh);
-    // Sigma in low-resolution pixels.
-    let sigma = (SIGMA_FRAC * lw as f32).max(1.0);
-    gaussian(&mut small, sigma);
-    let mut big = scale_frame_straight(&small, w, h);
-    for px in big.data.as_chunks_mut::<4>().0 {
-        px[3] = 255;
-    }
-    big.data
 }
 
 fn kernel(sigma: f32) -> Vec<f32> {
@@ -74,13 +103,14 @@ fn kernel(sigma: f32) -> Vec<f32> {
     k
 }
 
-/// Separable Gaussian on the B, G, R channels (edges clamped); alpha set opaque.
-fn gaussian(f: &mut Frame, sigma: f32) {
-    let (w, h) = (f.width as usize, f.height as usize);
+/// Separable Gaussian on the B, G, R channels (edges clamped); `dst` alpha opaque.
+fn gaussian(src: &[u8], dst: &mut Vec<u8>, tmp: &mut Vec<f32>, w: usize, h: usize, sigma: f32) {
     let k = kernel(sigma);
     let r = (k.len() / 2) as isize;
-    let src: Vec<f32> = f.data.iter().map(|&v| v as f32).collect();
-    let mut tmp = vec![0.0f32; src.len()];
+    tmp.clear();
+    tmp.resize(w * h * 4, 0.0);
+    dst.clear();
+    dst.resize(w * h * 4, 255);
     for y in 0..h {
         for x in 0..w {
             let mut acc = [0.0f32; 3];
@@ -88,7 +118,7 @@ fn gaussian(f: &mut Frame, sigma: f32) {
                 let sx = (x as isize + t as isize - r).clamp(0, w as isize - 1) as usize;
                 let i = (y * w + sx) * 4;
                 for (c, a) in acc.iter_mut().enumerate() {
-                    *a += kv * src[i + c];
+                    *a += kv * src[i + c] as f32;
                 }
             }
             tmp[(y * w + x) * 4..][..3].copy_from_slice(&acc);
@@ -106,9 +136,8 @@ fn gaussian(f: &mut Frame, sigma: f32) {
             }
             let o = (y * w + x) * 4;
             for (c, a) in acc.iter().enumerate() {
-                f.data[o + c] = (a + 0.5) as u8;
+                dst[o + c] = (a + 0.5) as u8;
             }
-            f.data[o + 3] = 255;
         }
     }
 }
@@ -175,5 +204,33 @@ mod tests {
         let same_content = Arc::new((*cam).clone());
         c.get(&same_content, 128, 72);
         assert_eq!(c.builds(), 2);
+    }
+
+    #[test]
+    #[ignore = "speed measurement; run with --release --nocapture"]
+    fn blur_speed() {
+        let mut d = Vec::new();
+        for y in 0..720u32 {
+            for x in 0..1280u32 {
+                let v = ((x * 7 + y * 3) % 256) as u8;
+                d.extend_from_slice(&[v, v / 2, 255 - v, 255]);
+            }
+        }
+        let n = 20;
+        for (w, h) in [(960u32, 540u32), (1920, 1080)] {
+            let mut c = BlurCache::new();
+            let mut frames: Vec<Arc<Frame>> = (0..n + 1)
+                .map(|_| Arc::new(Frame::from_bgra(1280, 720, d.clone()).unwrap()))
+                .collect();
+            c.get(&frames[0], w, h); // warm-up, allocates buffers
+            let t = std::time::Instant::now();
+            for f in frames.drain(1..) {
+                std::hint::black_box(c.get(&f, w, h));
+            }
+            println!(
+                "blur 1280x720 -> {w}x{h}: {:.2} ms per new frame",
+                t.elapsed().as_secs_f64() * 1000.0 / n as f64
+            );
+        }
     }
 }
