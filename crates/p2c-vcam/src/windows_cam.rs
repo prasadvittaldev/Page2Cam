@@ -47,7 +47,27 @@ struct Owner {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// How the camera owner is started (replaced in tests).
+type StartFn = std::sync::Arc<dyn Fn() -> anyhow::Result<Owner> + Send + Sync>;
+
+/// Minimum gap between attempts to start the camera after a failure.
+const START_RETRY: Duration = Duration::from_secs(5);
+
+/// True when no start was tried yet, or the last one was at least 5 s ago.
+fn retry_due(last_try: Option<Instant>, now: Instant) -> bool {
+    last_try.is_none_or(|t| now.saturating_duration_since(t) >= START_RETRY)
+}
+
 impl Owner {
+    /// An owner with no camera behind it (tests).
+    #[cfg(test)]
+    fn dummy() -> Owner {
+        Owner {
+            stop: None,
+            thread: None,
+        }
+    }
+
     fn start() -> anyhow::Result<Owner> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
@@ -117,7 +137,12 @@ impl Drop for View {
 /// Writes frames into the camera DLL's shared memory (once it exists: the DLL
 /// creates it when Windows loads it, e.g. when an app opens the camera).
 pub struct WinVcamSink {
-    _owner: Owner,
+    /// `None` while the camera could not be started yet (retried every 5 s).
+    owner: Option<Owner>,
+    start: StartFn,
+    /// Result of a background start attempt in flight.
+    pending: Option<std::sync::mpsc::Receiver<anyhow::Result<Owner>>>,
+    last_start_try: Option<Instant>,
     view: Option<View>,
     last_try: Option<Instant>,
     status: CameraStatus,
@@ -129,16 +154,83 @@ pub struct WinVcamSink {
 unsafe impl Send for WinVcamSink {}
 
 impl WinVcamSink {
-    pub fn open(_spec: &OutputSpec, status: CameraStatus) -> anyhow::Result<WinVcamSink> {
-        anyhow::ensure!(is_registered(), NOT_INSTALLED);
-        let owner = Owner::start()?;
-        Ok(WinVcamSink {
-            _owner: owner,
+    pub fn open(spec: &OutputSpec, status: CameraStatus) -> anyhow::Result<WinVcamSink> {
+        Self::open_with(
+            spec,
+            status,
+            is_registered(),
+            std::sync::Arc::new(Owner::start),
+        )
+    }
+
+    /// Not installed is a hard error; a failing start (e.g. Frame Server still
+    /// restarting) is not: the sink retries from `push`.
+    fn open_with(
+        _spec: &OutputSpec,
+        status: CameraStatus,
+        registered: bool,
+        start: StartFn,
+    ) -> anyhow::Result<WinVcamSink> {
+        anyhow::ensure!(registered, NOT_INSTALLED);
+        let mut sink = WinVcamSink {
+            owner: None,
+            start,
+            pending: None,
+            last_start_try: Some(Instant::now()),
             view: None,
             last_try: None,
             status,
             dll_version: None,
-        })
+        };
+        match (sink.start)() {
+            Ok(o) => sink.owner = Some(o),
+            Err(e) => sink.start_failed(&e),
+        }
+        Ok(sink)
+    }
+
+    fn start_failed(&self, e: &anyhow::Error) {
+        tracing::warn!("virtual camera start failed, will retry: {e:#}");
+        self.status.set(Some(format!("starting (retrying): {e:#}")));
+    }
+
+    /// Cheap per-frame check: collect a finished background start attempt, or
+    /// launch one when due. Never blocks (the attempt runs on its own thread).
+    fn poll_start(&mut self, now: Instant) {
+        if self.owner.is_some() {
+            return;
+        }
+        if let Some(rx) = &self.pending {
+            match rx.try_recv() {
+                Ok(Ok(o)) => {
+                    tracing::info!("virtual camera started");
+                    self.owner = Some(o);
+                    self.pending = None;
+                    self.status.set(None);
+                }
+                Ok(Err(e)) => {
+                    self.pending = None;
+                    self.start_failed(&e);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending = None,
+            }
+            return;
+        }
+        if !retry_due(self.last_start_try, now) {
+            return;
+        }
+        self.last_start_try = Some(now);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = self.start.clone();
+        let spawned = std::thread::Builder::new()
+            .name("p2c-wincam-retry".into())
+            .spawn(move || {
+                let _ = tx.send(start());
+            });
+        if spawned.is_ok() {
+            self.pending = Some(rx);
+        }
     }
 
     fn try_map(&mut self) {
@@ -191,6 +283,10 @@ impl WinVcamSink {
 impl FrameSink for WinVcamSink {
     /// Writes `out.camera` (NV12, fitted into 1920x1080) into the shared memory.
     fn push(&mut self, out: &Output) -> anyhow::Result<()> {
+        self.poll_start(Instant::now());
+        if self.owner.is_none() {
+            return Ok(());
+        }
         self.try_map();
         let Some(base) = self.view.as_ref().map(|v| v.view.Value as *mut u8) else {
             return Ok(());
@@ -221,5 +317,80 @@ impl FrameSink for WinVcamSink {
             f.height
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn spec() -> OutputSpec {
+        OutputSpec {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            format: p2c_compositor::OutputFormat::Nv12,
+        }
+    }
+
+    fn failing() -> StartFn {
+        Arc::new(|| anyhow::bail!("The data is invalid. (0x8007000D)"))
+    }
+
+    #[test]
+    fn retry_due_every_5s() {
+        let t0 = Instant::now();
+        assert!(retry_due(None, t0));
+        assert!(!retry_due(Some(t0), t0 + Duration::from_millis(4999)));
+        assert!(retry_due(Some(t0), t0 + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn not_installed_is_not_retried() {
+        let err = WinVcamSink::open_with(&spec(), CameraStatus::default(), false, failing())
+            .err()
+            .expect("hard error");
+        assert!(err.to_string().contains("not installed"), "{err}");
+    }
+
+    #[test]
+    fn start_failure_reports_retrying_status() {
+        let status = CameraStatus::default();
+        let sink = WinVcamSink::open_with(&spec(), status.clone(), true, failing())
+            .expect("sink despite start failure");
+        assert!(sink.owner.is_none());
+        let s = status.status().expect("status set");
+        assert!(s.starts_with("starting (retrying)"), "{s}");
+        assert!(s.contains("0x8007000D"), "{s}");
+    }
+
+    #[test]
+    fn retry_succeeds_in_background_and_clears_status() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let start: StartFn = Arc::new(move || {
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("not yet")
+            }
+            Ok(Owner::dummy())
+        });
+        let status = CameraStatus::default();
+        let mut sink = WinVcamSink::open_with(&spec(), status.clone(), true, start).unwrap();
+        let t0 = Instant::now();
+        sink.poll_start(t0 + Duration::from_secs(1)); // not due: no attempt
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let due = t0 + Duration::from_secs(6);
+        for _ in 0..200 {
+            sink.poll_start(due);
+            if sink.owner.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(sink.owner.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(status.status(), None);
     }
 }
