@@ -49,7 +49,9 @@ pub(crate) struct Header {
     format: u32,
     /// Written once by the DLL when it creates the mapping; 0 = old DLL.
     dll_version: u32,
-    _pad: [u8; 24],
+    /// Who may write frames (`Writer`); set only by the tray. Old DLLs ignore it.
+    writer: u32,
+    _pad: [u8; 20],
 }
 
 const _: () = assert!(std::mem::size_of::<Header>() == HEADER_SIZE);
@@ -191,6 +193,38 @@ pub unsafe fn dll_version(base: *const u8) -> u32 {
     std::ptr::read_volatile(&h.dll_version)
 }
 
+/// Who currently owns frame writing. The tray hands it to the engine once
+/// the engine produces output, and takes it back when the engine stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Writer {
+    None = 0,
+    Tray = 1,
+    Engine = 2,
+}
+
+/// Tray side: say who writes frames now.
+///
+/// # Safety
+/// `base` must point to a writable, 8-byte aligned mapping of `MAPPING_SIZE` bytes.
+pub unsafe fn set_writer(base: *mut u8, w: Writer) {
+    let h = &mut *(base as *mut Header);
+    std::ptr::write_volatile(&mut h.writer, w as u32);
+}
+
+/// Who may write frames (unknown values read as `Writer::None`).
+///
+/// # Safety
+/// `base` must point to a readable, 8-byte aligned mapping of `MAPPING_SIZE` bytes.
+pub unsafe fn writer(base: *const u8) -> Writer {
+    let h = &*(base as *const Header);
+    match std::ptr::read_volatile(&h.writer) {
+        1 => Writer::Tray,
+        2 => Writer::Engine,
+        _ => Writer::None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +344,47 @@ mod tests {
             unsafe { read_frame(base, &mut Vec::new()) },
             Err(ReadError::Busy)
         );
+    }
+
+    #[test]
+    fn writer_field_roundtrip_and_header_size() {
+        assert_eq!(std::mem::size_of::<Header>(), HEADER_SIZE);
+        let mut m = mem();
+        let base = m.as_mut_ptr() as *mut u8;
+        assert_eq!(unsafe { writer(base) }, Writer::None);
+        for w in [Writer::Tray, Writer::Engine, Writer::None] {
+            unsafe { set_writer(base, w) };
+            assert_eq!(unsafe { writer(base) }, w);
+        }
+        assert_eq!(Writer::Tray as u32, 1);
+        assert_eq!(Writer::Engine as u32, 2);
+        // Frames and the DLL stamp don't clobber it.
+        unsafe { set_writer(base, Writer::Engine) };
+        unsafe { set_dll_version(base) };
+        unsafe { write_frame(base, PixelFormat::Bgra, 2, 2, &[7; 16], 1) };
+        assert_eq!(unsafe { writer(base) }, Writer::Engine);
+        // An unknown value reads as None.
+        unsafe { (*(base as *mut Header)).writer = 9 };
+        assert_eq!(unsafe { writer(base) }, Writer::None);
+    }
+
+    #[test]
+    fn old_dll_unaffected_by_writer_field() {
+        let mut m = mem();
+        let base = m.as_mut_ptr() as *mut u8;
+        let px: Vec<u8> = (0..16).collect();
+        unsafe {
+            set_writer(base, Writer::Tray);
+            write_frame(base, PixelFormat::Bgra, 2, 2, &px, 5);
+        }
+        // The v2 reader (the DLL's) sees the same frame and version.
+        let mut out = Vec::new();
+        let info = unsafe { read_frame(base, &mut out) }.unwrap();
+        assert_eq!((info.width, info.height, info.time_ms), (2, 2, 5));
+        assert_eq!(out, px);
+        assert_eq!(VERSION, 2);
+        unsafe { set_writer(base, Writer::Engine) };
+        assert!(unsafe { read_frame(base, &mut out) }.is_ok());
     }
 
     #[test]

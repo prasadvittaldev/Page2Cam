@@ -20,7 +20,7 @@ use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
 };
 
-use crate::{camera_driver_status, CameraStatus};
+use crate::{camera_driver_status, CameraMode, CameraStatus};
 
 const NOT_INSTALLED: &str =
     "the Page2Cam camera is not installed. Close Page2Cam, right-click install-camera.cmd \
@@ -330,30 +330,125 @@ impl Drop for Owner {
     }
 }
 
-struct View {
-    handle: HANDLE,
-    view: MEMORY_MAPPED_VIEW_ADDRESS,
+/// What keeps a mapped block alive.
+enum Backing {
+    Os {
+        handle: HANDLE,
+        view: MEMORY_MAPPED_VIEW_ADDRESS,
+    },
+    /// Heap memory standing in for the mapping (tests).
+    #[cfg(test)]
+    #[allow(dead_code)]
+    Heap(Vec<u64>),
 }
 
-impl Drop for View {
+impl Drop for Backing {
     fn drop(&mut self) {
-        unsafe {
-            let _ = UnmapViewOfFile(self.view);
-            let _ = CloseHandle(self.handle);
+        match self {
+            Backing::Os { handle, view } => unsafe {
+                let _ = UnmapViewOfFile(*view);
+                let _ = CloseHandle(*handle);
+            },
+            #[cfg(test)]
+            Backing::Heap(_) => {}
         }
     }
+}
+
+/// A writable view of the camera DLL's shared memory (the DLL creates it when
+/// Windows loads it, e.g. when an app opens the camera). Used by the engine's
+/// sink and by the tray (standby pictures, writer handover); it does not own
+/// the camera registration.
+pub struct FrameWriter {
+    base: *mut u8,
+    _backing: Backing,
+}
+
+// The mapping is plain shared memory; the seqlock protocol makes a single
+// writer thread safe, and callers keep one writer thread at a time.
+unsafe impl Send for FrameWriter {}
+
+impl FrameWriter {
+    /// Open the mapping if the DLL has created it yet (one attempt, no retry timer).
+    pub fn open() -> Option<FrameWriter> {
+        let name = HSTRING::from(p2c_shm::MAPPING_NAME);
+        unsafe {
+            let handle = OpenFileMappingW(FILE_MAP_WRITE.0, false, PCWSTR(name.as_ptr())).ok()?;
+            let view = MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, p2c_shm::MAPPING_SIZE);
+            if view.Value.is_null() {
+                let _ = CloseHandle(handle);
+                return None;
+            }
+            Some(FrameWriter {
+                base: view.Value as *mut u8,
+                _backing: Backing::Os { handle, view },
+            })
+        }
+    }
+
+    #[cfg(test)]
+    fn from_heap() -> FrameWriter {
+        let mut mem = vec![0u64; p2c_shm::MAPPING_SIZE / 8 + 1];
+        FrameWriter {
+            base: mem.as_mut_ptr() as *mut u8,
+            _backing: Backing::Heap(mem),
+        }
+    }
+
+    /// Start of the mapping (header), for `p2c_shm::{writer, set_writer, dll_version}`.
+    pub fn base(&self) -> *mut u8 {
+        self.base
+    }
+
+    /// Write one NV12 frame; false if it doesn't fit the mapping.
+    pub fn write_nv12(&self, f: &p2c_core::Nv12Frame, time_ms: u64) -> bool {
+        // SAFETY: `base` is MAPPING_SIZE bytes, 8-byte aligned, mapped while self lives.
+        unsafe {
+            p2c_shm::write_frame(
+                self.base,
+                p2c_shm::PixelFormat::Nv12,
+                f.width,
+                f.height,
+                &f.data,
+                time_ms,
+            )
+        }
+    }
+
+    /// Write one packed BGRA frame; false if it doesn't fit the mapping.
+    pub fn write_bgra(&self, width: u32, height: u32, data: &[u8], time_ms: u64) -> bool {
+        // SAFETY: as in `write_nv12`.
+        unsafe {
+            p2c_shm::write_frame(
+                self.base,
+                p2c_shm::PixelFormat::Bgra,
+                width,
+                height,
+                data,
+                time_ms,
+            )
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Writes frames into the camera DLL's shared memory (once it exists: the DLL
 /// creates it when Windows loads it, e.g. when an app opens the camera).
 pub struct WinVcamSink {
+    mode: CameraMode,
     /// `None` while the camera could not be started yet (retried every 5 s).
     owner: Option<Owner>,
     start: StartFn,
     /// Result of a background start attempt in flight.
     pending: Option<std::sync::mpsc::Receiver<anyhow::Result<Owner>>>,
     last_start_try: Option<Instant>,
-    view: Option<View>,
+    writer: Option<FrameWriter>,
     last_try: Option<Instant>,
     status: CameraStatus,
     /// Driver version last seen in the mapping (to log a change once).
@@ -375,7 +470,40 @@ const SERVICE_RESTARTED: &str = "starting (retrying): camera service restarted";
 unsafe impl Send for WinVcamSink {}
 
 impl WinVcamSink {
-    pub fn open(spec: &OutputSpec, status: CameraStatus) -> anyhow::Result<WinVcamSink> {
+    /// `CameraMode::Own` opens the camera registration (today's behaviour);
+    /// `FromTray` only connects to the mapping, the tray owns the camera.
+    pub fn open(
+        spec: &OutputSpec,
+        status: CameraStatus,
+        mode: CameraMode,
+    ) -> anyhow::Result<WinVcamSink> {
+        match mode {
+            CameraMode::Own => Self::open_own(spec, status),
+            CameraMode::FromTray => Ok(Self::from_tray(status)),
+        }
+    }
+
+    /// Engine sink for a camera the tray owns: no registration, no start
+    /// retry, no Frame Server watch; writes only while `writer == Engine`.
+    fn from_tray(status: CameraStatus) -> WinVcamSink {
+        WinVcamSink {
+            mode: CameraMode::FromTray,
+            owner: None,
+            start: std::sync::Arc::new(|| anyhow::bail!("the tray owns the camera")),
+            pending: None,
+            last_start_try: None,
+            writer: None,
+            last_try: None,
+            status,
+            dll_version: None,
+            watch: std::sync::mpsc::channel().1,
+            owner_since: Instant::now(),
+            service_pid: None,
+            present: std::sync::Arc::new(|| None),
+        }
+    }
+
+    fn open_own(spec: &OutputSpec, status: CameraStatus) -> anyhow::Result<WinVcamSink> {
         let registered = is_registered();
         Self::open_with(
             spec,
@@ -403,11 +531,12 @@ impl WinVcamSink {
     ) -> anyhow::Result<WinVcamSink> {
         anyhow::ensure!(registered, NOT_INSTALLED);
         let mut sink = WinVcamSink {
+            mode: CameraMode::Own,
             owner: None,
             start,
             pending: None,
             last_start_try: Some(Instant::now()),
-            view: None,
+            writer: None,
             last_try: None,
             status,
             dll_version: None,
@@ -469,7 +598,7 @@ impl WinVcamSink {
         }
         if lost.is_some() {
             let old = self.owner.take();
-            self.view = None;
+            self.writer = None;
             self.last_try = None;
             self.dll_version = None;
             self.service_pid = None;
@@ -577,7 +706,7 @@ impl WinVcamSink {
     }
 
     fn try_map(&mut self) {
-        if self.view.is_some()
+        if self.writer.is_some()
             || self
                 .last_try
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
@@ -585,17 +714,9 @@ impl WinVcamSink {
             return;
         }
         self.last_try = Some(Instant::now());
-        let name = HSTRING::from(p2c_shm::MAPPING_NAME);
-        unsafe {
-            if let Ok(handle) = OpenFileMappingW(FILE_MAP_WRITE.0, false, PCWSTR(name.as_ptr())) {
-                let view = MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, p2c_shm::MAPPING_SIZE);
-                if view.Value.is_null() {
-                    let _ = CloseHandle(handle);
-                } else {
-                    tracing::info!("connected to the Page2Cam camera driver");
-                    self.view = Some(View { handle, view });
-                }
-            }
+        if let Some(w) = FrameWriter::open() {
+            tracing::info!("connected to the Page2Cam camera driver");
+            self.writer = Some(w);
         }
     }
 }
@@ -626,34 +747,32 @@ impl WinVcamSink {
 impl FrameSink for WinVcamSink {
     /// Writes `out.camera` (NV12, fitted into 1920x1080) into the shared memory.
     fn push(&mut self, out: &Output) -> anyhow::Result<()> {
-        self.poll_health();
-        self.poll_start(Instant::now());
-        if self.owner.is_none() {
-            return Ok(());
+        if self.mode == CameraMode::Own {
+            self.poll_health();
+            self.poll_start(Instant::now());
+            if self.owner.is_none() {
+                return Ok(());
+            }
         }
         self.try_map();
-        let Some(base) = self.view.as_ref().map(|v| v.view.Value as *mut u8) else {
+        let Some(base) = self.writer.as_ref().map(|w| w.base()) else {
             return Ok(());
         };
         self.check_driver(base);
+        let Some(writer) = self.writer.as_ref() else {
+            return Ok(());
+        };
+        // The tray owns the camera and the picture until it hands writing over.
+        if self.mode == CameraMode::FromTray
+            // SAFETY: `base` is the mapped view of MAPPING_SIZE bytes.
+            && unsafe { p2c_shm::writer(base) } != p2c_shm::Writer::Engine
+        {
+            return Ok(());
+        }
         let Some(f) = out.camera.as_deref() else {
             return Ok(());
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        // SAFETY: the view is MAPPING_SIZE bytes, page-aligned, and stays mapped while self lives.
-        let ok = unsafe {
-            p2c_shm::write_frame(
-                base,
-                p2c_shm::PixelFormat::Nv12,
-                f.width,
-                f.height,
-                &f.data,
-                now,
-            )
-        };
+        let ok = writer.write_nv12(f, now_ms());
         anyhow::ensure!(
             ok,
             "camera frame {}x{} does not fit the shared memory",
@@ -818,7 +937,7 @@ mod tests {
         tx.send((t, ServiceState::Running { pid: 200 })).unwrap();
         sink.poll_health();
         assert!(sink.owner.is_none(), "owner dropped");
-        assert!(sink.view.is_none());
+        assert!(sink.writer.is_none());
         assert_eq!(sink.dll_version, None);
         assert_eq!(
             status.status().as_deref(),
@@ -870,6 +989,80 @@ mod tests {
         assert!(sink.owner.is_some());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(status.status(), None);
+    }
+
+    fn nv12_out(w: u32, h: u32, fill: u8) -> Output {
+        Output {
+            camera: Some(Arc::new(p2c_core::Nv12Frame {
+                width: w,
+                height: h,
+                data: vec![fill; (w * h * 3 / 2) as usize],
+            })),
+            ..Output::default()
+        }
+    }
+
+    fn mapped_frame(w: &FrameWriter) -> Result<p2c_shm::FrameInfo, p2c_shm::ReadError> {
+        unsafe { p2c_shm::read_frame(w.base(), &mut Vec::new()) }
+    }
+
+    #[test]
+    fn engine_writes_only_when_handed_over() {
+        let mut sink = WinVcamSink::from_tray(CameraStatus::default());
+        assert!(sink.owner.is_none(), "no camera registration in tray mode");
+        sink.writer = Some(FrameWriter::from_heap());
+        let base = sink.writer.as_ref().unwrap().base();
+        // Nobody / the tray holds the pen: the engine must not touch frames.
+        for w in [p2c_shm::Writer::None, p2c_shm::Writer::Tray] {
+            unsafe { p2c_shm::set_writer(base, w) };
+            sink.push(&nv12_out(4, 2, 9)).unwrap();
+            assert_eq!(
+                mapped_frame(sink.writer.as_ref().unwrap()),
+                Err(p2c_shm::ReadError::NoFrame),
+                "{w:?}"
+            );
+        }
+        // Handed over: frames are written.
+        unsafe { p2c_shm::set_writer(base, p2c_shm::Writer::Engine) };
+        sink.push(&nv12_out(4, 2, 9)).unwrap();
+        let info = mapped_frame(sink.writer.as_ref().unwrap()).unwrap();
+        assert_eq!((info.width, info.height), (4, 2));
+        assert_eq!(info.format, p2c_shm::PixelFormat::Nv12);
+        // Taken back: it stops again.
+        let seq = info.seq;
+        unsafe { p2c_shm::set_writer(base, p2c_shm::Writer::Tray) };
+        sink.push(&nv12_out(4, 2, 9)).unwrap();
+        assert_eq!(
+            mapped_frame(sink.writer.as_ref().unwrap()).unwrap().seq,
+            seq
+        );
+    }
+
+    #[test]
+    fn frame_writer_writes_nv12_and_bgra() {
+        let w = FrameWriter::from_heap();
+        assert!(w.write_nv12(
+            &p2c_core::Nv12Frame {
+                width: 4,
+                height: 2,
+                data: vec![1; 12],
+            },
+            7
+        ));
+        assert_eq!(mapped_frame(&w).unwrap().format, p2c_shm::PixelFormat::Nv12);
+        assert!(w.write_bgra(2, 2, &[3; 16], 8));
+        let info = mapped_frame(&w).unwrap();
+        assert_eq!(info.format, p2c_shm::PixelFormat::Bgra);
+        assert_eq!(info.time_ms, 8);
+        // Too big for the mapping.
+        assert!(!w.write_nv12(
+            &p2c_core::Nv12Frame {
+                width: 4000,
+                height: 2,
+                data: vec![0; 12000],
+            },
+            1
+        ));
     }
 
     #[test]

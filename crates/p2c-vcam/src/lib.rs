@@ -13,6 +13,8 @@ mod windows_cam;
 pub use convert::bgra_to_yuyv;
 #[cfg(target_os = "linux")]
 pub use linux::{find_loopback_device, resolve_device, V4l2Sink};
+#[cfg(windows)]
+pub use windows_cam::FrameWriter;
 
 /// Admin status for a camera driver that wrote `dll_version` into the shared
 /// memory (0 = a DLL from before the version field): `Some(error)` when it is
@@ -41,6 +43,17 @@ impl CameraStatus {
     }
 }
 
+/// Who owns the Windows camera registration for a sink.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CameraMode {
+    /// This process registers the camera and retries/recovers it (standalone).
+    #[default]
+    Own,
+    /// The tray owns the camera; this sink only writes frames while the
+    /// shared-memory `writer` field says `Engine`.
+    FromTray,
+}
+
 /// An opened virtual camera.
 pub struct VirtualCamera {
     pub sink: Box<dyn FrameSink>,
@@ -55,6 +68,17 @@ pub struct VirtualCamera {
 /// Open this platform's virtual camera. `device` overrides auto-detection where
 /// the platform has device nodes (Linux).
 pub fn open_default(device: Option<&Path>, spec: &OutputSpec) -> anyhow::Result<VirtualCamera> {
+    open_default_mode(device, spec, CameraMode::Own)
+}
+
+/// Like `open_default`; `mode` only matters on Windows (Linux ignores it).
+pub fn open_default_mode(
+    device: Option<&Path>,
+    spec: &OutputSpec,
+    mode: CameraMode,
+) -> anyhow::Result<VirtualCamera> {
+    #[cfg(not(windows))]
+    let _ = mode;
     #[cfg(target_os = "linux")]
     {
         let dev = resolve_device(device, Path::new("/sys"))?;
@@ -70,7 +94,7 @@ pub fn open_default(device: Option<&Path>, spec: &OutputSpec) -> anyhow::Result<
     {
         let _ = device;
         let status = CameraStatus::default();
-        let sink = windows_cam::WinVcamSink::open(spec, status.clone())?;
+        let sink = windows_cam::WinVcamSink::open(spec, status.clone(), mode)?;
         Ok(VirtualCamera {
             sink: Box::new(sink),
             description: "Windows camera \"Page2Cam\"".into(),

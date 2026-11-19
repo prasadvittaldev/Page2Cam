@@ -9,8 +9,8 @@ mod layout;
 
 pub use convert::{fill_nv12, fill_rgb32, nv12_to_nv12, nv12_to_rgb32};
 pub use layout::{
-    dll_version, read_frame, set_dll_version, write_frame, FrameInfo, PixelFormat, ReadError,
-    HEADER_SIZE, MAPPING_SIZE, MAX_HEIGHT, MAX_WIDTH, VERSION,
+    dll_version, read_frame, set_dll_version, set_writer, write_frame, writer, FrameInfo,
+    PixelFormat, ReadError, Writer, HEADER_SIZE, MAPPING_SIZE, MAX_HEIGHT, MAX_WIDTH, VERSION,
 };
 
 /// Name of the shared mapping (the Global namespace spans sessions).
