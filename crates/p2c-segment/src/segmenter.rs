@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use p2c_core::{DurationStats, FrameSlot, MaskSlot, Nv12Slot};
+use p2c_core::{DurationStats, FrameSlot, MaskSlot, Nv12Gate, Nv12Slot};
 use parking_lot::Mutex;
 
 use crate::engine::{Engine, EngineChoice};
@@ -59,7 +59,14 @@ impl Segmenter {
         out: MaskSlot,
         choice: EngineChoice,
     ) -> Segmenter {
-        Self::spawn_nv12(opener, webcam, Nv12Slot::new(), out, choice)
+        Self::spawn_nv12(
+            opener,
+            webcam,
+            Nv12Slot::new(),
+            Nv12Gate::new(),
+            out,
+            choice,
+        )
     }
 
     /// [`Segmenter::spawn`] plus the camera's NV12 slot: when it holds the
@@ -69,10 +76,19 @@ impl Segmenter {
         opener: Opener,
         webcam: FrameSlot,
         nv12: Nv12Slot,
+        gate: Nv12Gate,
         out: MaskSlot,
         choice: EngineChoice,
     ) -> Segmenter {
-        Self::spawn_full(opener, webcam, nv12, out, choice, PolicyTimes::default())
+        Self::spawn_full(
+            opener,
+            webcam,
+            nv12,
+            gate,
+            out,
+            choice,
+            PolicyTimes::default(),
+        )
     }
 
     /// [`Segmenter::spawn`] with other fallback/retry times (tests).
@@ -84,13 +100,22 @@ impl Segmenter {
         choice: EngineChoice,
         times: PolicyTimes,
     ) -> Segmenter {
-        Self::spawn_full(opener, webcam, Nv12Slot::new(), out, choice, times)
+        Self::spawn_full(
+            opener,
+            webcam,
+            Nv12Slot::new(),
+            Nv12Gate::new(),
+            out,
+            choice,
+            times,
+        )
     }
 
     fn spawn_full(
         opener: Opener,
         webcam: FrameSlot,
         nv12: Nv12Slot,
+        gate: Nv12Gate,
         out: MaskSlot,
         choice: EngineChoice,
         times: PolicyTimes,
@@ -114,7 +139,7 @@ impl Segmenter {
         let sh = shared.clone();
         let handle = std::thread::Builder::new()
             .name("p2c-segment".into())
-            .spawn(move || Worker::new(opener, webcam, nv12, out, choice, times).run(&sh))
+            .spawn(move || Worker::new(opener, webcam, nv12, gate, out, choice, times).run(&sh))
             .expect("spawn segmenter thread");
         Segmenter {
             shared,
@@ -165,6 +190,10 @@ struct Worker {
     opener: Opener,
     webcam: FrameSlot,
     nv12: Nv12Slot,
+    gate: Nv12Gate,
+    /// Inferences fed from NV12 / all inferences, for the periodic log line.
+    nv12_hits: u32,
+    infers: u32,
     out: MaskSlot,
     engine: Option<Box<dyn Engine>>,
     smoother: Option<Smoother>,
@@ -204,6 +233,7 @@ impl Worker {
         opener: Opener,
         webcam: FrameSlot,
         nv12: Nv12Slot,
+        gate: Nv12Gate,
         out: MaskSlot,
         choice: EngineChoice,
         times: PolicyTimes,
@@ -212,6 +242,9 @@ impl Worker {
             opener,
             webcam,
             nv12,
+            gate,
+            nv12_hits: 0,
+            infers: 0,
             out,
             engine: None,
             smoother: None,
@@ -263,6 +296,7 @@ impl Worker {
                 self.pending_reset = true;
             }
             self.was_enabled = enabled;
+            self.gate.set(enabled);
             let pause = if enabled { self.step() } else { Some(IDLE) };
             if !enabled {
                 self.masks_per_sec = 0.0;
@@ -373,6 +407,8 @@ impl Worker {
             Some(n) => engine.infer_nv12(&n.frame),
             None => engine.infer(&frame),
         };
+        self.infers += 1;
+        self.nv12_hits += twin.is_some() as u32;
         if let Some(p) = engine.take_prep() {
             self.prep_t.record(p);
         }
@@ -452,6 +488,9 @@ impl Worker {
         if self.last_rate_log.elapsed() >= LOG_EVERY {
             self.last_rate_log = Instant::now();
             let fmt = |s: Option<p2c_core::Summary>| s.map_or("-".to_string(), |s| s.to_string());
+            let (nv12_hits, infers) = (self.nv12_hits, self.infers);
+            self.nv12_hits = 0;
+            self.infers = 0;
             let (infer, post, cycle, prep) = (
                 fmt(self.infer_t.take_summary()),
                 fmt(self.post_t.take_summary()),
@@ -465,7 +504,7 @@ impl Worker {
                     masks_per_sec = format!("{:.1}", self.masks_per_sec),
                     latency_ms = self.latency.as_millis() as u64,
                     cam_ms = self.cam_interval.as_millis() as u64,
-                    "cut-out running: model {infer}; input prep {prep}; clean-up {post}; between masks {cycle}"
+                    "cut-out running: model {infer}; input prep {prep} (nv12 {nv12_hits}/{infers}); clean-up {post}; between masks {cycle}"
                 );
             }
         }
@@ -872,5 +911,70 @@ mod tests {
         assert_eq!(m.data, vec![255; 4]);
         assert_eq!(m.edge, crate::post::profile(EngineChoice::Fast).edge);
         s.stop();
+    }
+}
+
+#[cfg(test)]
+mod nv12_path_tests {
+    use super::*;
+    use p2c_core::{Frame, Nv12Capture, Nv12Frame, Nv12Gate};
+
+    /// Records which entry point the segmenter used.
+    struct Recorder(Arc<Mutex<Vec<&'static str>>>);
+    impl Engine for Recorder {
+        fn infer(&mut self, _: &Frame) -> anyhow::Result<(Vec<f32>, u32, u32)> {
+            self.0.lock().push("bgra");
+            Ok((vec![1.0; 4], 2, 2))
+        }
+        fn infer_nv12(&mut self, _: &Nv12Frame) -> anyhow::Result<(Vec<f32>, u32, u32)> {
+            self.0.lock().push("nv12");
+            Ok((vec![1.0; 4], 2, 2))
+        }
+        fn reset(&mut self) {}
+        fn device(&self) -> Device {
+            Device::Cpu
+        }
+    }
+
+    /// One BGRA frame (seq 1) and an NV12 capture with `tag` and `size`; the
+    /// path the engine saw.
+    fn path_for(tag: u64, size: (u32, u32)) -> (Vec<&'static str>, Nv12Gate) {
+        let (cam, nv, out) = (FrameSlot::new(), Nv12Slot::new(), MaskSlot::new());
+        cam.put(Frame::new_black(16, 8));
+        nv.put(Nv12Capture {
+            bgra_seq: tag,
+            frame: Nv12Frame::new(size.0, size.1, vec![0; (size.0 * size.1 * 3 / 2) as usize])
+                .unwrap(),
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        let opener: Opener =
+            Box::new(move |_| Ok(Box::new(Recorder(s2.clone())) as Box<dyn Engine>));
+        let gate = Nv12Gate::new();
+        let s = Segmenter::spawn_nv12(
+            opener,
+            cam,
+            nv,
+            gate.clone(),
+            out.clone(),
+            EngineChoice::Fast,
+        );
+        s.set_enabled(true);
+        let t = Instant::now();
+        while out.seq() == 0 && t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let wanted = gate.is_on();
+        s.stop();
+        let mut v = seen.lock().clone();
+        v.push(if wanted { "gate-on" } else { "gate-off" });
+        (v, gate)
+    }
+
+    #[test]
+    fn segmenter_uses_nv12_only_for_a_matching_twin() {
+        assert_eq!(path_for(1, (16, 8)).0, ["nv12", "gate-on"], "matching twin");
+        assert_eq!(path_for(0, (16, 8)).0, ["bgra", "gate-on"], "stale tag");
+        assert_eq!(path_for(1, (8, 4)).0, ["bgra", "gate-on"], "different size");
     }
 }

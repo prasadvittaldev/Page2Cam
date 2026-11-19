@@ -23,7 +23,7 @@ use p2c_compositor::{
     CpuProducer, FrameSink, OutputFormat, OutputProducer, OutputSpec, ProducerEvent, Ticker,
 };
 use p2c_core::AudioRing;
-use p2c_core::{FrameSlot, Nv12Slot};
+use p2c_core::{FrameSlot, Nv12Gate, Nv12Slot};
 use p2c_stream::StreamController;
 use p2c_webcam::{list_cameras, pick_camera, WebcamCapture, WebcamStatus};
 use parking_lot::{Mutex, RwLock};
@@ -411,9 +411,16 @@ fn run() -> anyhow::Result<i32> {
     let crop: p2c_core::SharedCrop = Arc::new(RwLock::new(cfg.crop()));
     // NV12 originals of the webcam frames (stays empty for fake/test input).
     let nv12_slot = Nv12Slot::new();
+    let nv12_gate = Nv12Gate::new();
     let webcam = match &cli.fake_webcam {
         Some(img) => start_fake_webcam(img, crop.clone()),
-        None => start_webcam(&cfg, own_device.as_deref(), nv12_slot.clone(), crop.clone()),
+        None => start_webcam(
+            &cfg,
+            own_device.as_deref(),
+            nv12_slot.clone(),
+            nv12_gate.clone(),
+            crop.clone(),
+        ),
     };
     let webcam_status = match &webcam {
         Some((_, WebcamSource::Real(cap), _)) => cap.status(),
@@ -486,6 +493,7 @@ fn run() -> anyhow::Result<i32> {
             &cfg,
             cam.clone(),
             nv12_slot.clone(),
+            nv12_gate.clone(),
             matte.clone(),
             cutout_gpu,
         )
@@ -1059,6 +1067,7 @@ fn start_webcam(
     cfg: &Config,
     own_device: Option<&Path>,
     nv12: Nv12Slot,
+    gate: Nv12Gate,
     crop: p2c_core::SharedCrop,
 ) -> Option<(FrameSlot, WebcamSource, String)> {
     if !cfg.pip_layout().ok()?.visible {
@@ -1072,7 +1081,7 @@ fn start_webcam(
         return None;
     };
     let slot = FrameSlot::new();
-    match WebcamCapture::start(&cam, own_device, slot.clone(), nv12, crop) {
+    match WebcamCapture::start(&cam, own_device, slot.clone(), nv12, gate, crop) {
         Ok(cap) => {
             tracing::info!(webcam = %cam.name, "webcam on");
             Some((slot, WebcamSource::Real(cap), cam.name.clone()))
@@ -1144,6 +1153,7 @@ fn start_segmenter(
     cfg: &Config,
     webcam: FrameSlot,
     nv12: Nv12Slot,
+    gate: Nv12Gate,
     matte: p2c_core::MaskSlot,
     gpu: Option<u32>,
 ) -> p2c_segment::Segmenter {
@@ -1159,7 +1169,7 @@ fn start_segmenter(
         Ok(()) => p2c_segment::open_engine(&models, c, gpu),
         Err(e) => anyhow::bail!("{e}"),
     });
-    p2c_segment::Segmenter::spawn_nv12(opener, webcam, nv12, matte, choice)
+    p2c_segment::Segmenter::spawn_nv12(opener, webcam, nv12, gate, matte, choice)
 }
 
 #[cfg(test)]

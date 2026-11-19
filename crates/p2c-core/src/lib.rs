@@ -12,6 +12,6 @@ pub use audio::{AudioRing, CHANNELS, SAMPLE_RATE};
 pub use crop::{apply_crop, Crop, SharedCrop};
 pub use frame::{Frame, FrameError};
 pub use mask::{EdgeRange, Mask};
-pub use nv12::{bgra_to_nv12, camera_size, crop_nv12, Nv12Capture, Nv12Frame};
+pub use nv12::{bgra_to_nv12, camera_size, crop_nv12, Nv12Capture, Nv12Frame, Nv12Gate};
 pub use slot::{FrameSlot, MaskSlot, Nv12Slot, Slot};
 pub use stats::{DurationStats, RateWindow, Summary};

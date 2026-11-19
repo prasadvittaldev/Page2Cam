@@ -13,7 +13,7 @@ use nokhwa::utils::{
 };
 use nokhwa::Camera;
 use p2c_core::{
-    apply_crop, crop_nv12, Frame, FrameSlot, Nv12Capture, Nv12Frame, Nv12Slot, SharedCrop,
+    apply_crop, crop_nv12, Frame, FrameSlot, Nv12Capture, Nv12Frame, Nv12Gate, Nv12Slot, SharedCrop,
 };
 
 use crate::CameraInfo;
@@ -178,7 +178,7 @@ fn capture_loop<S: FrameSource>(
 }
 
 /// The real camera: nokhwa frames decoded to BGRA.
-struct NokhwaSource(Camera, Option<Nv12Frame>);
+struct NokhwaSource(Camera, Option<Nv12Frame>, Nv12Gate);
 
 impl FrameSource for NokhwaSource {
     fn take_nv12(&mut self) -> Option<Nv12Frame> {
@@ -199,10 +199,7 @@ impl FrameSource for NokhwaSource {
         match crate::decode::to_bgra(fmt, res.width(), res.height(), frame.buffer()) {
             Ok(f) => {
                 if fmt == crate::decode::RawFormat::Nv12 {
-                    let len = res.width() as usize * res.height() as usize * 3 / 2;
-                    self.1 =
-                        Nv12Frame::new(res.width(), res.height(), frame.buffer()[..len].to_vec())
-                            .ok();
+                    self.1 = nv12_twin(res.width(), res.height(), frame.buffer(), &self.2);
                 }
                 Ok(Some(f))
             }
@@ -237,6 +234,7 @@ impl WebcamCapture {
         own_device: Option<&Path>,
         slot: FrameSlot,
         nv12_slot: Nv12Slot,
+        gate: Nv12Gate,
         crop: SharedCrop,
     ) -> anyhow::Result<WebcamCapture> {
         let stop = Arc::new(AtomicBool::new(false));
@@ -255,7 +253,7 @@ impl WebcamCapture {
                 let camera = match open(&cam) {
                     Ok(c) => {
                         let _ = ready_tx.send(Ok(()));
-                        NokhwaSource(c, None)
+                        NokhwaSource(c, None, gate.clone())
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -268,21 +266,15 @@ impl WebcamCapture {
                 let mut first = true;
                 capture_loop(
                     camera,
-                    || reopen(&cam, own_device.as_deref()).map(|c| NokhwaSource(c, None)),
+                    || {
+                        reopen(&cam, own_device.as_deref())
+                            .map(|c| NokhwaSource(c, None, gate.clone()))
+                    },
                     &stop2,
                     reopen_due,
                     &cam.name,
                     |f, nv12| {
-                        let (bgra, nv12) = crop_frames(f, nv12, &crop);
-                        if let Some(frame) = nv12 {
-                            // Before the BGRA put, so a reader that sees BGRA
-                            // frame N always finds its NV12 twin (tag N).
-                            nv12_slot.put(Nv12Capture {
-                                bgra_seq: slot.seq() + 1,
-                                frame,
-                            });
-                        }
-                        slot.put(bgra);
+                        publish_frame(f, nv12, &crop, &slot, &nv12_slot, &gate);
                         let now = Instant::now();
                         if let Some(fps) = rate.tick(now) {
                             tracing::info!(camera = %cam.name, "webcam measured {fps:.1} fps");
@@ -327,6 +319,39 @@ impl WebcamCapture {
     }
 }
 
+/// The NV12 original of a camera buffer, only while the cut-out wants it
+/// (`gate`): copying 1.4 MB per frame is wasted work otherwise. Odd sizes and
+/// short buffers give `None` (the BGRA path covers them).
+fn nv12_twin(width: u32, height: u32, buf: &[u8], gate: &Nv12Gate) -> Option<Nv12Frame> {
+    if !gate.is_on() {
+        return None;
+    }
+    let len = (width as usize * height as usize).checked_mul(3)? / 2;
+    Nv12Frame::new(width, height, buf.get(..len)?.to_vec()).ok()
+}
+
+/// Crop a captured frame, publish its NV12 twin (when wanted and present),
+/// then the BGRA frame. The NV12 goes in first, tagged with the BGRA seq it
+/// will get, so a reader that sees BGRA frame N always finds its twin.
+fn publish_frame(
+    frame: Frame,
+    nv12: Option<Nv12Frame>,
+    crop: &SharedCrop,
+    slot: &FrameSlot,
+    nv12_slot: &Nv12Slot,
+    gate: &Nv12Gate,
+) {
+    let nv12 = nv12.filter(|_| gate.is_on());
+    let (bgra, nv12) = crop_frames(frame, nv12, crop);
+    if let Some(frame) = nv12 {
+        nv12_slot.put(Nv12Capture {
+            bgra_seq: slot.seq() + 1,
+            frame,
+        });
+    }
+    slot.put(bgra);
+}
+
 /// Crop a frame and its NV12 twin with one read of the crop. Both use
 /// `Crop::pixels`, which is always even, so they cover the same rectangle.
 fn crop_frames(
@@ -337,7 +362,7 @@ fn crop_frames(
     let c = *crop.read();
     let nv12 = nv12
         .filter(|n| (n.width, n.height) == (frame.width, frame.height))
-        .map(|n| crop_nv12(&n, &c));
+        .map(|n| crop_nv12(n, &c));
     (apply_crop(frame, &c), nv12)
 }
 
@@ -647,5 +672,64 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::spawn(move || drop(done_tx));
         assert!(join_within(handle, &done_rx, Duration::from_secs(2)));
+    }
+}
+
+#[cfg(test)]
+mod nv12_gate_tests {
+    use super::*;
+    use p2c_core::{Crop, Nv12Gate};
+
+    fn nv12(w: u32, h: u32) -> Nv12Frame {
+        Nv12Frame::new(w, h, vec![100; (w * h * 3 / 2) as usize]).unwrap()
+    }
+
+    #[test]
+    fn nv12_not_published_when_cut_out_is_off() {
+        let (slot, nv_slot, gate) = (FrameSlot::new(), Nv12Slot::new(), Nv12Gate::new());
+        let crop: SharedCrop = Arc::new(parking_lot::RwLock::new(Crop::FULL));
+        publish_frame(
+            Frame::new_black(8, 8),
+            Some(nv12(8, 8)),
+            &crop,
+            &slot,
+            &nv_slot,
+            &gate,
+        );
+        assert_eq!(
+            (slot.seq(), nv_slot.seq()),
+            (1, 0),
+            "BGRA always, NV12 gated"
+        );
+        gate.set(true);
+        publish_frame(
+            Frame::new_black(8, 8),
+            Some(nv12(8, 8)),
+            &crop,
+            &slot,
+            &nv_slot,
+            &gate,
+        );
+        assert_eq!((slot.seq(), nv_slot.seq()), (2, 1));
+        assert_eq!(
+            nv_slot.latest().unwrap().bgra_seq,
+            2,
+            "tagged with its BGRA twin"
+        );
+    }
+
+    #[test]
+    fn odd_camera_size_drops_nv12_twin() {
+        let gate = Nv12Gate::new();
+        gate.set(true);
+        assert!(nv12_twin(8, 8, &[0; 96], &gate).is_some());
+        assert!(nv12_twin(7, 8, &[0; 200], &gate).is_none(), "odd width");
+        assert!(nv12_twin(8, 7, &[0; 200], &gate).is_none(), "odd height");
+        assert!(nv12_twin(8, 8, &[0; 10], &gate).is_none(), "short buffer");
+        gate.set(false);
+        assert!(
+            nv12_twin(8, 8, &[0; 96], &gate).is_none(),
+            "gate off: no copy"
+        );
     }
 }

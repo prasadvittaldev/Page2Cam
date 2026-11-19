@@ -5,5 +5,6 @@ mod format;
 mod pick;
 
 pub use capture::{list_cameras, WebcamCapture, WebcamStatus};
+pub use decode::{to_bgra, RawFormat};
 pub use format::{choose_format, describe_modes};
 pub use pick::{pick_camera, reselect, CameraInfo};

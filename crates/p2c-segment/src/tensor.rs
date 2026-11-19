@@ -179,3 +179,24 @@ mod tests {
         assert!(!nv12_can_feed(&synthetic_nv12(320, 180), 640, 360));
     }
 }
+
+#[cfg(test)]
+mod webcam_equivalence {
+    use super::*;
+    use p2c_webcam::{to_bgra, RawFormat};
+
+    #[test]
+    fn nv12_input_equals_webcam_decode_at_same_size() {
+        let (w, h) = (64usize, 36usize);
+        let mut data: Vec<u8> = (0..w * h).map(|i| (16 + i * 13 % 220) as u8).collect();
+        data.extend((0..w * h / 2).map(|i| (40 + i * 7 % 180) as u8));
+        let n = Nv12Frame::new(w as u32, h as u32, data.clone()).unwrap();
+        let bgra = to_bgra(RawFormat::Nv12, w as u32, h as u32, &data).unwrap();
+        assert_eq!(nv12_to_frame(&n).data, bgra.data, "converted pixels differ");
+        let direct = nv12_to_rgb_f32_nchw(&n, w as u32, h as u32);
+        let via = to_rgb_f32_nchw(&bgra, w as u32, h as u32);
+        for (a, b) in direct.iter().zip(&via) {
+            assert!(((a - b) * 255.0).abs() < 0.01);
+        }
+    }
+}

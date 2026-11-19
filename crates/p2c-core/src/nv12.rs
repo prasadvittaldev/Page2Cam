@@ -40,12 +40,31 @@ pub struct Nv12Capture {
     pub frame: Nv12Frame,
 }
 
+/// Shared "the cut-out wants NV12" switch. The segmenter turns it on while it
+/// is enabled; capture only copies/publishes NV12 frames while it is on.
+#[derive(Clone, Debug, Default)]
+pub struct Nv12Gate(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Nv12Gate {
+    pub fn new() -> Nv12Gate {
+        Nv12Gate::default()
+    }
+
+    pub fn set(&self, on: bool) {
+        self.0.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Cut `crop` out of an NV12 frame with the same rectangle `apply_crop` uses
 /// for BGRA (`Crop::pixels`: all values even, so chroma pairs stay whole).
-pub fn crop_nv12(frame: &Nv12Frame, crop: &crate::Crop) -> Nv12Frame {
+pub fn crop_nv12(frame: Nv12Frame, crop: &crate::Crop) -> Nv12Frame {
     let (x, y, w, h) = crop.pixels(frame.width, frame.height);
     if (x, y, w, h) == (0, 0, frame.width, frame.height) {
-        return frame.clone();
+        return frame;
     }
     let (fw, fh) = (frame.width as usize, frame.height as usize);
     let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
@@ -291,5 +310,27 @@ mod tests {
             "3840x2160 -> 1920x1080: {:.2} ms",
             median_ms(&mk(3840, 2160), 1920, 1080)
         );
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::Crop;
+
+    #[test]
+    fn full_crop_moves_the_nv12_buffer() {
+        let f = Nv12Frame::new(4, 4, vec![7; 24]).unwrap();
+        let p = f.data.as_ptr();
+        assert_eq!(crop_nv12(f, &Crop::FULL).data.as_ptr(), p);
+    }
+
+    #[test]
+    fn gate_is_shared_and_starts_off() {
+        let g = Nv12Gate::new();
+        let g2 = g.clone();
+        assert!(!g.is_on());
+        g2.set(true);
+        assert!(g.is_on());
     }
 }
