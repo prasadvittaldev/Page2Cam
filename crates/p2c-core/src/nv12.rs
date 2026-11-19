@@ -32,6 +32,38 @@ impl Nv12Frame {
     }
 }
 
+/// An NV12 camera frame and the `seq` its BGRA twin got in the webcam
+/// `FrameSlot`, so a consumer can tell whether the two belong together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Nv12Capture {
+    pub bgra_seq: u64,
+    pub frame: Nv12Frame,
+}
+
+/// Cut `crop` out of an NV12 frame with the same rectangle `apply_crop` uses
+/// for BGRA (`Crop::pixels`: all values even, so chroma pairs stay whole).
+pub fn crop_nv12(frame: &Nv12Frame, crop: &crate::Crop) -> Nv12Frame {
+    let (x, y, w, h) = crop.pixels(frame.width, frame.height);
+    if (x, y, w, h) == (0, 0, frame.width, frame.height) {
+        return frame.clone();
+    }
+    let (fw, fh) = (frame.width as usize, frame.height as usize);
+    let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
+    let mut data = Vec::with_capacity(w * h * 3 / 2);
+    for r in y..y + h {
+        data.extend_from_slice(&frame.data[r * fw + x..r * fw + x + w]);
+    }
+    let uv = &frame.data[fw * fh..];
+    for r in y / 2..(y + h) / 2 {
+        data.extend_from_slice(&uv[r * fw + x..r * fw + x + w]);
+    }
+    Nv12Frame {
+        width: w as u32,
+        height: h as u32,
+        data,
+    }
+}
+
 // BT.709 limited range, 16.16 fixed point. Chroma coefficients sum to exactly 0.
 const YR: i32 = 11966;
 const YG: i32 = 40255;

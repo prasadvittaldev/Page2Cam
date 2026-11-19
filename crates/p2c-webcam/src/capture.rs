@@ -12,7 +12,9 @@ use nokhwa::utils::{
     Resolution,
 };
 use nokhwa::Camera;
-use p2c_core::{apply_crop, Frame, FrameSlot, SharedCrop};
+use p2c_core::{
+    apply_crop, crop_nv12, Frame, FrameSlot, Nv12Capture, Nv12Frame, Nv12Slot, SharedCrop,
+};
 
 use crate::CameraInfo;
 
@@ -74,6 +76,12 @@ trait FrameSource {
     /// The next frame; `Ok(None)` skips one (e.g. undecodable), `Err` means
     /// the camera failed and must be reopened, unless it wraps [`Permanent`].
     fn next_frame(&mut self) -> anyhow::Result<Option<Frame>>;
+
+    /// The NV12 original (uncropped) of the frame `next_frame` just returned,
+    /// when the camera delivers NV12. Taken once per frame.
+    fn take_nv12(&mut self) -> Option<Nv12Frame> {
+        None
+    }
 }
 
 /// A failure reopening won't fix (e.g. a pixel format we can't decode):
@@ -108,7 +116,7 @@ fn capture_loop<S: FrameSource>(
     stop: &AtomicBool,
     reopen_due: impl Fn(Option<Instant>, Instant) -> bool,
     name: &str,
-    mut on_frame: impl FnMut(Frame),
+    mut on_frame: impl FnMut(Frame, Option<Nv12Frame>),
     mut on_status: impl FnMut(String),
 ) {
     let mut source = Some(first);
@@ -120,7 +128,8 @@ fn capture_loop<S: FrameSource>(
             Some(s) => match s.next_frame() {
                 Ok(Some(f)) => {
                     frames_since_open = true;
-                    on_frame(f);
+                    let nv12 = s.take_nv12();
+                    on_frame(f, nv12);
                 }
                 Ok(None) => {}
                 Err(e) if e.downcast_ref::<Permanent>().is_some() => {
@@ -169,10 +178,15 @@ fn capture_loop<S: FrameSource>(
 }
 
 /// The real camera: nokhwa frames decoded to BGRA.
-struct NokhwaSource(Camera);
+struct NokhwaSource(Camera, Option<Nv12Frame>);
 
 impl FrameSource for NokhwaSource {
+    fn take_nv12(&mut self) -> Option<Nv12Frame> {
+        self.1.take()
+    }
+
     fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
+        self.1 = None;
         let frame = self.0.frame()?;
         let res = frame.resolution();
         let Some(fmt) = raw_format(frame.source_frame_format()) else {
@@ -183,7 +197,15 @@ impl FrameSource for NokhwaSource {
             .into());
         };
         match crate::decode::to_bgra(fmt, res.width(), res.height(), frame.buffer()) {
-            Ok(f) => Ok(Some(f)),
+            Ok(f) => {
+                if fmt == crate::decode::RawFormat::Nv12 {
+                    let len = res.width() as usize * res.height() as usize * 3 / 2;
+                    self.1 =
+                        Nv12Frame::new(res.width(), res.height(), frame.buffer()[..len].to_vec())
+                            .ok();
+                }
+                Ok(Some(f))
+            }
             Err(e) => {
                 tracing::debug!(error = %e, "dropping undecodable webcam frame");
                 Ok(None)
@@ -214,6 +236,7 @@ impl WebcamCapture {
         cam: &CameraInfo,
         own_device: Option<&Path>,
         slot: FrameSlot,
+        nv12_slot: Nv12Slot,
         crop: SharedCrop,
     ) -> anyhow::Result<WebcamCapture> {
         let stop = Arc::new(AtomicBool::new(false));
@@ -232,7 +255,7 @@ impl WebcamCapture {
                 let camera = match open(&cam) {
                     Ok(c) => {
                         let _ = ready_tx.send(Ok(()));
-                        NokhwaSource(c)
+                        NokhwaSource(c, None)
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -245,12 +268,21 @@ impl WebcamCapture {
                 let mut first = true;
                 capture_loop(
                     camera,
-                    || reopen(&cam, own_device.as_deref()).map(NokhwaSource),
+                    || reopen(&cam, own_device.as_deref()).map(|c| NokhwaSource(c, None)),
                     &stop2,
                     reopen_due,
                     &cam.name,
-                    |f| {
-                        slot.put(crop_frame(f, &crop));
+                    |f, nv12| {
+                        let (bgra, nv12) = crop_frames(f, nv12, &crop);
+                        if let Some(frame) = nv12 {
+                            // Before the BGRA put, so a reader that sees BGRA
+                            // frame N always finds its NV12 twin (tag N).
+                            nv12_slot.put(Nv12Capture {
+                                bgra_seq: slot.seq() + 1,
+                                frame,
+                            });
+                        }
+                        slot.put(bgra);
                         let now = Instant::now();
                         if let Some(fps) = rate.tick(now) {
                             tracing::info!(camera = %cam.name, "webcam measured {fps:.1} fps");
@@ -295,10 +327,18 @@ impl WebcamCapture {
     }
 }
 
-/// Apply the current crop (the lock is read once per frame).
-fn crop_frame(frame: Frame, crop: &SharedCrop) -> Frame {
+/// Crop a frame and its NV12 twin with one read of the crop. Both use
+/// `Crop::pixels`, which is always even, so they cover the same rectangle.
+fn crop_frames(
+    frame: Frame,
+    nv12: Option<Nv12Frame>,
+    crop: &SharedCrop,
+) -> (Frame, Option<Nv12Frame>) {
     let c = *crop.read();
-    apply_crop(frame, &c)
+    let nv12 = nv12
+        .filter(|n| (n.width, n.height) == (frame.width, frame.height))
+        .map(|n| crop_nv12(&n, &c));
+    (apply_crop(frame, &c), nv12)
 }
 
 fn raw_format(f: FrameFormat) -> Option<crate::decode::RawFormat> {
@@ -394,7 +434,7 @@ mod tests {
     fn crop_is_read_per_frame() {
         use p2c_core::{Crop, Frame};
         let shared: SharedCrop = Arc::new(parking_lot::RwLock::new(Crop::FULL));
-        let out = crop_frame(Frame::new_black(8, 8), &shared);
+        let (out, _) = crop_frames(Frame::new_black(8, 8), None, &shared);
         assert_eq!((out.width, out.height), (8, 8));
         *shared.write() = Crop {
             x: 0.0,
@@ -402,8 +442,61 @@ mod tests {
             w: 0.5,
             h: 0.5,
         };
-        let out = crop_frame(Frame::new_black(8, 8), &shared);
+        let (out, _) = crop_frames(Frame::new_black(8, 8), None, &shared);
         assert_eq!((out.width, out.height), (4, 4));
+    }
+
+    #[test]
+    fn nv12_crop_matches_bgra_crop() {
+        use crate::decode::{to_bgra, RawFormat};
+        use p2c_core::Crop;
+        // 16x12 NV12 with distinct Y per pixel and distinct UV per 2x2 block.
+        let (w, h) = (16usize, 12usize);
+        let mut data: Vec<u8> = (0..w * h).map(|i| 30 + (i * 7 % 200) as u8).collect();
+        for i in 0..w * h / 2 {
+            data.push(if i % 2 == 0 {
+                60 + (i * 5 % 120) as u8
+            } else {
+                100 + (i * 3 % 120) as u8
+            });
+        }
+        let bgra = to_bgra(RawFormat::Nv12, w as u32, h as u32, &data).unwrap();
+        let nv = Nv12Frame::new(w as u32, h as u32, data).unwrap();
+        for crop in [
+            Crop::FULL,
+            Crop {
+                x: 0.25,
+                y: 0.25,
+                w: 0.5,
+                h: 0.5,
+            },
+            // not even in pixels: both paths must round the same way
+            Crop {
+                x: 0.33,
+                y: 0.17,
+                w: 0.41,
+                h: 0.59,
+            },
+            Crop {
+                x: 0.9,
+                y: 0.9,
+                w: 0.1,
+                h: 0.1,
+            },
+        ] {
+            let shared: SharedCrop = Arc::new(parking_lot::RwLock::new(crop));
+            let (b, n) = crop_frames(bgra.clone(), Some(nv.clone()), &shared);
+            let n = n.expect("nv12 cropped");
+            assert_eq!((n.width, n.height), (b.width, b.height), "{crop:?}");
+            let back = to_bgra(RawFormat::Nv12, n.width, n.height, &n.data).unwrap();
+            for (x, y) in b.data.iter().zip(&back.data) {
+                assert!((*x as i32 - *y as i32).abs() <= 1, "{crop:?}");
+            }
+        }
+        // A twin of another size is dropped rather than mis-cropped.
+        let shared: SharedCrop = Arc::new(parking_lot::RwLock::new(Crop::FULL));
+        let other = Nv12Frame::new(4, 4, vec![0; 24]).unwrap();
+        assert!(crop_frames(bgra, Some(other), &shared).1.is_none());
     }
 
     #[test]
@@ -456,7 +549,7 @@ mod tests {
                 last.is_none_or(|t| now - t >= Duration::from_millis(10))
             },
             "Cam",
-            |_| {
+            |_, _| {
                 frames += 1;
                 if frames == 4 {
                     stop.store(true, Ordering::Relaxed);
@@ -492,7 +585,7 @@ mod tests {
             &stop,
             reopen_due,
             "Cam",
-            |_| {},
+            |_, _| {},
             |_| {},
         );
         t.join().unwrap();
@@ -519,7 +612,7 @@ mod tests {
             &stop,
             |_: Option<Instant>, _: Instant| true,
             "Cam",
-            |_| {},
+            |_, _| {},
             |s| statuses.push(s),
         );
         assert_eq!(opens.load(Ordering::SeqCst), 0, "not reopened");

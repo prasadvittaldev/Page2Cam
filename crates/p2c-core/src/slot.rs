@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::{Frame, Mask};
+use crate::{Frame, Mask, Nv12Capture};
 
 /// Holds only the newest value. Producers overwrite; consumers read the latest
 /// without draining a queue. `seq` counts puts so consumers can detect staleness.
@@ -12,6 +12,8 @@ pub struct Slot<T> {
 
 /// Latest video frame.
 pub type FrameSlot = Slot<Frame>;
+/// Latest NV12 camera frame, tagged with the sequence of its BGRA twin.
+pub type Nv12Slot = Slot<Nv12Capture>;
 /// Latest cut-out mask.
 pub type MaskSlot = Slot<Mask>;
 
@@ -51,6 +53,13 @@ impl<T> Slot<T> {
 
     pub fn latest(&self) -> Option<Arc<T>> {
         self.inner.lock().0.clone()
+    }
+
+    /// The newest value with its `seq`, read under one lock so the pair
+    /// always belongs together.
+    pub fn latest_with_seq(&self) -> (Option<Arc<T>>, u64) {
+        let g = self.inner.lock();
+        (g.0.clone(), g.1)
     }
 
     pub fn seq(&self) -> u64 {

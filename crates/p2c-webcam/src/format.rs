@@ -4,7 +4,8 @@ use nokhwa::utils::{CameraFormat, FrameFormat};
 /// Pick the mode to request from `formats`:
 /// 1. at least 25 fps (else the highest fps on offer),
 /// 2. resolution closest to 1280x720 by pixel count, never above 1920x1080,
-/// 3. MJPEG, then YUYV, then NV12; formats we cannot decode are skipped.
+/// 3. MJPEG or NV12 (the faster one; NV12 at a tie), then YUYV; formats we
+///    cannot decode are skipped.
 pub fn choose_format(formats: &[CameraFormat]) -> Option<CameraFormat> {
     let decodable: Vec<CameraFormat> = formats
         .iter()
@@ -28,6 +29,8 @@ pub fn choose_format(formats: &[CameraFormat]) -> Option<CameraFormat> {
                 (px - target).abs(),
                 format_rank(f.format()),
                 u32::MAX - f.frame_rate(),
+                // same size and fps: NV12 (no JPEG decode, feeds the cut-out directly)
+                f.format() != FrameFormat::NV12,
             )
         })
 }
@@ -58,9 +61,9 @@ pub fn describe_modes(formats: &[CameraFormat]) -> String {
 /// Lower is better; None = we cannot decode it.
 fn format_rank(f: FrameFormat) -> Option<u8> {
     match f {
-        FrameFormat::MJPEG => Some(0),
+        // NV12 and MJPEG rank equally: fps decides, then NV12 wins the tie.
+        FrameFormat::MJPEG | FrameFormat::NV12 => Some(0),
         FrameFormat::YUYV => Some(1),
-        FrameFormat::NV12 => Some(2),
         _ => None,
     }
 }
@@ -84,11 +87,42 @@ mod tests {
     }
 
     #[test]
-    fn prefers_mjpeg_at_equal_mode() {
+    fn prefers_mjpeg_over_yuyv_at_equal_mode() {
         let got = choose_format(&[
             f(1280, 720, FrameFormat::YUYV, 30),
             f(1280, 720, FrameFormat::MJPEG, 30),
+        ]);
+        assert_eq!(got, Some(f(1280, 720, FrameFormat::MJPEG, 30)));
+    }
+
+    #[test]
+    fn choose_format_prefers_nv12_at_same_mode() {
+        // The integrated webcam: NV12 and MJPEG at 1280x720@30 (and more).
+        let got = choose_format(&[
+            f(1920, 1080, FrameFormat::NV12, 30),
             f(1280, 720, FrameFormat::NV12, 30),
+            f(1280, 960, FrameFormat::NV12, 30),
+            f(640, 360, FrameFormat::NV12, 30),
+            f(640, 480, FrameFormat::NV12, 30),
+            f(1280, 960, FrameFormat::MJPEG, 30),
+            f(1280, 720, FrameFormat::MJPEG, 30),
+            f(640, 480, FrameFormat::MJPEG, 30),
+            f(640, 360, FrameFormat::MJPEG, 30),
+            f(1280, 720, FrameFormat::YUYV, 30),
+        ]);
+        assert_eq!(got, Some(f(1280, 720, FrameFormat::NV12, 30)));
+    }
+
+    #[test]
+    fn choose_format_keeps_mjpeg_when_it_is_faster() {
+        let got = choose_format(&[
+            f(1280, 720, FrameFormat::NV12, 15),
+            f(1280, 720, FrameFormat::MJPEG, 30),
+        ]);
+        assert_eq!(got, Some(f(1280, 720, FrameFormat::MJPEG, 30)));
+        let got = choose_format(&[
+            f(1280, 720, FrameFormat::NV12, 25),
+            f(1280, 720, FrameFormat::MJPEG, 30),
         ]);
         assert_eq!(got, Some(f(1280, 720, FrameFormat::MJPEG, 30)));
     }

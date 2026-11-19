@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use p2c_core::{DurationStats, FrameSlot, MaskSlot};
+use p2c_core::{DurationStats, FrameSlot, MaskSlot, Nv12Slot};
 use parking_lot::Mutex;
 
 use crate::engine::{Engine, EngineChoice};
@@ -59,13 +59,38 @@ impl Segmenter {
         out: MaskSlot,
         choice: EngineChoice,
     ) -> Segmenter {
-        Self::spawn_with(opener, webcam, out, choice, PolicyTimes::default())
+        Self::spawn_nv12(opener, webcam, Nv12Slot::new(), out, choice)
+    }
+
+    /// [`Segmenter::spawn`] plus the camera's NV12 slot: when it holds the
+    /// twin of the webcam frame being processed, the model input is built
+    /// from it instead of from the BGRA frame.
+    pub fn spawn_nv12(
+        opener: Opener,
+        webcam: FrameSlot,
+        nv12: Nv12Slot,
+        out: MaskSlot,
+        choice: EngineChoice,
+    ) -> Segmenter {
+        Self::spawn_full(opener, webcam, nv12, out, choice, PolicyTimes::default())
     }
 
     /// [`Segmenter::spawn`] with other fallback/retry times (tests).
+    #[cfg(test)]
     fn spawn_with(
         opener: Opener,
         webcam: FrameSlot,
+        out: MaskSlot,
+        choice: EngineChoice,
+        times: PolicyTimes,
+    ) -> Segmenter {
+        Self::spawn_full(opener, webcam, Nv12Slot::new(), out, choice, times)
+    }
+
+    fn spawn_full(
+        opener: Opener,
+        webcam: FrameSlot,
+        nv12: Nv12Slot,
         out: MaskSlot,
         choice: EngineChoice,
         times: PolicyTimes,
@@ -89,7 +114,7 @@ impl Segmenter {
         let sh = shared.clone();
         let handle = std::thread::Builder::new()
             .name("p2c-segment".into())
-            .spawn(move || Worker::new(opener, webcam, out, choice, times).run(&sh))
+            .spawn(move || Worker::new(opener, webcam, nv12, out, choice, times).run(&sh))
             .expect("spawn segmenter thread");
         Segmenter {
             shared,
@@ -139,6 +164,7 @@ const LOG_EVERY: Duration = Duration::from_secs(30);
 struct Worker {
     opener: Opener,
     webcam: FrameSlot,
+    nv12: Nv12Slot,
     out: MaskSlot,
     engine: Option<Box<dyn Engine>>,
     smoother: Option<Smoother>,
@@ -146,6 +172,8 @@ struct Worker {
     /// published masks, for the periodic log line.
     infer_t: DurationStats,
     post_t: DurationStats,
+    /// Time turning the frame into model input (NV12 or BGRA path).
+    prep_t: DurationStats,
     cycle_t: DurationStats,
     last_mask_at: Option<Instant>,
     /// Engine we want running: the operator's choice, or Fast after a fallback.
@@ -175,6 +203,7 @@ impl Worker {
     fn new(
         opener: Opener,
         webcam: FrameSlot,
+        nv12: Nv12Slot,
         out: MaskSlot,
         choice: EngineChoice,
         times: PolicyTimes,
@@ -182,11 +211,13 @@ impl Worker {
         Worker {
             opener,
             webcam,
+            nv12,
             out,
             engine: None,
             smoother: None,
             infer_t: DurationStats::default(),
             post_t: DurationStats::default(),
+            prep_t: DurationStats::default(),
             cycle_t: DurationStats::default(),
             last_mask_at: None,
             target: choice,
@@ -318,7 +349,13 @@ impl Worker {
         }
         self.last_seq = seq;
         self.last_seq_at = Some(now);
-        let frame = self.webcam.latest()?;
+        let (frame, frame_seq) = self.webcam.latest_with_seq();
+        let frame = frame?;
+        // The NV12 twin: tagged with the BGRA frame it came with, same size.
+        let twin = self.nv12.latest().filter(|n| {
+            n.bgra_seq == frame_seq
+                && (n.frame.width, n.frame.height) == (frame.width, frame.height)
+        });
 
         let engine = self.engine.as_mut()?;
         let size = (frame.width, frame.height);
@@ -332,7 +369,13 @@ impl Worker {
         self.last_size = Some(size);
 
         let t = Instant::now();
-        let result = engine.infer(&frame);
+        let result = match &twin {
+            Some(n) => engine.infer_nv12(&n.frame),
+            None => engine.infer(&frame),
+        };
+        if let Some(p) = engine.take_prep() {
+            self.prep_t.record(p);
+        }
         let took = t.elapsed();
         self.infer_t.record(took);
         let edge = profile(self.active.unwrap_or(self.target)).edge;
@@ -409,10 +452,11 @@ impl Worker {
         if self.last_rate_log.elapsed() >= LOG_EVERY {
             self.last_rate_log = Instant::now();
             let fmt = |s: Option<p2c_core::Summary>| s.map_or("-".to_string(), |s| s.to_string());
-            let (infer, post, cycle) = (
+            let (infer, post, cycle, prep) = (
                 fmt(self.infer_t.take_summary()),
                 fmt(self.post_t.take_summary()),
                 fmt(self.cycle_t.take_summary()),
+                fmt(self.prep_t.take_summary()),
             );
             if let (Some(a), Some(d)) = (self.active, self.device) {
                 tracing::info!(
@@ -421,7 +465,7 @@ impl Worker {
                     masks_per_sec = format!("{:.1}", self.masks_per_sec),
                     latency_ms = self.latency.as_millis() as u64,
                     cam_ms = self.cam_interval.as_millis() as u64,
-                    "cut-out running: model {infer}; clean-up {post}; between masks {cycle}"
+                    "cut-out running: model {infer}; input prep {prep}; clean-up {post}; between masks {cycle}"
                 );
             }
         }
