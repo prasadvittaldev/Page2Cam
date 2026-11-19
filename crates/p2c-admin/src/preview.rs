@@ -63,6 +63,26 @@ pub(crate) fn encode_preview(f: &Frame) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
+const SNAPSHOT_W: u32 = 1280;
+const SNAPSHOT_H: u32 = 720;
+
+/// Encode an output frame as a 1280x720 JPEG (quality 80), on demand.
+pub fn encode_snapshot(f: &Frame) -> anyhow::Result<Vec<u8>> {
+    let small = if (f.width, f.height) == (SNAPSHOT_W, SNAPSHOT_H) {
+        f.clone()
+    } else {
+        scale_frame(f, SNAPSHOT_W, SNAPSHOT_H)
+    };
+    let mut out = Vec::with_capacity(160 * 1024);
+    jpeg_encoder::Encoder::new(&mut out, 80).encode(
+        &small.data,
+        small.width as u16,
+        small.height as u16,
+        jpeg_encoder::ColorType::Bgra,
+    )?;
+    Ok(out)
+}
+
 /// Encoder thread: while anyone is subscribed, publish the newest frame as JPEG.
 pub(crate) fn spawn_encoder(
     slot: FrameSlot,

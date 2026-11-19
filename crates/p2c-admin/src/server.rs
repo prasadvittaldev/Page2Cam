@@ -21,6 +21,7 @@ use crate::api::{
 };
 use crate::input::{map_preview, normalize_url};
 use crate::preview::spawn_encoder;
+use crate::tray::TrayLink;
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const LOGO_PNG: &[u8] = include_bytes!("../ui/logo.png");
@@ -74,6 +75,7 @@ pub(crate) struct State {
     width: u32,
     height: u32,
     preview: Arc<watch::Sender<Jpeg>>,
+    tray: Option<Arc<TrayLink>>,
 }
 
 impl State {
@@ -92,6 +94,7 @@ impl State {
             width,
             height,
             preview: Arc::new(tx),
+            tray: TrayLink::global(),
         }
     }
 }
@@ -115,6 +118,9 @@ pub(crate) fn router(st: State) -> Router {
         .route("/api/stream/stop", post(stream_stop))
         .route("/api/audio", post(audio))
         .route("/api/crop", get(crop_get).post(crop_set))
+        .route("/api/input", post(input))
+        .route("/api/snapshot", get(snapshot))
+        .route("/api/agents", get(agents).post(agents))
         .route("/ws", get(ws))
         .layer(middleware::from_fn_with_state(st.clone(), guard))
         .with_state(st)
@@ -375,6 +381,184 @@ async fn crop_set(AxState(st): AxState<State>, Json(b): Json<CropBody>) -> Json<
     Json(c)
 }
 
+fn json_error(code: StatusCode, msg: &str) -> Response {
+    (code, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+/// `POST /api/input` from agents: x/y are 0..1 of the output frame.
+#[derive(Deserialize)]
+struct InputBody {
+    kind: String,
+    x: Option<f32>,
+    y: Option<f32>,
+    dx: Option<f32>,
+    dy: Option<f32>,
+    key: Option<String>,
+    text: Option<String>,
+}
+
+const MAX_TEXT_CHARS: usize = 10_000;
+
+/// Windows virtual-key code for a named key.
+fn named_key(name: &str) -> Option<i32> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "enter" | "return" => 13,
+        "tab" => 9,
+        "escape" | "esc" => 27,
+        "backspace" => 8,
+        "delete" | "del" => 46,
+        "space" => 32,
+        "arrowleft" | "left" => 37,
+        "arrowup" | "up" => 38,
+        "arrowright" | "right" => 39,
+        "arrowdown" | "down" => 40,
+        "home" => 36,
+        "end" => 35,
+        "pageup" => 33,
+        "pagedown" => 34,
+        _ => return None,
+    })
+}
+
+fn input_events(b: InputBody, w: u32, h: u32) -> Result<Vec<InputEvent>, String> {
+    let key = |action, code, ch| InputEvent::Key {
+        action,
+        code,
+        ch,
+        mods: 0,
+    };
+    match b.kind.as_str() {
+        "click" | "move" | "scroll" => {
+            let (Some(x), Some(y)) = (b.x, b.y) else {
+                return Err("x and y are required".into());
+            };
+            if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
+                return Err("x and y must be between 0 and 1".into());
+            }
+            let (px, py) = map_preview(x as f64, y as f64, w, h);
+            Ok(match b.kind.as_str() {
+                "move" => vec![InputEvent::Move {
+                    x: px,
+                    y: py,
+                    mods: 0,
+                }],
+                "click" => {
+                    let btn = |down| InputEvent::Button {
+                        x: px,
+                        y: py,
+                        button: MouseBtn::Left,
+                        down,
+                        clicks: 1,
+                        mods: 0,
+                    };
+                    vec![
+                        InputEvent::Move {
+                            x: px,
+                            y: py,
+                            mods: 0,
+                        },
+                        btn(true),
+                        btn(false),
+                    ]
+                }
+                _ => {
+                    let px_of = |v: Option<f32>| {
+                        v.filter(|v| v.is_finite())
+                            .unwrap_or(0.0)
+                            .clamp(-100_000.0, 100_000.0) as i32
+                    };
+                    vec![InputEvent::Wheel {
+                        x: px,
+                        y: py,
+                        dx: px_of(b.dx),
+                        dy: px_of(b.dy),
+                        mods: 0,
+                    }]
+                }
+            })
+        }
+        "key" => {
+            let name = b.key.ok_or("key is required")?;
+            let code = named_key(&name).ok_or_else(|| format!("unknown key {name:?}"))?;
+            let mut v = vec![key(KeyAction::Down, code, 0)];
+            if code == 13 {
+                v.push(key(KeyAction::Char, 13, 13));
+            }
+            v.push(key(KeyAction::Up, code, 0));
+            Ok(v)
+        }
+        "text" => {
+            let text = b.text.ok_or("text is required")?;
+            if text.chars().count() > MAX_TEXT_CHARS {
+                return Err(format!("text is longer than {MAX_TEXT_CHARS} characters"));
+            }
+            Ok(text
+                .encode_utf16()
+                .map(|u| key(KeyAction::Char, 0, u))
+                .collect())
+        }
+        other => Err(format!("unknown input kind {other:?}")),
+    }
+}
+
+async fn input(AxState(st): AxState<State>, Json(b): Json<InputBody>) -> Response {
+    match input_events(b, st.width, st.height) {
+        Ok(events) => {
+            for ev in events {
+                st.controls.input(ev);
+            }
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(e) => json_error(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+async fn snapshot(AxState(st): AxState<State>) -> Response {
+    let controls = st.controls.clone();
+    let jpg = tokio::task::spawn_blocking(move || controls.snapshot())
+        .await
+        .ok()
+        .flatten();
+    match jpg {
+        Some(b) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            b,
+        )
+            .into_response(),
+        None => json_error(StatusCode::SERVICE_UNAVAILABLE, "no frame yet"),
+    }
+}
+
+/// `/api/agents`: forwarded to the tray's `/tray/agents`.
+async fn agents(
+    AxState(st): AxState<State>,
+    method: axum::http::Method,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(link) = st.tray.clone() else {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "tray not available");
+    };
+    let is_post = method == axum::http::Method::POST;
+    let res = tokio::task::spawn_blocking(move || {
+        link.request(
+            if is_post { "POST" } else { "GET" },
+            is_post.then_some(&body[..]),
+        )
+    })
+    .await;
+    match res {
+        Ok(Ok((code, bytes))) => (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
+            [(header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response(),
+        _ => json_error(StatusCode::BAD_GATEWAY, "tray did not answer"),
+    }
+}
 async fn ws(AxState(st): AxState<State>, up: WebSocketUpgrade) -> Response {
     up.on_upgrade(move |socket| handle_ws(st, socket))
 }
@@ -555,6 +739,8 @@ mod tests {
             pub crop: Mutex<CropDto>,
             /// The `save` flag of every `set_crop` call.
             pub crop_saves: Mutex<Vec<bool>>,
+            pub events: Mutex<Vec<InputEvent>>,
+            pub snap: Mutex<Option<Vec<u8>>>,
         }
 
         fn gpu(name: &str, kind: &str) -> GpuInfo {
@@ -569,7 +755,12 @@ mod tests {
                 self.navigated.lock().unwrap().push(url.into());
             }
             fn nav(&self, _a: NavAction) {}
-            fn input(&self, _ev: InputEvent) {}
+            fn input(&self, ev: InputEvent) {
+                self.events.lock().unwrap().push(ev);
+            }
+            fn snapshot(&self) -> Option<Vec<u8>> {
+                self.snap.lock().unwrap().clone()
+            }
             fn pip(&self) -> PipLayout {
                 *self.pip.lock().unwrap()
             }
@@ -1301,5 +1492,217 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(fake.streams.lock().unwrap()[0].key, "k-1");
+    }
+
+    async fn input_post(fake: Arc<Fake>, body: &str) -> (StatusCode, String) {
+        let r = app(fake)
+            .oneshot(req(
+                "POST",
+                "/api/input",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        (r.status(), body_string(r).await)
+    }
+
+    #[tokio::test]
+    async fn input_route_maps_output_coords_to_page_px() {
+        let fake = Arc::new(Fake::default());
+        let (code, _) = input_post(fake.clone(), r#"{"kind":"click","x":0.5,"y":0.5}"#).await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _) = input_post(
+            fake.clone(),
+            r#"{"kind":"scroll","x":0.25,"y":0.5,"dx":0,"dy":-120}"#,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _) = input_post(fake.clone(), r#"{"kind":"key","key":"Enter"}"#).await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _) = input_post(fake.clone(), r#"{"kind":"text","text":"hi"}"#).await;
+        assert_eq!(code, StatusCode::OK);
+        let ev = fake.events.lock().unwrap().clone();
+        assert_eq!(
+            ev[0],
+            InputEvent::Move {
+                x: 960,
+                y: 540,
+                mods: 0
+            }
+        );
+        assert_eq!(
+            ev[1],
+            InputEvent::Button {
+                x: 960,
+                y: 540,
+                button: MouseBtn::Left,
+                down: true,
+                clicks: 1,
+                mods: 0
+            }
+        );
+        assert!(matches!(
+            ev[2],
+            InputEvent::Button {
+                down: false,
+                x: 960,
+                y: 540,
+                ..
+            }
+        ));
+        assert_eq!(
+            ev[3],
+            InputEvent::Wheel {
+                x: 480,
+                y: 540,
+                dx: 0,
+                dy: -120,
+                mods: 0
+            }
+        );
+        // Enter: down, char, up. "hi": two chars.
+        assert!(matches!(
+            ev[4],
+            InputEvent::Key {
+                action: KeyAction::Down,
+                code: 13,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ev[5],
+            InputEvent::Key {
+                action: KeyAction::Char,
+                ch: 13,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ev[6],
+            InputEvent::Key {
+                action: KeyAction::Up,
+                code: 13,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ev[7],
+            InputEvent::Key {
+                action: KeyAction::Char,
+                ch: 104,
+                ..
+            }
+        ));
+        assert_eq!(ev.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn input_route_rejects_out_of_range() {
+        let fake = Arc::new(Fake::default());
+        for body in [
+            r#"{"kind":"click","x":1.5,"y":0.5}"#,
+            r#"{"kind":"move","x":0.5,"y":-0.1}"#,
+            r#"{"kind":"click","y":0.5}"#,
+            r#"{"kind":"key","key":"Nope"}"#,
+            r#"{"kind":"fly","x":0.5,"y":0.5}"#,
+        ] {
+            let (code, text) = input_post(fake.clone(), body).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
+            assert!(text.contains("\"error\""), "{text}");
+        }
+        let long = format!(r#"{{"kind":"text","text":"{}"}}"#, "a".repeat(10_001));
+        let (code, _) = input_post(fake.clone(), &long).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(fake.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_route_returns_jpeg_or_503() {
+        let fake = Arc::new(Fake::default());
+        let get = |fake: Arc<Fake>| async move {
+            app(fake)
+                .oneshot(req(
+                    "GET",
+                    "/api/snapshot",
+                    "127.0.0.1:8765",
+                    Some(TOKEN),
+                    None,
+                ))
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            get(fake.clone()).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        *fake.snap.lock().unwrap() = Some(vec![0xff, 0xd8, 0xff, 0xd9]);
+        let r = get(fake).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()["content-type"], "image/jpeg");
+        assert_eq!(
+            r.into_body().collect().await.unwrap().to_bytes().as_ref(),
+            [0xff, 0xd8, 0xff, 0xd9]
+        );
+    }
+
+    #[test]
+    fn snapshot_encoder_makes_1280x720_jpeg() {
+        let f = p2c_core::Frame::new_black(1920, 1080);
+        let jpg = crate::preview::encode_snapshot(&f).unwrap();
+        assert_eq!(&jpg[..2], &[0xff, 0xd8]);
+        // SOF0 marker holds height then width.
+        let i = jpg.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
+        let h = u16::from_be_bytes([jpg[i + 5], jpg[i + 6]]);
+        let w = u16::from_be_bytes([jpg[i + 7], jpg[i + 8]]);
+        assert_eq!((w, h), (1280, 720));
+    }
+
+    #[tokio::test]
+    async fn agents_route_without_tray_is_503() {
+        for method in ["GET", "POST"] {
+            let r = app(Arc::default())
+                .oneshot(req(
+                    method,
+                    "/api/agents",
+                    "127.0.0.1:8765",
+                    Some(TOKEN),
+                    (method == "POST").then_some(r#"{"allowed":true}"#),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body_string(r).await, r#"{"error":"tray not available"}"#);
+        }
+    }
+
+    #[tokio::test]
+    async fn new_routes_require_token_and_host() {
+        let fake = Arc::new(Fake::default());
+        *fake.snap.lock().unwrap() = Some(vec![1]);
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/api/input",
+                Some(r#"{"kind":"click","x":0.5,"y":0.5}"#),
+            ),
+            ("GET", "/api/snapshot", None),
+            ("GET", "/api/agents", None),
+            ("POST", "/api/agents", Some(r#"{"allowed":true}"#)),
+        ] {
+            for (host, token) in [
+                ("127.0.0.1:8765", None),
+                ("127.0.0.1:8765", Some("wrong")),
+                ("evil.test:8765", Some(TOKEN)),
+            ] {
+                let r = app(fake.clone())
+                    .oneshot(req(method, uri, host, token, body))
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), StatusCode::FORBIDDEN, "{method} {uri} {host}");
+            }
+        }
+        assert!(fake.events.lock().unwrap().is_empty());
     }
 }

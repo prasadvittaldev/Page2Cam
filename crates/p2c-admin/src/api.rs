@@ -219,6 +219,9 @@ pub struct Status {
     pub cutout_gpu: String,
     /// Health over the last ~10 s, for the tray's icon.
     pub health: Health,
+    /// Agents may control Page2Cam (read from the tray). `None` without a tray.
+    #[serde(default)]
+    pub agents_allowed: Option<bool>,
 }
 
 /// Engine health for the tray (rates over a rolling ~10 s window).
@@ -297,4 +300,7 @@ pub trait Controls: Send + Sync + 'static {
     /// Apply a crop (clamped through `Crop::clamp`) from the next webcam
     /// frame on; `save` also writes it to the settings file.
     fn set_crop(&self, c: CropDto, save: bool);
+    /// The latest output frame as a 1280x720 JPEG (quality 80), encoded on
+    /// demand; `None` before the first frame.
+    fn snapshot(&self) -> Option<Vec<u8>>;
 }

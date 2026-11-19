@@ -75,6 +75,8 @@ pub struct App {
     pub ticker_stats: Arc<p2c_compositor::TickerStats>,
     /// Recent samples for the health rates.
     pub health_window: Mutex<crate::health::HealthWindow>,
+    /// Latest output frame (shared with the preview sink); snapshots encode from it on demand.
+    pub output_frame: FrameSlot,
 }
 
 /// Lock `m` for the status/health readers. Debug builds panic if it stays
@@ -493,6 +495,7 @@ impl Controls for App {
             gpu_choice: gpu_saved,
             gpu_running: self.gpu_running.clone(),
             health,
+            agents_allowed: p2c_admin::TrayLink::global().map(|l| l.allowed()),
         }
     }
 
@@ -568,6 +571,17 @@ impl Controls for App {
 
     fn set_crop(&self, c: p2c_admin::CropDto, save: bool) {
         change_crop(&self.crop, self.settings_path.as_deref(), c.into(), save);
+    }
+
+    fn snapshot(&self) -> Option<Vec<u8>> {
+        let frame = self.output_frame.latest()?;
+        match p2c_admin::encode_snapshot(&frame) {
+            Ok(jpg) => Some(jpg),
+            Err(e) => {
+                tracing::warn!(error = %e, "snapshot encode failed");
+                None
+            }
+        }
     }
 }
 
@@ -945,6 +959,7 @@ mod tests {
             quit_main: Mutex::new(None),
             ticker_stats: Arc::default(),
             health_window: Mutex::new(Default::default()),
+            output_frame: FrameSlot::new(),
         }
     }
 

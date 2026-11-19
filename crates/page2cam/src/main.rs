@@ -556,6 +556,7 @@ fn run() -> anyhow::Result<i32> {
         quit_main: Mutex::new(None),
         ticker_stats: ticker.stats(),
         health_window: Mutex::new(Default::default()),
+        output_frame: preview.clone(),
     });
 
     // Applies to the next stream start; a live stream is not restarted.

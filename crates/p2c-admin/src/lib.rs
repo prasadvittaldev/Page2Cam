@@ -6,11 +6,13 @@ mod api;
 mod input;
 mod preview;
 mod server;
+mod tray;
 
 pub use api::{
     AudioSettings, Controls, CropDto, GpuInfo, Health, InputEvent, KeyAction, MouseBtn, NavAction,
     Status, StreamRequest, UpdateInfo,
 };
 pub use input::{map_preview, normalize_url};
-pub use preview::PreviewSink;
+pub use preview::{encode_snapshot, PreviewSink};
 pub use server::{serve, AdminConfig, AdminServer, PortUnavailable};
+pub use tray::TrayLink;
