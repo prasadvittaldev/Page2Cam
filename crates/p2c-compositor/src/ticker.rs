@@ -128,6 +128,12 @@ pub trait OutputProducer: Send {
     fn producer_note(&self) -> Option<ComposeNote> {
         None
     }
+    /// A request to hand over to the CPU compositor now (checked after each
+    /// successful `produce`; the CPU then draws the same tick). For things
+    /// this producer can't draw, e.g. backdrops without their GPU shaders.
+    fn fallback_request(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// How many ticks of the last `PIPELINE_WINDOW` ticks are looked at for the
@@ -483,6 +489,14 @@ impl ProducerSlot {
         let r = self.produce_once(inputs, preview_due);
         let Err(e) = r else {
             self.errors = 0;
+            if !self.fell_back {
+                if let Some(reason) = self.producer.fallback_request() {
+                    self.fall_back(reason, has_prev);
+                    if self.fell_back {
+                        return self.produce_once(inputs, preview_due);
+                    }
+                }
+            }
             return r;
         };
         self.errors += 1;
@@ -1352,6 +1366,31 @@ mod tests {
             .map(|w| w[1].0.duration_since(w[0].0))
             .max()
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn producer_fallback_request_hands_over_at_once() {
+        // A producer that can't draw what it is asked holds (Ok(None)) and
+        // asks for the CPU: the switch happens on that very tick.
+        struct CantDraw;
+        impl OutputProducer for CantDraw {
+            fn produce(&mut self, _: &TickInputs, _: bool) -> anyhow::Result<Option<Output>> {
+                Ok(None)
+            }
+            fn name(&self) -> String {
+                "CantDraw".into()
+            }
+            fn fallback_request(&mut self) -> Option<String> {
+                Some("backdrop shaders missing".into())
+            }
+        }
+        let (samples, t, rx) = spawn_fake(Box::new(CantDraw), red_page());
+        let ev = rx.recv_timeout(Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(150));
+        t.stop();
+        let ProducerEvent::Failed(reason) = ev.expect("no handover");
+        assert!(reason.contains("backdrop shaders missing"), "{reason}");
+        assert_eq!(samples.lock().last().map(|s| s.1), Some(RED), "CPU frames");
     }
 
     #[test]

@@ -2055,42 +2055,111 @@ fn gpu_refined_and_blur_within_budget() {
     assert!(over.is_empty(), "over the 2 ms budget: {over:?}");
 }
 
-/// If the backdrop shaders can't be compiled, the GPU keeps drawing
-/// Page/Room (no error, so no fallback to the CPU) and says why in the note.
+/// If the backdrop shaders can't be compiled, Page/Room keeps working on
+/// the GPU, but a backdrop that needs them (blur, image, colour, refined
+/// edges) is handed to the CPU compositor at once: never the sharp room
+/// under a blur setting.
 #[test]
-fn gpu_backdrop_shader_failure_draws_page_room() {
+fn gpu_backdrop_shader_failure_hands_backdrops_to_cpu() {
+    use p2c_compositor::{FrameSink, Output, ProducerEvent, Ticker};
+    use p2c_core::{FrameSlot, MaskSlot};
     let page = noise(640, 360, 91);
     let cam = person_cam(320, 180);
     let m = person_mask();
-    let inputs = ti(
-        &cam,
-        Some(&m),
-        layout(OverlayStyle::Box, 0.3, 0.5, 0.4),
-        backdrop(FullBackdrop::Page, BoxBackdrop::Blur, true),
-    );
-    let mut plain = inputs.clone();
-    plain.backdrop = Backdrop::default();
-    let (want, _) = cpu_compose(Some(&page), (640, 360), &plain);
-    for a in adapters_or_skip("gpu_backdrop_shader_failure_draws_page_room") {
+    let box_l = layout(OverlayStyle::Box, 0.3, 0.5, 0.4);
+    let small = layout(OverlayStyle::CutoutSmall, 1.0, 0.0, 0.5);
+    let room = ti(&cam, Some(&m), box_l, Backdrop::default());
+    let needs: [(&str, TickInputs); 2] = [
+        (
+            "box + in-box blur",
+            ti(
+                &cam,
+                Some(&m),
+                box_l,
+                backdrop(FullBackdrop::Page, BoxBackdrop::Blur, false),
+            ),
+        ),
+        (
+            "blurred room",
+            ti(
+                &cam,
+                Some(&m),
+                small,
+                backdrop(FullBackdrop::BlurredRoom, BoxBackdrop::Room, false),
+            ),
+        ),
+    ];
+    for a in adapters_or_skip("gpu_backdrop_shader_failure_hands_backdrops_to_cpu") {
         let gpu = Gpu::new(a.luid).unwrap();
+        // The producer alone: Page/Room drawn here; backdrops held + handed over.
         let mut p = producer(&gpu, Some(&page), (640, 360));
         p.fail_backdrop_shaders_for_test();
-        for _ in 0..3 {
-            p.produce(&inputs, false).expect("no producer failure");
-        }
-        assert_eq!(
-            p.producer_note(),
-            Some(ComposeNote::BackdropUnavailable),
-            "{}",
-            a.name
-        );
-        let got = p.render_bgra_for_test(&inputs).unwrap();
-        let (mean, d, x, y) = mean_and_max(&want, &got);
-        println!("shader failure on {}: mean {mean:.3}, max {d}", a.name);
-        assert!(d <= 2, "{}: {d} at ({x},{y})", a.name);
-        // Page/Room inputs carry no note.
-        p.produce(&plain, false).unwrap();
+        p.produce(&room, false).unwrap();
         assert_eq!(p.producer_note(), None, "{}", a.name);
+        assert!(p.fallback_request().is_none(), "{}", a.name);
+        let got = p.render_bgra_for_test(&room).unwrap();
+        let (want, _) = cpu_compose(Some(&page), (640, 360), &room);
+        let (_, d, x, y) = mean_and_max(&want, &got);
+        assert!(d <= 2, "{} page/room: {d} at ({x},{y})", a.name);
+        for (what, inputs) in &needs {
+            let out = p.produce(inputs, false).unwrap();
+            assert!(out.is_none(), "{} {what}: drew without the shaders", a.name);
+            assert_eq!(
+                p.producer_note(),
+                Some(ComposeNote::BackdropUnavailable),
+                "{} {what}",
+                a.name
+            );
+            let why = p.fallback_request().expect("hand-over requested");
+            assert!(why.contains("shaders"), "{why}");
+        }
+
+        // In the ticker: the CPU compositor takes over and draws the backdrop.
+        struct Rec(Arc<std::sync::Mutex<Vec<Output>>>);
+        impl FrameSink for Rec {
+            fn push(&mut self, out: &Output) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(out.clone());
+                Ok(())
+            }
+        }
+        for (what, inputs) in &needs {
+            let mut p = producer(&gpu, Some(&page), (640, 360));
+            p.fail_backdrop_shaders_for_test();
+            let page_slot = FrameSlot::new();
+            page_slot.put(page.clone());
+            let cam_slot = FrameSlot::new();
+            cam_slot.put_arc(cam.clone());
+            let mask_slot = MaskSlot::new();
+            mask_slot.put_arc(m.clone());
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let t = Ticker::spawn(
+                spec(640, 360),
+                Some(page_slot),
+                Some(cam_slot),
+                Some(mask_slot),
+                Arc::new(parking_lot::RwLock::new(inputs.layout)),
+                Arc::new(parking_lot::RwLock::new(inputs.backdrop.clone())),
+                Box::new(p),
+                vec![Box::new(Rec(seen.clone()))],
+                tx,
+            );
+            let ev = rx.recv_timeout(Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(200));
+            t.stop();
+            let ProducerEvent::Failed(reason) = ev.expect("no hand-over to the CPU");
+            assert!(reason.contains("shaders"), "{reason}");
+            let seen = seen.lock().unwrap();
+            assert!(!seen.is_empty(), "{} {what}: no frames", a.name);
+            // Every frame pushed is the CPU's backdrop frame (none from the GPU).
+            let (cpu, _) = cpu_compose(Some(&page), (640, 360), inputs);
+            let want = bgra_to_nv12(&cpu, 640, 360);
+            for o in seen.iter() {
+                let got = o.nv12.as_ref().expect("nv12");
+                assert_eq!(got.data, want.data, "{} {what}: not the CPU frame", a.name);
+            }
+            println!("{what} on {}: handed to the CPU ({reason})", a.name);
+        }
     }
 }
 

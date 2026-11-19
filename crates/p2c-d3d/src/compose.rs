@@ -22,7 +22,6 @@
 //! the exact filter is used (unscaled, downscaled, letterbox), within 8 (mean
 //! ≤ 1) where an upscaled webcam/mask uses the hardware bilinear sampler.
 
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -316,8 +315,10 @@ pub struct GpuProducer {
     layer_builds: u64,
     /// Backdrop / refined-edge shaders (from the background compile).
     backdrop: Option<BackdropShaders>,
-    /// They failed to compile: backdrops are drawn as Page/Room.
-    backdrop_failed: bool,
+    /// Why they failed to compile (backdrops then go to the CPU compositor).
+    backdrop_failed: Option<String>,
+    /// A pending request to hand over to the CPU compositor.
+    fallback: Option<String>,
     /// The note for the status line while backdrops are off on this GPU.
     note: Option<ComposeNote>,
     /// Blurred webcam for the box (in-box Blur) and for the whole frame.
@@ -407,7 +408,8 @@ impl GpuProducer {
             layer: None,
             layer_builds: 0,
             backdrop: None,
-            backdrop_failed: false,
+            backdrop_failed: None,
+            fallback: None,
             note: None,
             box_blur: GpuBlur::new(),
             room_blur: GpuBlur::new(),
@@ -474,8 +476,10 @@ impl GpuProducer {
     /// readback rings.
     #[doc(hidden)]
     pub fn render_bgra_for_test(&mut self, inputs: &TickInputs) -> Result<Frame> {
-        let inputs = self.effective(inputs);
-        self.composite(self.page.seq(), &inputs)?;
+        if !self.can_draw(inputs) {
+            bail!("backdrop shaders unavailable on this GPU");
+        }
+        self.composite(self.page.seq(), inputs)?;
         self.gpu.read_bgra(&self.target)
     }
 
@@ -568,12 +572,12 @@ impl GpuProducer {
 
     /// Whether the backdrop shaders can be used, creating them from the
     /// background-compiled bytecode on first need. A compile failure is
-    /// logged once and leaves backdrops off (Page/Room drawn, with a note).
+    /// logged once; see [`GpuProducer::can_draw`].
     fn backdrop_available(&mut self) -> bool {
         if self.backdrop.is_some() {
             return true;
         }
-        if self.backdrop_failed {
+        if self.backdrop_failed.is_some() {
             return false;
         }
         let made = match crate::backdrop::blobs() {
@@ -583,11 +587,12 @@ impl GpuProducer {
         match made {
             Ok(s) => self.backdrop = Some(s),
             Err(e) => {
+                let e = format!("{e:#}");
                 tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "GPU backdrop shaders unavailable; drawing the page and room without backgrounds"
+                    error = %e,
+                    "GPU backdrop shaders unavailable; backgrounds and refined edges go to the CPU compositor"
                 );
-                self.backdrop_failed = true;
+                self.backdrop_failed = Some(e);
             }
         }
         self.backdrop.is_some()
@@ -597,24 +602,29 @@ impl GpuProducer {
     #[doc(hidden)]
     pub fn fail_backdrop_shaders_for_test(&mut self) {
         self.backdrop = None;
-        self.backdrop_failed = true;
+        self.backdrop_failed = Some("failed for a test".into());
     }
 
-    /// The inputs actually drawn: without backdrop shaders, the backdrop
-    /// falls back to Page/Room with LUT edges and the producer note says so.
-    fn effective<'a>(&mut self, inputs: &'a TickInputs) -> Cow<'a, TickInputs> {
+    /// Whether `inputs` can be drawn here. A backdrop that needs the backdrop
+    /// shaders (blur, image, colour, refined edges) can't be when they
+    /// failed to compile: drawing Page/Room instead would show the sharp
+    /// room under a blur setting, so this asks the ticker to hand over to
+    /// the CPU compositor ([`OutputProducer::fallback_request`]) and the
+    /// note says why. Page/Room keeps working on the GPU.
+    fn can_draw(&mut self, inputs: &TickInputs) -> bool {
         let b = &inputs.backdrop;
         let wants =
             b.full != FullBackdrop::Page || b.in_box != BoxBackdrop::Room || b.refined_edges;
         self.note = None;
         if !wants || self.backdrop_available() {
-            return Cow::Borrowed(inputs);
+            return true;
         }
         self.note = Some(ComposeNote::BackdropUnavailable);
-        Cow::Owned(TickInputs {
-            backdrop: Backdrop::default(),
-            ..inputs.clone()
-        })
+        let why = self.backdrop_failed.as_deref().unwrap_or("unknown error");
+        self.fallback = Some(format!(
+            "GPU backdrop shaders failed to compile ({why}); backgrounds need the CPU compositor"
+        ));
+        false
     }
 
     /// Render webcam x mask into the layer texture (only when its inputs or
@@ -1070,12 +1080,18 @@ impl OutputProducer for GpuProducer {
     fn producer_note(&self) -> Option<ComposeNote> {
         self.note
     }
+
+    fn fallback_request(&mut self) -> Option<String> {
+        self.fallback.take()
+    }
 }
 
 impl GpuProducer {
     fn produce_inner(&mut self, inputs: &TickInputs, preview_due: bool) -> Result<Option<Output>> {
-        let eff = self.effective(inputs);
-        let inputs: &TickInputs = &eff;
+        if !self.can_draw(inputs) {
+            // Nothing drawn: the ticker repeats the last output and hands over.
+            return Ok(None);
+        }
         let key = Key::of(self.page.seq(), inputs);
         let changed = !self.last_key.as_ref().is_some_and(|k| k.same_as(&key));
         let fresh = if changed {

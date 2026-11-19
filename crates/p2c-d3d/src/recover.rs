@@ -365,4 +365,8 @@ impl OutputProducer for RecoveringProducer {
     fn producer_note(&self) -> Option<p2c_compositor::ComposeNote> {
         self.producer.producer_note()
     }
+
+    fn fallback_request(&mut self) -> Option<String> {
+        self.producer.fallback_request()
+    }
 }
