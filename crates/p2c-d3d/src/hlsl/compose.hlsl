@@ -2,16 +2,23 @@
 // (Box: opaque; cut-out: webcam x remapped mask, premultiplied, blended
 // ONE / INV_SRC_ALPHA over the page by the output-merger).
 //
-// Mirrors p2c_compositor::Compositor: scaling is the same separable
+// The PIP is built into a layer texture at the PIP rectangle's size
+// (ps_compose) only when the webcam, mask or size changes, and drawn 1:1
+// every tick (ps_layer).
+//
+// Mirrors p2c_compositor::Compositor: downscaling uses the same separable
 // triangle ("bilinear convolution") filter as fast_image_resize, which
 // widens the kernel when downscaling; values are rounded to 0..255 where the
 // CPU stores bytes (scaled webcam, scaled mask, edge remap, premultiply).
+// Upscales (where that filter is plain bilinear interpolation) may use the
+// hardware bilinear sampler instead (cam_linear / mask_linear).
 //
-// Both passes draw the fullscreen triangle of nv12.hlsl into a viewport set
+// All passes draw the fullscreen triangle of nv12.hlsl into a viewport set
 // to the destination rectangle (x may be negative: the cut-out overhang).
 
-Texture2D<float4> src : register(t0);   // page or webcam (BGRA)
+Texture2D<float4> src : register(t0);   // page, webcam or PIP layer (BGRA)
 Texture2D<float> mask : register(t1);   // person mask (R8)
+SamplerState lin : register(s0);        // bilinear, clamp
 
 cbuffer PassConsts : register(b0) {
     float4 rect;      // destination rectangle in output pixels: x, y, w, h
@@ -21,6 +28,9 @@ cbuffer PassConsts : register(b0) {
     float edge_lo;    // EdgeRange.lo
     float edge_hi;    // EdgeRange.hi
     uint edge_full;   // 1 = leave the mask as it is (EdgeRange::FULL or hi <= lo)
+    uint cam_linear;  // 1 = scale src with the hardware bilinear sampler
+    uint mask_linear; // 1 = scale the mask with the hardware bilinear sampler
+    float2 pad;
 };
 
 // Weight of source pixel `i` for a destination pixel whose centre maps to
@@ -111,13 +121,36 @@ struct VsOut {
 
 float4 ps_compose(VsOut i) : SV_Target {
     float2 p = i.pos.xy - rect.xy; // destination-local pixel centre
-    float4 c = resample_rgba(p, src_size, rect.zw);
+    // Bilinear sampling at p / dsize puts the destination centre at
+    // p * scale source pixels, like the convolution.
+    // (if/else, not ?: — HLSL evaluates both sides of ?:.)
+    float4 c;
+    [branch] if (cam_linear != 0) {
+        c = round_up4(src.SampleLevel(lin, p / rect.zw, 0) * 255.0);
+    } else {
+        c = resample_rgba(p, src_size, rect.zw);
+    }
     if (mode == 0) {
         return float4(c.rgb / 255.0, 1.0);
     }
-    float m = resample_mask(p, mask_size, rect.zw);
+    float m;
+    [branch] if (mask_linear != 0) {
+        m = round_up(mask.SampleLevel(lin, p / rect.zw, 0) * 255.0);
+    } else {
+        m = resample_mask(p, mask_size, rect.zw);
+    }
     float a = edge_remap(m);
     // Premultiply like the CPU: (c * a + 127) / 255 in integers.
     uint3 pm = (uint3(c.rgb) * uint(a) + 127) / 255;
     return float4(float3(pm) / 255.0, a / 255.0);
+}
+
+// The cached PIP layer (premultiplied, at the rectangle's size), 1:1.
+float4 ps_layer(VsOut i) : SV_Target {
+    return src.Load(int3(int2(i.pos.xy - rect.xy), 0));
+}
+
+// Plain bilinear scaling (the admin preview at a downscale of at most 2).
+float4 ps_sample(VsOut i) : SV_Target {
+    return src.SampleLevel(lin, (i.pos.xy - rect.xy) / rect.zw, 0);
 }

@@ -364,14 +364,51 @@ fn bgra_diff(a: &Frame, b: &Frame) -> (u8, u32, u32) {
     worst
 }
 
+/// Mean absolute difference per channel (B, G, R, A) over the whole frame.
+fn bgra_mean_diff(a: &Frame, b: &Frame) -> [f64; 4] {
+    let mut sum = [0u64; 4];
+    for (i, (x, y)) in a.data.iter().zip(&b.data).enumerate() {
+        sum[i % 4] += u64::from(x.abs_diff(*y));
+    }
+    let n = (a.width as u64 * a.height as u64).max(1) as f64;
+    sum.map(|s| s as f64 / n)
+}
+
+/// Allowed GPU-vs-CPU difference: max per channel, and mean per channel.
+#[derive(Clone, Copy)]
+struct Tol {
+    max: u8,
+    mean: f64,
+}
+
+/// Unscaled, letterbox, Box geometry, edge remap: the exact filter (±2).
+const STRICT: Tol = Tol { max: 2, mean: 1.0 };
+/// Upscaled webcam/mask in the cached PIP layer use the hardware bilinear
+/// sampler (R41), which differs from fast_image_resize's byte-rounded
+/// two-pass convolution by a little on noise, more where a steep edge
+/// remap amplifies a mask difference.
+const SCALED_PIP: Tol = Tol { max: 8, mean: 1.0 };
+
 /// GPU BGRA intermediate vs the CPU `Compositor` on identical inputs (±2).
 fn parity_case(
+    label: &str,
+    page: &Frame,
+    out: (u32, u32),
+    cam: Option<Arc<Frame>>,
+    mask: Option<Arc<Mask>>,
+    layout: PipLayout,
+) {
+    parity_case_tol(label, page, out, cam, mask, layout, STRICT)
+}
+
+fn parity_case_tol(
     label: &str,
     page: &Frame,
     (ow, oh): (u32, u32),
     cam: Option<Arc<Frame>>,
     mask: Option<Arc<Mask>>,
     layout: PipLayout,
+    tol: Tol,
 ) {
     let page_arc = Arc::new(page.clone());
     let mut cpu = Frame::new_black(ow, oh);
@@ -392,13 +429,24 @@ fn parity_case(
         };
         let got = p.render_bgra_for_test(&inputs).unwrap();
         let (d, x, y) = bgra_diff(&cpu, &got);
-        println!("{label} on {}: max diff {d} at ({x},{y})", a.name);
+        let mean = bgra_mean_diff(&cpu, &got);
+        println!(
+            "{label} on {}: max diff {d} at ({x},{y}), mean {:.3?}",
+            a.name, mean
+        );
         assert!(
-            d <= 2,
-            "{label} on {}: diff {d} at ({x},{y}): cpu {:?} gpu {:?}",
+            d <= tol.max,
+            "{label} on {}: diff {d} > {} at ({x},{y}): cpu {:?} gpu {:?}",
             a.name,
+            tol.max,
             cpu.pixel(x, y),
             got.pixel(x, y)
+        );
+        assert!(
+            mean.iter().all(|m| *m <= tol.mean),
+            "{label} on {}: mean diff {mean:?} > {}",
+            a.name,
+            tol.mean
         );
     }
 }
@@ -429,26 +477,28 @@ fn parity_box() {
 #[test]
 #[ignore]
 fn parity_cutout_small() {
-    parity_case(
+    parity_case_tol(
         "cutout small",
         &noise(640, 360, 3),
         (640, 360),
         Some(Arc::new(noise(320, 180, 4))),
         Some(soft_mask(80, 45, EdgeRange::FULL)),
         layout(OverlayStyle::CutoutSmall, 0.7, 0.0, 0.4),
+        SCALED_PIP,
     );
 }
 
 #[test]
 #[ignore]
 fn parity_cutout_full_overhang_left() {
-    parity_case(
+    parity_case_tol(
         "cutout full x=0",
         &noise(640, 360, 5),
         (640, 360),
         Some(Arc::new(noise(320, 180, 6))),
         Some(soft_mask(160, 90, EdgeRange::FULL)),
         layout(OverlayStyle::CutoutFull, 0.0, 0.0, 0.25),
+        SCALED_PIP,
     );
 }
 
@@ -466,14 +516,117 @@ fn parity_mask_edge_range() {
         layout(OverlayStyle::CutoutFull, 0.5, 0.0, 0.25),
     );
     // And a soft mask through the same edge range.
-    parity_case(
+    parity_case_tol(
         "edge range, soft mask",
         &noise(640, 360, 9),
         (640, 360),
         Some(Arc::new(noise(320, 240, 10))),
         Some(soft_mask(64, 48, EdgeRange { lo: 64, hi: 192 })),
         layout(OverlayStyle::CutoutSmall, 0.2, 0.0, 0.5),
+        SCALED_PIP,
     );
+}
+
+/// The live case: 1080p output, 1280x720 webcam and 640x360 mask, both
+/// upscaled into the cut-out-full rectangle.
+#[test]
+#[ignore]
+fn parity_cutout_full_1080p_live_sizes() {
+    parity_case_tol(
+        "cutout full 1080p",
+        &noise(1920, 1080, 41),
+        (1920, 1080),
+        Some(Arc::new(noise(1280, 720, 42))),
+        Some(soft_mask(640, 360, EdgeRange { lo: 40, hi: 220 })),
+        layout(OverlayStyle::CutoutFull, 0.5, 0.0, 0.25),
+        SCALED_PIP,
+    );
+}
+
+/// R41: the scaled webcam x mask layer is built only when the webcam, mask,
+/// style or PIP size changes; page-only changes and moves reuse it.
+#[test]
+#[ignore]
+fn gpu_pip_layer_rebuilt_only_on_change() {
+    let page = noise(640, 360, 43);
+    for a in hardware() {
+        let gpu = Gpu::new(a.luid).unwrap();
+        let input = PageInput::new(&gpu, 640, 360).unwrap();
+        let shared = gpu.create_shared_bgra(&page).unwrap();
+        let mut p = GpuProducer::new(gpu.clone(), input.clone(), spec(640, 360)).unwrap();
+        let cam = Arc::new(noise(320, 180, 44));
+        let mask = soft_mask(160, 90, EdgeRange { lo: 40, hi: 220 });
+        let mut inputs = TickInputs {
+            page: None,
+            cam: Some(cam.clone()),
+            mask: Some(mask.clone()),
+            layout: layout(OverlayStyle::CutoutSmall, 0.3, 0.0, 0.4),
+        };
+        // The page changes every tick (animated page): one layer build.
+        for _ in 0..5 {
+            input.on_shared_texture(shared.handle()).unwrap();
+            p.produce(&inputs, false).unwrap();
+        }
+        assert_eq!(p.layer_builds(), 1, "{}: page-only changes", a.name);
+        // Moving the PIP (same size) reuses the layer.
+        inputs.layout.x = 0.8;
+        p.produce(&inputs, false).unwrap();
+        assert_eq!(p.layer_builds(), 1, "{}: move", a.name);
+        // A new mask, a new webcam frame, a new size, a new style: rebuilt.
+        inputs.mask = Some(soft_mask(160, 90, EdgeRange { lo: 40, hi: 220 }));
+        p.produce(&inputs, false).unwrap();
+        assert_eq!(p.layer_builds(), 2, "{}: new mask", a.name);
+        inputs.cam = Some(Arc::new((*cam).clone()));
+        p.produce(&inputs, false).unwrap();
+        assert_eq!(p.layer_builds(), 3, "{}: new webcam frame", a.name);
+        inputs.layout.width = 0.6;
+        inputs.layout.style = OverlayStyle::Box;
+        p.produce(&inputs, false).unwrap();
+        assert_eq!(p.layer_builds(), 4, "{}: Box", a.name);
+        inputs.layout.width = 0.3;
+        p.produce(&inputs, false).unwrap();
+        assert_eq!(p.layer_builds(), 5, "{}: resize", a.name);
+        // Unchanged inputs: nothing rebuilt (and the drain/None semantics hold).
+        for _ in 0..4 {
+            p.produce(&inputs, false).unwrap();
+        }
+        assert_eq!(p.layer_builds(), 5, "{}: unchanged", a.name);
+        // The moved, cached layer still matches the CPU compositor.
+        let page_arc = Arc::new(page.clone());
+        for (l, m) in [
+            (
+                layout(OverlayStyle::CutoutSmall, 0.3, 0.0, 0.4),
+                Some(&mask),
+            ),
+            (
+                layout(OverlayStyle::CutoutSmall, 0.9, 0.0, 0.4),
+                Some(&mask),
+            ),
+        ] {
+            let inputs = TickInputs {
+                page: None,
+                cam: Some(cam.clone()),
+                mask: m.cloned(),
+                layout: l,
+            };
+            let got = p.render_bgra_for_test(&inputs).unwrap();
+            let mut cpu = Frame::new_black(640, 360);
+            let pip = Pip {
+                cam: &cam,
+                mask: m,
+                layout: &l,
+            };
+            Compositor::new().compose(Some(&page_arc), Some(pip), &mut cpu);
+            let (d, x, y) = bgra_diff(&cpu, &got);
+            let mean = bgra_mean_diff(&cpu, &got);
+            println!(
+                "cached layer at x={} on {}: max {d}, mean {mean:.3?}",
+                l.x, a.name
+            );
+            assert!(d <= SCALED_PIP.max, "{}: diff {d} at ({x},{y})", a.name);
+            assert!(mean.iter().all(|m| *m <= SCALED_PIP.mean), "{}", a.name);
+        }
+    }
 }
 
 #[test]
@@ -675,6 +828,91 @@ fn bench_compose_1080p_cutout_full() {
             pct(1.0).as_secs_f64() * 1e3,
             times.len()
         );
+    }
+}
+
+/// GPU time per pass (D3D11 timestamps) of a live-like 1080p cut-out-full run:
+/// the page changes every tick (animated page), webcam and mask on 2 ticks of
+/// 3 (~20/s at 30 fps), a preview is due every other tick.
+#[test]
+#[ignore]
+fn bench_compose_gpu_passes_1080p() {
+    let page = noise(1920, 1080, 31);
+    let cams: Vec<_> = (0..4).map(|i| Arc::new(noise(1280, 720, 32 + i))).collect();
+    let masks: Vec<_> = (0..4)
+        .map(|i| {
+            soft_mask(
+                640,
+                360,
+                EdgeRange {
+                    lo: 40,
+                    hi: 220 + i,
+                },
+            )
+        })
+        .collect();
+    for (style, width) in [
+        (OverlayStyle::CutoutFull, 0.25),
+        (OverlayStyle::CutoutSmall, 0.3),
+        (OverlayStyle::Box, 0.25),
+    ] {
+        for a in hardware() {
+            let gpu = Gpu::new(a.luid).unwrap();
+            let input = PageInput::new(&gpu, 1920, 1080).unwrap();
+            let shared = gpu.create_shared_bgra(&page).unwrap();
+            let mut p = GpuProducer::new(gpu.clone(), input.clone(), spec(1920, 1080)).unwrap();
+            p.set_profiling(true);
+            let l = layout(style, 0.5, 1.0, width);
+            let mut passes: Vec<(&'static str, Vec<f64>)> = Vec::new();
+            let mut totals = Vec::new();
+            let mut cam = cams[0].clone();
+            let mut mask = masks[0].clone();
+            for i in 0..150usize {
+                input.on_shared_texture(shared.handle()).unwrap();
+                if i % 3 != 2 {
+                    cam = Arc::new((*cams[i % 4]).clone());
+                    mask = masks[i % 4].clone();
+                }
+                let inputs = TickInputs {
+                    page: None,
+                    cam: Some(cam.clone()),
+                    mask: Some(mask.clone()),
+                    layout: l,
+                };
+                p.produce(&inputs, i % 2 == 0).unwrap();
+                let Some(prof) = p.take_profile() else {
+                    continue;
+                };
+                if i < 20 {
+                    continue;
+                }
+                totals.push(prof.iter().map(|(_, ms)| ms).sum::<f64>());
+                for (name, ms) in prof {
+                    match passes.iter_mut().find(|(n, _)| *n == name) {
+                        Some((_, v)) => v.push(ms),
+                        None => passes.push((name, vec![ms])),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let p95 = |v: &Vec<f64>| v[((v.len() - 1) as f64 * 0.95) as usize];
+            let mut line = String::new();
+            for (name, v) in &mut passes {
+                let m = med(v);
+                line += &format!(" {name} {m:.3}");
+            }
+            let total = med(&mut totals);
+            println!(
+                "gpu passes {style:?} on {}: total median {total:.3} ms p95 {:.3} ms (~{:.1}% at 30 fps) |{line} (ms, median per tick)",
+                a.name,
+                p95(&totals),
+                total * 30.0 / 10.0,
+            );
+        }
     }
 }
 

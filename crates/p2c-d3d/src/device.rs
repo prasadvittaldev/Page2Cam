@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Multithread,
     ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_BIND_FLAG,
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_QUERY_EVENT,
     D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
     D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
@@ -438,6 +438,14 @@ impl Gpu {
                 )
                 .context("CreateSharedHandle")?;
             self.inner.ctx.Flush();
+            // Wait until the initial data is on the GPU: a device opening the
+            // handle reads through another resource object, which the driver
+            // doesn't order after this upload (NVIDIA intermittently showed
+            // an empty page in the parity tests).
+            let ev = crate::profile::query(self, D3D11_QUERY_EVENT)?;
+            self.inner.ctx.End(&ev);
+            self.inner.ctx.Flush();
+            let _done: windows::core::BOOL = crate::profile::wait_data(self, &ev)?;
             Ok(SharedTexture {
                 handle,
                 _tex: t.tex,

@@ -8,6 +8,8 @@ pub mod device;
 #[cfg(windows)]
 pub mod page;
 #[cfg(windows)]
+mod profile;
+#[cfg(windows)]
 pub mod readback;
 #[cfg(windows)]
 pub mod recover;

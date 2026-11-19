@@ -69,7 +69,7 @@ pub(crate) struct Shaders {
     pub(crate) vs_fullscreen: ID3D11VertexShader,
     ps_y: ID3D11PixelShader,
     ps_uv: ID3D11PixelShader,
-    linear_clamp: ID3D11SamplerState,
+    pub(crate) linear_clamp: ID3D11SamplerState,
     /// 16-byte constant buffer for the NV12 pass.
     nv12_cb: ID3D11Buffer,
 }
