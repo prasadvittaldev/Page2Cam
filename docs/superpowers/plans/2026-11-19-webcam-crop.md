@@ -95,6 +95,26 @@
 
 ---
 
-### Task 4: Update the test copy for the user
+### Task 4: Stop dangling Page2Cam processes at start
+
+**Files:**
+- Create: `crates/page2cam/src/instances.rs`; Modify: `crates/page2cam/src/main.rs`
+
+**Interfaces:**
+- Produces:
+  - `pub struct Proc { pub pid: u32, pub parent: u32, pub name: String, pub path: Option<PathBuf> }`
+  - `pub fn to_stop(procs: &[Proc], me: u32) -> Vec<u32>` (pure): every process named `page2cam.exe` (Windows, case-insensitive) / `page2cam` (Linux) except `me` and any process whose parent chain reaches `me` (our own CEF helpers). Orphaned helpers of a dead instance and other main instances (any install path) are included.
+  - `pub fn stop_others(me: u32) -> Vec<u32>` (Windows: ToolHelp32 snapshot + `TerminateProcess` (exit code 1), then wait up to 3 s for each to exit; Linux: `/proc` scan + SIGTERM, then SIGKILL after 3 s). Logs each stopped pid and path at warn level ("stopped a leftover Page2Cam process").
+  - main.rs: call `stop_others(std::process::id())` in `run()` right after the `--wait-for-pid` wait and before opening the virtual camera, webcam or admin port. Skip it inside CEF subprocesses (they return earlier via `maybe_run_subprocess`).
+
+- [ ] **Step 1: Failing tests** (pure `to_stop`): `stops_other_main_instance`, `keeps_own_helpers` (child and grandchild of `me`), `stops_orphaned_helpers_of_dead_instance` (parent pid not in the list), `ignores_other_programs`, `name_match_is_case_insensitive_on_windows`.
+- [ ] **Step 2: Run** `cargo test -p page2cam instances` → fail.
+- [ ] **Step 3: Implement**; manual check: start a debug instance with `--no-open --admin-port 8796 --test-pattern --config <scratch toml>`, then a second one with port 8795 → the second logs that it stopped the first; kill the second afterwards. Never touch the user's running installed/test copy during this check: run it only when `dist\test-build\page2cam.exe` and the Program Files copy are NOT running (check first; if they are, skip the manual check and say so).
+- [ ] **Step 4: Run** `cargo test --workspace`, clippy (Windows + Linux-target for page2cam if it builds there; otherwise note alsa-sys), `cargo fmt`.
+- [ ] **Step 5: Commit** `feat: stop leftover Page2Cam processes at start`.
+
+---
+
+### Task 5: Update the test copy for the user
 
 - [ ] **Step 1:** `cargo build --release -p page2cam`; if no `page2cam.exe` from `dist\test-build` is running, copy `target\release\page2cam.exe` there (verify hash); otherwise report that the user must close it. The camera DLL is unchanged by this plan (verify by hash) — no reinstall.
