@@ -1,4 +1,5 @@
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 pub const MAX_WIDTH: u32 = 1920;
 pub const MAX_HEIGHT: u32 = 1080;
@@ -51,11 +52,7 @@ pub(crate) struct Header {
     dll_version: u32,
     /// Who may write frames (`Writer`); set only by the tray. Old DLLs ignore it.
     writer: AtomicU32,
-    _pad: [u8; 4],
-    /// Wall clock (ms) when the current writer took the lock (odd `seq`); 0
-    /// when not writing. Lets another writer reclaim a lock a dead one left.
-    lock_since_ms: AtomicU64,
-    _pad2: [u8; 8],
+    _pad: [u8; 20],
 }
 
 const _: () = assert!(std::mem::size_of::<Header>() == HEADER_SIZE);
@@ -84,8 +81,29 @@ pub enum ReadError {
     Format { found: u32 },
 }
 
-/// Write one tightly packed frame. Returns false if it doesn't fit or the
-/// size is invalid (NV12 needs even width/height).
+/// A writer's local view of a lock it found held (odd `seq`): the odd value and
+/// when *this process* first saw it. Staleness is decided only from this
+/// writer's own monotonic clock (no shared timestamp), so two writers can't
+/// both conclude "stale" from one stored time; a reclaim is a CAS from the one
+/// observed value, which only one of them can win. Keep one per writer
+/// (`Default` is fine); `FrameWriter` holds it.
+#[derive(Default, Debug)]
+pub struct StaleState {
+    seen: Option<(u64, Instant)>,
+}
+
+/// A lock observed unchanged for longer than this (by the observer's own
+/// clock) belongs to a dead or stalled writer and may be reclaimed.
+const STALE_LOCK: Duration = Duration::from_millis(500);
+
+/// Write one tightly packed frame. Returns false if it doesn't fit, the size
+/// is invalid (NV12 needs even width/height), another writer holds the lock
+/// (frame skipped: retry next tick), or the lock was reclaimed from us mid-write
+/// (nothing more is written; the reader never accepts the partial frame).
+///
+/// Locking: seq even `s` -> odd `s+1` by CAS; finish with CAS `s+1` -> `s+2`.
+/// seq only ever increases, so a stalled writer whose lock was reclaimed finds
+/// its end-CAS failing and cannot make seq odd/backwards.
 ///
 /// # Safety
 /// `base` must point to a writable, 8-byte aligned mapping of `MAPPING_SIZE` bytes.
@@ -96,11 +114,22 @@ pub unsafe fn write_frame(
     height: u32,
     data: &[u8],
     time_ms: u64,
+    stale: &mut StaleState,
 ) -> bool {
-    write_frame_at(base, fmt, width, height, data, time_ms, wall_ms())
+    write_frame_at(
+        base,
+        fmt,
+        width,
+        height,
+        data,
+        time_ms,
+        stale,
+        Instant::now(),
+    )
 }
 
-/// `write_frame` with an injected clock (for the stale-lock test).
+/// `write_frame` with an injected clock (tests).
+#[allow(clippy::too_many_arguments)]
 unsafe fn write_frame_at(
     base: *mut u8,
     fmt: PixelFormat,
@@ -108,7 +137,8 @@ unsafe fn write_frame_at(
     height: u32,
     data: &[u8],
     time_ms: u64,
-    now_ms: u64,
+    stale: &mut StaleState,
+    now: Instant,
 ) -> bool {
     let len = fmt.frame_len(width, height);
     if width == 0
@@ -122,57 +152,65 @@ unsafe fn write_frame_at(
     }
     let hp = base as *mut Header;
     let h = &*hp;
-    // Try-lock: seq even -> odd. Another writer mid-write (odd) or a lost race
-    // means skip this frame, so two writers never overlap.
-    let s = h.seq.load(Ordering::Acquire);
-    let s = if s.is_multiple_of(2) {
+    let cur = h.seq.load(Ordering::Acquire);
+    // `s`: the even value our lock is based on; our lock value is `s + 1`.
+    let s = if cur.is_multiple_of(2) {
+        stale.seen = None;
         if h.seq
-            .compare_exchange(s, s + 1, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return false;
         }
-        s
+        cur
     } else {
-        // Odd: a writer is busy, or died mid-write (e.g. killed). Reclaim only
-        // after the lock has been held for more than STALE_LOCK_MS.
-        let since = h.lock_since_ms.load(Ordering::Acquire);
-        if since == 0
-            || now_ms.saturating_sub(since) <= STALE_LOCK_MS
-            || h.seq
-                .compare_exchange(s, s + 2, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
+        // Held. Reclaim only if we have seen this same odd value for 500 ms.
+        match stale.seen {
+            Some((v, since)) if v == cur => {
+                if now.saturating_duration_since(since) <= STALE_LOCK {
+                    return false;
+                }
+            }
+            _ => {
+                stale.seen = Some((cur, now));
+                return false;
+            }
+        }
+        // cur -> cur + 2 (odd, ours, distinct from the old holder's cur + 1
+        // end value, so its end-CAS fails); only one reclaimer wins.
+        if h.seq
+            .compare_exchange(cur, cur + 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
+            stale.seen = None;
             return false;
         }
-        s + 1
+        stale.seen = None;
+        cur + 1
     };
-    h.lock_since_ms.store(now_ms, Ordering::Release);
-    // Fields are only touched while holding the lock; readers re-check seq.
+    let mine = s + 1;
+    fence(Ordering::Release);
+    // Fields are written only while holding the lock; bail if it was taken
+    // from us (a long stall right after locking). A tiny window between this
+    // check and the copy remains; the end-CAS and the reader's seq re-check
+    // make a frame that overlapped a reclaim unacceptable to the reader only
+    // if seq moved, which a reclaim does.
+    if h.seq.load(Ordering::Acquire) != mine {
+        return false;
+    }
     std::ptr::write_volatile(std::ptr::addr_of_mut!((*hp).magic), MAGIC);
     std::ptr::write_volatile(std::ptr::addr_of_mut!((*hp).version), VERSION);
     std::ptr::write_volatile(std::ptr::addr_of_mut!((*hp).width), width);
     std::ptr::write_volatile(std::ptr::addr_of_mut!((*hp).height), height);
     std::ptr::write_volatile(std::ptr::addr_of_mut!((*hp).format), fmt as u32);
+    if h.seq.load(Ordering::Acquire) != mine {
+        return false;
+    }
     std::ptr::copy_nonoverlapping(data.as_ptr(), base.add(HEADER_SIZE), len);
     h.time_ms.store(time_ms, Ordering::Relaxed);
-    h.lock_since_ms.store(0, Ordering::Relaxed);
-    fence(Ordering::Release);
-    h.seq.store(s + 2, Ordering::Release);
-    true
-}
-
-/// A held write lock (odd `seq`) older than this is taken to belong to a dead
-/// writer and may be reclaimed. `Header::lock_since_ms` (wall clock, ms) is set
-/// right after taking the lock and cleared at the end; 0 while odd (the tiny
-/// window right after the CAS) is never reclaimed.
-const STALE_LOCK_MS: u64 = 500;
-
-fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    h.seq
+        .compare_exchange(mine, s + 2, Ordering::Release, Ordering::Relaxed)
+        .is_ok()
 }
 
 /// Copy the newest complete frame into `out`.
@@ -483,26 +521,138 @@ mod tests {
         assert_eq!(h.seq.load(Ordering::Relaxed) % 2, 0, "seq left odd");
     }
 
+    /// `write_frame` with a fresh staleness state (tests that don't reclaim).
+    unsafe fn write_frame(
+        base: *mut u8,
+        fmt: PixelFormat,
+        w: u32,
+        h: u32,
+        data: &[u8],
+        t: u64,
+    ) -> bool {
+        super::write_frame(base, fmt, w, h, data, t, &mut StaleState::default())
+    }
+
+    const MS500: Duration = Duration::from_millis(500);
+
     #[test]
-    fn stale_odd_seq_is_reclaimed_after_500ms() {
+    fn killed_writer_reclaimed_after_500ms_of_local_observation() {
         let mut m = mem();
         let base = m.as_mut_ptr() as *mut u8;
         let px = [7u8; 16];
         let h = unsafe { &*(base as *const Header) };
-        // A writer that began at t=1000 and died: odd seq.
-        h.seq.store(3, Ordering::SeqCst);
-        h.lock_since_ms.store(1000, Ordering::SeqCst);
-        // Within 500 ms the other writer is assumed alive: skip.
-        assert!(!unsafe { write_frame_at(base, PixelFormat::Bgra, 2, 2, &px, 1, 1400) });
+        h.seq.store(3, Ordering::SeqCst); // a writer died holding the lock
+        let mut st = StaleState::default();
+        let t0 = Instant::now();
+        let w = |st: &mut StaleState, t| unsafe {
+            write_frame_at(base, PixelFormat::Bgra, 2, 2, &px, 1, st, t)
+        };
+        // First sight starts the clock; within 500 ms: skipped.
+        assert!(!w(&mut st, t0));
+        assert!(!w(&mut st, t0 + MS500));
         assert_eq!(h.seq.load(Ordering::SeqCst), 3);
-        // Past 500 ms it is reclaimed and the frame is written.
-        assert!(unsafe { write_frame_at(base, PixelFormat::Bgra, 2, 2, &px, 1, 1501) });
-        assert_eq!(h.seq.load(Ordering::SeqCst) % 2, 0);
+        // Over 500 ms of our own observation: reclaimed and written.
+        assert!(w(&mut st, t0 + MS500 + Duration::from_millis(1)));
+        let s = h.seq.load(Ordering::SeqCst);
+        assert_eq!(s % 2, 0);
+        assert!(s > 3);
         let mut out = Vec::new();
         assert!(unsafe { read_frame(base, &mut out) }.is_ok());
         assert_eq!(out, px);
-        // Normal writes work again.
         assert!(unsafe { write_frame(base, PixelFormat::Bgra, 2, 2, &px, 2) });
+    }
+
+    #[test]
+    fn a_changing_odd_value_restarts_the_clock() {
+        let mut m = mem();
+        let base = m.as_mut_ptr() as *mut u8;
+        let h = unsafe { &*(base as *const Header) };
+        let mut st = StaleState::default();
+        let t0 = Instant::now();
+        let px = [1u8; 16];
+        h.seq.store(3, Ordering::SeqCst);
+        assert!(!unsafe { write_frame_at(base, PixelFormat::Bgra, 2, 2, &px, 1, &mut st, t0) });
+        // A live writer finished and another began: a different odd value.
+        h.seq.store(5, Ordering::SeqCst);
+        let later = t0 + Duration::from_secs(2);
+        assert!(!unsafe { write_frame_at(base, PixelFormat::Bgra, 2, 2, &px, 1, &mut st, later) });
+        assert_eq!(h.seq.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn slow_original_after_reclaim_cannot_finish() {
+        let mut m = mem();
+        let base = m.as_mut_ptr() as *mut u8;
+        let h = unsafe { &*(base as *const Header) };
+        let px = [9u8; 16];
+        // The original writer took the lock (0 -> 1) and then stalled.
+        assert!(h
+            .seq
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok());
+        let mut st = StaleState::default();
+        let t0 = Instant::now();
+        assert!(!unsafe { write_frame_at(base, PixelFormat::Bgra, 2, 2, &px, 1, &mut st, t0) });
+        assert!(unsafe {
+            write_frame_at(
+                base,
+                PixelFormat::Bgra,
+                2,
+                2,
+                &px,
+                1,
+                &mut st,
+                t0 + Duration::from_millis(501),
+            )
+        });
+        let after = h.seq.load(Ordering::SeqCst);
+        assert_eq!(after % 2, 0);
+        // The original wakes up: its end (1 -> 2) must fail and change nothing.
+        assert!(h
+            .seq
+            .compare_exchange(1, 2, Ordering::Release, Ordering::Relaxed)
+            .is_err());
+        assert_eq!(h.seq.load(Ordering::SeqCst), after, "monotonic, still even");
+        let mut out = Vec::new();
+        assert!(unsafe { read_frame(base, &mut out) }.is_ok());
+        assert_eq!(out, px);
+    }
+
+    #[test]
+    fn two_reclaimers_only_one_wins() {
+        let mut m = mem();
+        let base = m.as_mut_ptr() as *mut u8;
+        let h = unsafe { &*(base as *const Header) };
+        h.seq.store(1, Ordering::SeqCst); // dead holder
+        let t0 = Instant::now();
+        let (mut a, mut b) = (StaleState::default(), StaleState::default());
+        let pa = [0xAAu8; 16];
+        let pb = [0x55u8; 16];
+        // Both observe the same odd value for over 500 ms.
+        assert!(!unsafe { write_frame_at(base, PixelFormat::Bgra, 2, 2, &pa, 1, &mut a, t0) });
+        assert!(!unsafe { write_frame_at(base, PixelFormat::Bgra, 2, 2, &pb, 1, &mut b, t0) });
+        // A reclaim is a CAS from the observed value: only one can succeed.
+        let won = h
+            .seq
+            .compare_exchange(1, 3, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        let lost = h
+            .seq
+            .compare_exchange(1, 3, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        assert!(won && !lost);
+        // And through write_frame: with seq back at the observed odd value the
+        // first reclaimer takes it; the loser's view is now stale and it only
+        // restarts its clock instead of stomping on a held lock.
+        h.seq.store(1, Ordering::SeqCst);
+        let later = t0 + Duration::from_millis(501);
+        assert!(unsafe { write_frame_at(base, PixelFormat::Bgra, 2, 2, &pa, 1, &mut a, later) });
+        let mut out = Vec::new();
+        assert!(unsafe { read_frame(base, &mut out) }.is_ok());
+        assert_eq!(out, pa);
+        h.seq.store(5, Ordering::SeqCst); // someone else now holds it
+        assert!(!unsafe { write_frame_at(base, PixelFormat::Bgra, 2, 2, &pb, 1, &mut b, later) });
+        assert_eq!(h.seq.load(Ordering::SeqCst), 5);
     }
 
     #[test]

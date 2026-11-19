@@ -362,6 +362,8 @@ impl Drop for Backing {
 pub struct FrameWriter {
     base: *mut u8,
     _backing: Backing,
+    /// Local view of a lock held by another writer (stale-lock reclaim).
+    stale: std::cell::RefCell<p2c_shm::StaleState>,
 }
 
 // The mapping is plain shared memory; the seqlock protocol makes a single
@@ -382,6 +384,7 @@ impl FrameWriter {
             Some(FrameWriter {
                 base: view.Value as *mut u8,
                 _backing: Backing::Os { handle, view },
+                stale: Default::default(),
             })
         }
     }
@@ -392,6 +395,7 @@ impl FrameWriter {
         FrameWriter {
             base: mem.as_mut_ptr() as *mut u8,
             _backing: Backing::Heap(mem),
+            stale: Default::default(),
         }
     }
 
@@ -411,6 +415,7 @@ impl FrameWriter {
                 f.height,
                 &f.data,
                 time_ms,
+                &mut self.stale.borrow_mut(),
             )
         }
     }
@@ -426,6 +431,7 @@ impl FrameWriter {
                 height,
                 data,
                 time_ms,
+                &mut self.stale.borrow_mut(),
             )
         }
     }
