@@ -115,6 +115,32 @@
 
 ---
 
-### Task 5: Update the test copy for the user
+### Task 5: Recover from webcam and camera-service failures
+
+Evidence (2026-11-19 14:15–14:20): Windows' Frame Server slowed (webcam 20 → 0.5 fps), its watchdog fired (`WatchdogTimer Trigger … FSStream … hr 0xC00D4E24`), the webcam failed with 0x80070428 and the service stopped; Page2Cam never recovered (webcam thread exited; virtual camera gone).
+
+**Files:** `crates/p2c-webcam/src/capture.rs`, `crates/page2cam/src/main.rs`, `crates/p2c-vcam/src/windows_cam.rs` (builds on Task 3's retry).
+
+**Interfaces / behaviour:**
+- Webcam: when `camera.frame()` fails, the capture thread closes the camera, logs once, and reopens the same camera every 3 s until it works (respecting stop requests within 500 ms); status `webcam` shows `"reconnecting: <error>"` meanwhile. Pure helper `fn reopen_due(last_try: Option<Instant>, now: Instant) -> bool` (3 s).
+- Virtual camera: detect a dead Frame Server/camera (owner thread's `IMFVirtualCamera` calls failing, or the frame mapping no longer being read: DLL's frame `seq` acknowledgement absent for 5 s while frames are written — use `Owner` health query if available, else re-`Start()` probe every 5 s); then drop the owner and re-run Task 3's start-retry loop. Status `"starting (retrying): camera service restarted"`.
+- [ ] **Step 1: Failing tests:** `reopen_due_every_3s`; capture loop with an injected frame source that fails twice then succeeds → frames resume, status transitions logged; vcam: injected owner health failure → retry path entered, status text.
+- [ ] **Step 2–4:** run → fail; implement; `cargo test --workspace`, clippy (Windows + Linux-target where possible), fmt.
+- [ ] **Step 5: Commit** `fix: reconnect the webcam and the virtual camera after camera-service failures`.
+
+---
+
+### Task 6: Measure the camera DLL's cost inside Frame Server
+
+**Goal:** find out whether the DLL's per-frame work (NV12 copy or bilinear 1080p→720p scale, RGB32 conversion) can stall Frame Server under a throttled CPU — evidence first, no fix in this task.
+
+- [ ] **Step 1:** Add a release benchmark test in `crates/p2c-shm` (`#[ignore]`): time `nv12_to_nv12` 1920×1080→1280×720 (scale), 1920×1080→1920×1080 (copy), and `nv12_to_rgb32` 1080p, median/p95 over 300 runs; record numbers in the report.
+- [ ] **Step 2:** Add per-frame timing to the DLL's sample fill (`stream.rs`): every 300 frames log `fill p50/p95/max ms, size, format` to vcam.log (cheap; no per-frame logging).
+- [ ] **Step 3:** Report: numbers, and whether the scale path at a throttled CPU (~60 % clock) plausibly exceeds the frame interval. Recommend (do not implement) the fix if it does — e.g. the app writing the camera frame at the consumer's requested size (DLL publishes the requested size in the header) so the DLL only copies.
+- [ ] **Step 4: Commit** `perf(vcam-dll): measure per-frame cost inside Frame Server`. The new DLL requires reinstall (`install-camera.cmd`) to take effect — say so in the report.
+
+---
+
+### Task 7: Update the test copy for the user
 
 - [ ] **Step 1:** `cargo build --release -p page2cam`; if no `page2cam.exe` from `dist\test-build` is running, copy `target\release\page2cam.exe` there (verify hash); otherwise report that the user must close it. The camera DLL is unchanged by this plan (verify by hash) — no reinstall.
