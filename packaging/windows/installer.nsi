@@ -165,28 +165,31 @@ Section "!${APP}" SecInstall
   ; Restart the camera service so the new driver is used.
   nsExec::Exec 'net start FrameServer'
 
-  ; Silent update from inside Page2Cam: start it again when done.
-  ${GetParameters} $R0
-  ClearErrors
-  ${GetOptions} $R0 "/RELAUNCH" $R1
-  ${IfNot} ${Errors}
-    Call StartAppAsUser
-  ${EndIf}
 SectionEnd
+
 
 ; Selected by default (and so on for silent installs). This installer runs
 ; elevated and can't reliably write the signed-in user's HKCU Run key, so it
 ; only records the choice; the tray applies it to the Run key on its first
 ; start, after which the Run key is the only source of truth.
 Section "Start ${APP} (stopped) when I sign in" SecAutostart
+  StrCpy $1 "0"
   ${If} ${SectionIsSelected} ${SecAutostart}
-    FileOpen $0 "$INSTDIR\autostart.default" w
-    FileWrite $0 "1"
-    FileClose $0
-  ${Else}
-    FileOpen $0 "$INSTDIR\autostart.default" w
-    FileWrite $0 "0"
-    FileClose $0
+    StrCpy $1 "1"
+  ${EndIf}
+  FileOpen $0 "$INSTDIR\autostart.default" w
+  FileWrite $0 $1
+  FileClose $0
+SectionEnd
+
+; Last, so autostart.default exists before the tray can start.
+; Silent update from inside Page2Cam: start it again when done.
+Section "-Relaunch"
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptions} $R0 "/RELAUNCH" $R1
+  ${IfNot} ${Errors}
+    Call StartAppAsUser
   ${EndIf}
 SectionEnd
 
