@@ -9,6 +9,8 @@ license.workspace = true
 [dependencies]
 p2c-admin.workspace = true
 p2c-shm = { path = "../p2c-shm" }
+p2c-core.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 serde_json = "1"

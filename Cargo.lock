@@ -2544,7 +2544,9 @@ dependencies = [
 name = "p2c-tray"
 version = "0.3.0"
 dependencies = [
+ "image",
  "p2c-admin",
+ "p2c-core",
  "p2c-shm",
  "serde_json",
 ]

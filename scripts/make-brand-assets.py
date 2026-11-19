@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Standby pictures for the tray are rendered by scripts/make-standby.ps1 (PowerShell, no Pillow needed).
 """Generate every logo/icon file from assets/logo-source.png (transparent PNG).
 
 Outputs (committed, so builds don't need Pillow):
