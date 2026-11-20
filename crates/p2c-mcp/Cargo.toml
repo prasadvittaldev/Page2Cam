@@ -1,0 +1,12 @@
+[package]
+name = "p2c-mcp"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# MCP (Model Context Protocol) server for desktop agents: hand-written
+# JSON-RPC 2.0 and the tool set, over a `Backend` trait. Platform-free; the
+# tray (Windows) provides the backend and the transports.
+[dependencies]
+serde_json = "1"
+base64 = "0.22"
