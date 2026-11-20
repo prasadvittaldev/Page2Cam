@@ -84,12 +84,13 @@ impl TrayLink {
         }))
     }
 
-    /// The link from the environment, read once; `None` when standalone.
+    /// The link from the environment, read once (the variables are then
+    /// removed, so child processes don't inherit the token); `None` when
+    /// standalone. The engine calls it at start, before any child starts.
     pub fn global() -> Option<Arc<TrayLink>> {
         static LINK: OnceLock<Option<Arc<TrayLink>>> = OnceLock::new();
         LINK.get_or_init(|| {
-            let url = std::env::var("P2C_TRAY_URL").ok()?;
-            let token = std::env::var("P2C_TRAY_TOKEN").ok()?;
+            let (url, token) = take_env()?;
             TrayLink::new(&url, &token)
         })
         .clone()
@@ -172,6 +173,18 @@ impl TrayLink {
     }
 }
 
+const URL_ENV: &str = "P2C_TRAY_URL";
+const TOKEN_ENV: &str = "P2C_TRAY_TOKEN";
+
+/// `(url, token)` from the environment, removing both variables.
+fn take_env() -> Option<(String, String)> {
+    let url = std::env::var(URL_ENV).ok();
+    let token = std::env::var(TOKEN_ENV).ok();
+    std::env::remove_var(URL_ENV);
+    std::env::remove_var(TOKEN_ENV);
+    Some((url?, token?))
+}
+
 fn bad(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
 }
@@ -223,6 +236,18 @@ fn parse_response(raw: &[u8]) -> std::io::Result<(u16, Vec<u8>)> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn tray_link_env_is_read_once_and_removed() {
+        // Chromium helpers and ffmpeg must not inherit the tray token.
+        std::env::set_var(URL_ENV, "http://127.0.0.1:8766");
+        std::env::set_var(TOKEN_ENV, "sekret-token");
+        let got = take_env();
+        assert_eq!(got, Some(("http://127.0.0.1:8766".into(), "sekret-token".into())));
+        assert!(std::env::var_os(URL_ENV).is_none());
+        assert!(std::env::var_os(TOKEN_ENV).is_none());
+        assert_eq!(take_env(), None);
+    }
 
     /// Answers every connection with `reply`; sends each request's text to the channel.
     fn fake(reply: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {

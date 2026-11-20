@@ -295,6 +295,8 @@ fn run() -> anyhow::Result<i32> {
     // from ours so Chromium's helpers and ffmpeg don't inherit it.
     let admin_token = engine::admin_token(role, std::env::var(engine::TOKEN_ENV).ok());
     std::env::remove_var(engine::TOKEN_ENV);
+    // Same for the tray endpoint's address and token (read once, now).
+    let _ = p2c_admin::TrayLink::global();
     // Engine nobody can reach: stop before touching anything (no
     // stop_others, camera or Chromium).
     let admin_token = match admin_token {
