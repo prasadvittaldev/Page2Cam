@@ -1911,7 +1911,7 @@ mod tests {
             ..shown
         };
         let (cam_a, cam_b) = (solid(16, 9, BLUE), solid(16, 9, GREEN));
-        let (m_a, m_b) = (mask(16, 9, vec![255; 144]), mask(16, 9, vec![0; 144]));
+        let (m_a, m_b) = (mask(16, 9, vec![255; 144]), mask(16, 9, vec![128; 144]));
         let b = Backdrop::default();
         let mut c = Compositor::new();
         let mut out = Frame::new_black(64, 36);
@@ -1924,8 +1924,18 @@ mod tests {
         let moved = crate::PipLayout { x: 0.1, ..hidden };
         assert!(!c.compose(Some(&page), pip(&cam_a, None, &moved), &b, &mut out));
         assert!(out == first);
-        // Showing it redraws.
-        assert!(c.compose(Some(&page), pip(&cam_a, Some(&m_a), &shown), &b, &mut out));
+        // A new webcam frame and mask arrive while hidden; showing the PIP
+        // redraws with them, exactly as a fresh compositor draws them.
+        assert!(!c.compose(Some(&page), pip(&cam_b, Some(&m_b), &hidden), &b, &mut out));
+        assert!(c.compose(Some(&page), pip(&cam_b, Some(&m_b), &shown), &b, &mut out));
+        let fresh = |cam, m| {
+            let mut f = Frame::new_black(64, 36);
+            Compositor::new().compose(Some(&page), pip(cam, Some(m), &shown), &b, &mut f);
+            f
+        };
+        let (new, old) = (fresh(&cam_b, &m_b), fresh(&cam_a, &m_a));
+        assert!(new != old && new != first, "the inputs must show");
+        assert!(out == new, "shown PIP uses the new webcam frame and mask");
         // Under the blurred room the webcam is the background: it still counts.
         let room = backdrop(FullBackdrop::BlurredRoom, BoxBackdrop::Room);
         assert!(c.compose(

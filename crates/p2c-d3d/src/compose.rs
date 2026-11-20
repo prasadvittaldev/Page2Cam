@@ -1117,8 +1117,10 @@ impl GpuProducer {
         let key = Key::of(self.page.seq(), inputs);
         let changed = key.changes(self.last_key.as_ref());
         let fresh = if changed.any() {
-            self.why.count(changed);
             self.composite(key.page_seq, inputs)?;
+            // Counted once drawn: a failed composite is redrawn (and
+            // counted) on the next tick.
+            self.why.count(changed);
             self.composite += 1;
             self.last_key = Some(key);
             self.convert()?;

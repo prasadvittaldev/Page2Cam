@@ -744,23 +744,25 @@ impl Ticker {
                         deadline = start + period * n;
                     }
                     if last_log.elapsed() >= LOG_EVERY {
+                        // Taken on every window, logged or not, so each
+                        // line's counts cover that line's window only.
+                        // Refined edges on the CPU (none on the GPU or when off).
+                        let refined = slot
+                            .producer
+                            .take_refined_summary()
+                            .map(|r| format!("; refined edges {r}"))
+                            .unwrap_or_default();
+                        // `redrawn` counts new outputs (on the GPU also the
+                        // readback drain after a change); this, the
+                        // composites and what caused them.
+                        let why = slot
+                            .producer
+                            .take_redraw_why()
+                            .map(|w| format!("; {w}"))
+                            .unwrap_or_default();
                         if let (Some(c), Some(s)) =
                             (compose_t.take_summary(), sinks_t.take_summary())
                         {
-                            // Refined edges on the CPU (none on the GPU or when off).
-                            let refined = slot
-                                .producer
-                                .take_refined_summary()
-                                .map(|r| format!("; refined edges {r}"))
-                                .unwrap_or_default();
-                            // `redrawn` counts new outputs (on the GPU also
-                            // the readback drain after a change); this, the
-                            // composites and what caused them.
-                            let why = slot
-                                .producer
-                                .take_redraw_why()
-                                .map(|w| format!("; {w}"))
-                                .unwrap_or_default();
                             tracing::info!(
                                 ticks,
                                 redrawn,

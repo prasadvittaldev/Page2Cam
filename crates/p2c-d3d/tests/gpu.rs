@@ -797,6 +797,106 @@ fn gpu_producer_skips_unchanged_and_drains() {
     }
 }
 
+/// The CPU compositor's NV12 output for one PIP over `page`.
+fn cpu_nv12(page: &Arc<Frame>, cam: &Arc<Frame>, mask: &Arc<Mask>, l: &PipLayout) -> Nv12Frame {
+    let mut f = Frame::new_black(page.width, page.height);
+    let pip = Pip {
+        cam,
+        mask: Some(mask),
+        layout: l,
+    };
+    Compositor::new().compose(
+        Some(page),
+        Some(pip),
+        &p2c_compositor::Backdrop::default(),
+        &mut f,
+    );
+    bgra_to_nv12(&f, f.width, f.height)
+}
+
+#[test]
+#[ignore]
+fn gpu_hidden_pip_skips_new_inputs_then_shows_them() {
+    let page = noise(640, 360, 61);
+    let page_arc = Arc::new(page.clone());
+    let (cam_a, cam_b) = (Arc::new(noise(320, 180, 62)), Arc::new(noise(320, 180, 63)));
+    let mask_a = soft_mask(160, 90, EdgeRange { lo: 40, hi: 220 });
+    let mut mask_b = (*soft_mask(160, 90, EdgeRange::FULL)).clone();
+    mask_b.data.reverse();
+    let mask_b = Arc::new(mask_b);
+    let shown = layout(OverlayStyle::CutoutSmall, 0.3, 0.0, 0.4);
+    let hidden = PipLayout {
+        visible: false,
+        ..shown
+    };
+    let want_new = cpu_nv12(&page_arc, &cam_b, &mask_b, &shown);
+    let want_old = cpu_nv12(&page_arc, &cam_a, &mask_a, &shown);
+    for a in hardware() {
+        let gpu = Gpu::new(a.luid).unwrap();
+        let mut p = producer_with_page(&gpu, &page, spec(640, 360));
+        let inputs = |cam: &Arc<Frame>, mask: &Arc<Mask>, layout| TickInputs {
+            page: None,
+            cam: Some(cam.clone()),
+            mask: Some(mask.clone()),
+            layout,
+            backdrop: p2c_compositor::Backdrop::default(),
+        };
+        // Hidden: one composite, drained out of the ring.
+        let first = inputs(&cam_a, &mask_a, hidden);
+        for _ in 0..3 {
+            p.produce(&first, false).unwrap();
+        }
+        // A new webcam frame and mask behind the hidden PIP: no work.
+        let behind = inputs(&cam_b, &mask_b, hidden);
+        for _ in 0..3 {
+            assert!(
+                p.produce(&behind, false).unwrap().is_none(),
+                "{}: hidden PIP inputs composited",
+                a.name
+            );
+        }
+        // Shown: the output carries the new frame and mask.
+        let show = inputs(&cam_b, &mask_b, shown);
+        let mut last = None;
+        for _ in 0..3 {
+            if let Some(o) = p.produce(&show, false).unwrap() {
+                last = Some(o);
+            }
+        }
+        let nv12 = last.and_then(|o| o.nv12).expect("an output once shown");
+        let (ny, nuv) = max_diff(&want_new, &nv12);
+        let (oy, ouv) = max_diff(&want_old, &nv12);
+        println!(
+            "hidden then shown on {}: vs new inputs Y {ny} UV {nuv}, vs old Y {oy} UV {ouv}",
+            a.name
+        );
+        assert!(
+            ny <= SCALED_PIP.max && nuv <= SCALED_PIP.max,
+            "{}: shown output differs from the CPU with the new inputs: Y {ny} UV {nuv}",
+            a.name
+        );
+        assert!(oy > 50, "{}: output still shows the old inputs", a.name);
+        // And the BGRA composite matches the CPU path like the parity tests.
+        let got = p.render_bgra_for_test(&show).unwrap();
+        let mut cpu = Frame::new_black(640, 360);
+        let pip = Pip {
+            cam: &cam_b,
+            mask: Some(&mask_b),
+            layout: &shown,
+        };
+        Compositor::new().compose(
+            Some(&page_arc),
+            Some(pip),
+            &p2c_compositor::Backdrop::default(),
+            &mut cpu,
+        );
+        let (d, x, y) = bgra_diff(&cpu, &got);
+        let mean = bgra_mean_diff(&cpu, &got);
+        assert!(d <= SCALED_PIP.max, "{}: diff {d} at ({x},{y})", a.name);
+        assert!(mean.iter().all(|m| *m <= SCALED_PIP.mean), "{}", a.name);
+    }
+}
+
 #[test]
 #[ignore]
 fn bench_compose_1080p_cutout_full() {
