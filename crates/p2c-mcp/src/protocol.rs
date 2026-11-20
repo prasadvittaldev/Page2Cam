@@ -207,11 +207,34 @@ mod tests {
     #[test]
     fn tools_list_has_all_tools_with_schemas() {
         let want = [
-            "status", "start", "stop", "force_restart", "open_url", "navigate", "show_page",
-            "list_pages", "click", "scroll", "type_text", "press_key", "snapshot", "get_overlay",
-            "set_overlay", "set_cutout_quality", "get_crop", "set_crop", "reset_crop",
-            "start_stream", "stop_stream", "set_audio", "list_gpus", "set_gpu", "install_update",
-            "get_background", "set_background", "upload_background_image",
+            "status",
+            "start",
+            "stop",
+            "force_restart",
+            "open_url",
+            "navigate",
+            "show_page",
+            "list_pages",
+            "click",
+            "scroll",
+            "type_text",
+            "press_key",
+            "snapshot",
+            "get_overlay",
+            "set_overlay",
+            "set_cutout_quality",
+            "get_crop",
+            "set_crop",
+            "reset_crop",
+            "start_stream",
+            "stop_stream",
+            "set_audio",
+            "list_gpus",
+            "set_gpu",
+            "install_update",
+            "get_background",
+            "set_background",
+            "upload_background_image",
         ];
         let mut names = tool_names();
         names.sort();
@@ -219,13 +242,20 @@ mod tests {
         w.sort();
         assert_eq!(names, w);
         let r = server()
-            .handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }), &mut ClientInfo::default())
+            .handle(
+                &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+                &mut ClientInfo::default(),
+            )
             .unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 28);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
-            assert!(t["description"].as_str().unwrap().len() > 10, "{}", t["name"]);
+            assert!(
+                t["description"].as_str().unwrap().len() > 10,
+                "{}",
+                t["name"]
+            );
         }
         // The canvas is explained where pages and overlays are made.
         for n in ["show_page", "set_overlay", "snapshot"] {
@@ -243,39 +273,101 @@ mod tests {
             ("start", json!({}), C::Start),
             ("stop", json!({}), C::Stop),
             ("force_restart", json!({}), C::ForceRestart),
-            ("open_url", json!({ "url": " https://example.com " }), C::OpenUrl("https://example.com".into())),
-            ("navigate", json!({ "action": "back" }), C::Navigate(Nav::Back)),
-            ("show_page", json!({ "name": "agenda", "html": "<p>x</p>" }),
-                C::ShowPage { name: "agenda".into(), html: "<p>x</p>".into() }),
+            (
+                "open_url",
+                json!({ "url": " https://example.com " }),
+                C::OpenUrl("https://example.com".into()),
+            ),
+            (
+                "navigate",
+                json!({ "action": "back" }),
+                C::Navigate(Nav::Back),
+            ),
+            (
+                "show_page",
+                json!({ "name": "agenda", "html": "<p>x</p>" }),
+                C::ShowPage {
+                    name: "agenda".into(),
+                    html: "<p>x</p>".into(),
+                },
+            ),
             ("list_pages", json!({}), C::ListPages),
-            ("click", json!({ "x": 0.5, "y": 0.25 }), C::Input(json!({ "kind": "click", "x": 0.5, "y": 0.25 }))),
-            ("scroll", json!({ "x": 0.5, "y": 0.5, "dy": 300 }),
-                C::Input(json!({ "kind": "scroll", "x": 0.5, "y": 0.5, "dx": 0.0, "dy": 300.0 }))),
-            ("type_text", json!({ "text": "hi" }), C::Input(json!({ "kind": "text", "text": "hi" }))),
-            ("press_key", json!({ "key": "enter" }), C::Input(json!({ "kind": "key", "key": "enter" }))),
+            (
+                "click",
+                json!({ "x": 0.5, "y": 0.25 }),
+                C::Input(json!({ "kind": "click", "x": 0.5, "y": 0.25 })),
+            ),
+            (
+                "scroll",
+                json!({ "x": 0.5, "y": 0.5, "dy": 300 }),
+                C::Input(json!({ "kind": "scroll", "x": 0.5, "y": 0.5, "dx": 0.0, "dy": 300.0 })),
+            ),
+            (
+                "type_text",
+                json!({ "text": "hi" }),
+                C::Input(json!({ "kind": "text", "text": "hi" })),
+            ),
+            (
+                "press_key",
+                json!({ "key": "enter" }),
+                C::Input(json!({ "kind": "key", "key": "enter" })),
+            ),
             ("snapshot", json!({}), C::Snapshot),
             ("get_overlay", json!({}), C::GetOverlay),
-            ("set_overlay", json!({ "x": 1, "style": "cutout_full" }),
-                C::SetOverlay(json!({ "x": 1.0, "style": "cutout-full" }))),
-            ("set_cutout_quality", json!({ "quality": "fast" }), C::SetCutoutQuality("fast".into())),
+            (
+                "set_overlay",
+                json!({ "x": 1, "style": "cutout_full" }),
+                C::SetOverlay(json!({ "x": 1.0, "style": "cutout-full" })),
+            ),
+            (
+                "set_cutout_quality",
+                json!({ "quality": "fast" }),
+                C::SetCutoutQuality("fast".into()),
+            ),
             ("get_crop", json!({}), C::GetCrop),
-            ("set_crop", json!({ "x": 0.1, "y": 0, "w": 0.8, "h": 1 }),
-                C::SetCrop(json!({ "x": 0.1, "y": 0.0, "w": 0.8, "h": 1.0 }))),
+            (
+                "set_crop",
+                json!({ "x": 0.1, "y": 0, "w": 0.8, "h": 1 }),
+                C::SetCrop(json!({ "x": 0.1, "y": 0.0, "w": 0.8, "h": 1.0 })),
+            ),
             ("reset_crop", json!({}), C::ResetCrop),
             ("start_stream", json!({}), C::StartStream),
             ("stop_stream", json!({}), C::StopStream),
-            ("set_audio", json!({ "mic_on": true, "page_gain": 0.5 }),
-                C::SetAudio(json!({ "mic_on": true, "page_gain": 0.5 }))),
+            (
+                "set_audio",
+                json!({ "mic_on": true, "page_gain": 0.5 }),
+                C::SetAudio(json!({ "mic_on": true, "page_gain": 0.5 })),
+            ),
             ("list_gpus", json!({}), C::ListGpus),
-            ("set_gpu", json!({ "choice": "auto" }), C::SetGpu("auto".into())),
+            (
+                "set_gpu",
+                json!({ "choice": "auto" }),
+                C::SetGpu("auto".into()),
+            ),
             ("install_update", json!({}), C::InstallUpdate),
             ("get_background", json!({}), C::GetBackground),
-            ("set_background", json!({ "full": "youtube", "youtube": "https://youtu.be/dQw4w9WgXcQ" }),
-                C::SetBackground(json!({ "full": "youtube", "full_youtube": "https://youtu.be/dQw4w9WgXcQ" }))),
-            ("set_background", json!({ "in_box": "colour", "box_colour": "#AABBCC", "refined_edges": true }),
-                C::SetBackground(json!({ "in_box": "colour", "box_colour": "#aabbcc", "refined_edges": true }))),
-            ("upload_background_image", json!({ "row": "box", "base64": "iVBORw0KGgo=" }),
-                C::UploadBackgroundImage { row: "box".into(), bytes: b"\x89PNG\r\n\x1a\n".to_vec() }),
+            (
+                "set_background",
+                json!({ "full": "youtube", "youtube": "https://youtu.be/dQw4w9WgXcQ" }),
+                C::SetBackground(
+                    json!({ "full": "youtube", "full_youtube": "https://youtu.be/dQw4w9WgXcQ" }),
+                ),
+            ),
+            (
+                "set_background",
+                json!({ "in_box": "colour", "box_colour": "#AABBCC", "refined_edges": true }),
+                C::SetBackground(
+                    json!({ "in_box": "colour", "box_colour": "#aabbcc", "refined_edges": true }),
+                ),
+            ),
+            (
+                "upload_background_image",
+                json!({ "row": "box", "base64": "iVBORw0KGgo=" }),
+                C::UploadBackgroundImage {
+                    row: "box".into(),
+                    bytes: b"\x89PNG\r\n\x1a\n".to_vec(),
+                },
+            ),
         ];
         for (name, args, want) in table {
             let s = server();
@@ -295,13 +387,24 @@ mod tests {
         let f = dir.join("pic.png");
         std::fs::write(&f, b"\x89PNG\r\n\x1a\nrest").unwrap();
         let s = server();
-        let r = call(&s, "upload_background_image", json!({ "row": "full", "path": f.to_str().unwrap() }));
+        let r = call(
+            &s,
+            "upload_background_image",
+            json!({ "row": "full", "path": f.to_str().unwrap() }),
+        );
         assert_eq!(r["result"]["isError"], false, "{r}");
         assert_eq!(
             s.backend().calls.borrow()[0].1,
-            BackendCall::UploadBackgroundImage { row: "full".into(), bytes: b"\x89PNG\r\n\x1a\nrest".to_vec() }
+            BackendCall::UploadBackgroundImage {
+                row: "full".into(),
+                bytes: b"\x89PNG\r\n\x1a\nrest".to_vec()
+            }
         );
-        let r = call(&s, "upload_background_image", json!({ "row": "full", "path": dir.to_str().unwrap() }));
+        let r = call(
+            &s,
+            "upload_background_image",
+            json!({ "row": "full", "path": dir.to_str().unwrap() }),
+        );
         assert_eq!(r["result"]["isError"], true);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -347,12 +450,27 @@ mod tests {
             ("set_background", json!({ "youtube": "" })),
             ("set_background", json!({ "refined_edges": "yes" })),
             ("set_background", json!({})),
-            ("upload_background_image", json!({ "row": "side", "base64": "iVBORw0KGgo=" })),
-            ("upload_background_image", json!({ "row": "full", "base64": "!!!" })),
+            (
+                "upload_background_image",
+                json!({ "row": "side", "base64": "iVBORw0KGgo=" }),
+            ),
+            (
+                "upload_background_image",
+                json!({ "row": "full", "base64": "!!!" }),
+            ),
             ("upload_background_image", json!({ "row": "full" })),
-            ("upload_background_image", json!({ "row": "full", "base64": "iVBORw0KGgo=", "path": "C:/x.png" })),
-            ("upload_background_image", json!({ "row": "full", "path": "Z:/does/not/exist.png" })),
-            ("upload_background_image", json!({ "row": "full", "base64": "A".repeat(28 * 1024 * 1024) })),
+            (
+                "upload_background_image",
+                json!({ "row": "full", "base64": "iVBORw0KGgo=", "path": "C:/x.png" }),
+            ),
+            (
+                "upload_background_image",
+                json!({ "row": "full", "path": "Z:/does/not/exist.png" }),
+            ),
+            (
+                "upload_background_image",
+                json!({ "row": "full", "base64": "A".repeat(28 * 1024 * 1024) }),
+            ),
         ];
         for (name, args) in cases {
             let s = server();
@@ -365,7 +483,8 @@ mod tests {
     #[test]
     fn snapshot_returns_image_content() {
         let s = server();
-        *s.backend().reply.borrow_mut() = Some(Ok(BackendReply::Image(vec![0xff, 0xd8, 0xff, 0xe0])));
+        *s.backend().reply.borrow_mut() =
+            Some(Ok(BackendReply::Image(vec![0xff, 0xd8, 0xff, 0xe0])));
         let r = call(&s, "snapshot", json!({}));
         let c = &r["result"]["content"][0];
         assert_eq!(c["type"], "image");
@@ -376,10 +495,17 @@ mod tests {
     #[test]
     fn no_tool_output_contains_secrets() {
         let secrets = [
-            Ok(BackendReply::Json(json!({ "stream_url": "rtmp://a.rtmp.youtube.com/live2/abcd-1234",
-                "log": "GET /?t=SECRET", "token": "SECRET" }))),
-            Ok(BackendReply::Done("Authorization: Bearer SECRET; rtmp://a.rtmp.youtube.com/live2/abcd-1234".into())),
-            Err("ffmpeg: rtmp://a.rtmp.youtube.com/live2/abcd-1234: I/O error, url ?t=SECRET".into()),
+            Ok(BackendReply::Json(
+                json!({ "stream_url": "rtmp://a.rtmp.youtube.com/live2/abcd-1234",
+                "log": "GET /?t=SECRET", "token": "SECRET" }),
+            )),
+            Ok(BackendReply::Done(
+                "Authorization: Bearer SECRET; rtmp://a.rtmp.youtube.com/live2/abcd-1234".into(),
+            )),
+            Err(
+                "ffmpeg: rtmp://a.rtmp.youtube.com/live2/abcd-1234: I/O error, url ?t=SECRET"
+                    .into(),
+            ),
         ];
         for reply in secrets {
             for tool in tool_names() {
@@ -403,7 +529,10 @@ mod tests {
                     _ => json!({}),
                 };
                 let out = call(&s, &tool, args).to_string();
-                assert!(!out.contains("abcd-1234") && !out.contains("SECRET"), "{tool}: {out}");
+                assert!(
+                    !out.contains("abcd-1234") && !out.contains("SECRET"),
+                    "{tool}: {out}"
+                );
             }
         }
     }
@@ -412,22 +541,39 @@ mod tests {
     fn notification_has_no_reply() {
         let s = server();
         let mut c = ClientInfo::default();
-        assert!(s.handle(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }), &mut c).is_none());
-        assert!(s.handle(&json!({ "jsonrpc": "2.0", "id": 3, "result": {} }), &mut c).is_none());
+        assert!(s
+            .handle(
+                &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+                &mut c
+            )
+            .is_none());
+        assert!(s
+            .handle(&json!({ "jsonrpc": "2.0", "id": 3, "result": {} }), &mut c)
+            .is_none());
     }
 
     #[test]
     fn unknown_method_is_jsonrpc_error_32601() {
         let s = server();
         let mut c = ClientInfo::default();
-        let r = s.handle(&json!({ "jsonrpc": "2.0", "id": "a", "method": "resources/list" }), &mut c).unwrap();
+        let r = s
+            .handle(
+                &json!({ "jsonrpc": "2.0", "id": "a", "method": "resources/list" }),
+                &mut c,
+            )
+            .unwrap();
         assert_eq!(r["error"]["code"], -32601);
         assert_eq!(r["id"], "a");
         let r = call(&s, "no_such_tool", json!({}));
         assert_eq!(r["error"]["code"], -32602);
         let r = s.handle(&json!([1, 2]), &mut c).unwrap();
         assert_eq!(r["error"]["code"], -32600);
-        let r = s.handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }), &mut c).unwrap();
+        let r = s
+            .handle(
+                &json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }),
+                &mut c,
+            )
+            .unwrap();
         assert_eq!(r["result"], json!({}));
     }
 }

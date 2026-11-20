@@ -103,9 +103,14 @@ impl BackendCall {
             BackendCall::SetCrop(v) => format!("set crop {v}"),
             BackendCall::SetAudio(v) => format!("set audio {v}"),
             BackendCall::SetGpu(g) => format!("set GPU {g:?}"),
-            BackendCall::SetBackground(v) => format!("set background {}", crate::redact(&v.to_string())),
+            BackendCall::SetBackground(v) => {
+                format!("set background {}", crate::redact(&v.to_string()))
+            }
             BackendCall::UploadBackgroundImage { row, bytes } => {
-                format!("upload {row} background ({} KB)", bytes.len().div_ceil(1024))
+                format!(
+                    "upload {row} background ({} KB)",
+                    bytes.len().div_ceil(1024)
+                )
             }
             other => format!("{other:?}").to_lowercase(),
         }
@@ -139,9 +144,7 @@ pub fn tool_defs() -> Vec<Value> {
     let none = json!({ "type": "object", "properties": {}, "additionalProperties": false });
     let unit = json!({ "type": "number", "minimum": 0, "maximum": 1 });
     let colour = json!({ "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" });
-    let t = |name: &str, desc: String, schema: &Value| {
-        json!({ "name": name, "description": desc, "inputSchema": schema })
-    };
+    let t = |name: &str, desc: String, schema: &Value| json!({ "name": name, "description": desc, "inputSchema": schema });
     vec![
         t("status", "Page2Cam's state: running or stopped, health, page, webcam, overlay, cut-out, background, stream, audio, GPU, update. Works while stopped.".into(), &none),
         t("start", "Start Page2Cam (the video, the virtual camera picture and the control page). Takes up to 30 s.".into(), &none),
@@ -280,7 +283,11 @@ fn one_of<'a>(k: &str, v: &'a str, allowed: &[&str]) -> Result<&'a str, String> 
 fn colour_arg(args: &Args, k: &str) -> Result<Option<String>, String> {
     match str_arg(args, k)? {
         None => Ok(None),
-        Some(c) if c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|h| h.is_ascii_hexdigit()) => {
+        Some(c)
+            if c.len() == 7
+                && c.starts_with('#')
+                && c[1..].chars().all(|h| h.is_ascii_hexdigit()) =>
+        {
             Ok(Some(c.to_ascii_lowercase()))
         }
         Some(_) => Err(format!("{k} must be a colour like #1a2b3c")),
@@ -299,7 +306,9 @@ fn nonempty(m: Map<String, Value>) -> Result<Value, String> {
 /// the tool doesn't exist; `Err(Some(msg))` is a bad-argument tool error.
 pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<String>> {
     use BackendCall as C;
-    let simple = |c: BackendCall| -> Result<BackendCall, Option<String>> { only(args, &[]).map(|()| c).map_err(Some) };
+    let simple = |c: BackendCall| -> Result<BackendCall, Option<String>> {
+        only(args, &[]).map(|()| c).map_err(Some)
+    };
     let r: Result<BackendCall, String> = match name {
         "status" => return simple(C::Status),
         "start" => return simple(C::Start),
@@ -343,9 +352,14 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
                 return Err("html is required".into());
             }
             if html.len() > MAX_HTML_BYTES {
-                return Err("html is larger than 2 MB; link big images instead of inlining them".into());
+                return Err(
+                    "html is larger than 2 MB; link big images instead of inlining them".into(),
+                );
             }
-            Ok(C::ShowPage { name: name.to_string(), html: html.to_string() })
+            Ok(C::ShowPage {
+                name: name.to_string(),
+                html: html.to_string(),
+            })
         })(),
         "click" => (|| {
             only(args, &["x", "y"])?;
@@ -357,7 +371,9 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
             let (x, y) = (req_num(args, "x", 0.0, 1.0)?, req_num(args, "y", 0.0, 1.0)?);
             let dx = num_arg(args, "dx", -10_000.0, 10_000.0)?.unwrap_or(0.0);
             let dy = req_num(args, "dy", -10_000.0, 10_000.0)?;
-            Ok(C::Input(json!({ "kind": "scroll", "x": x, "y": y, "dx": dx, "dy": dy })))
+            Ok(C::Input(
+                json!({ "kind": "scroll", "x": x, "y": y, "dx": dx, "dy": dy }),
+            ))
         })(),
         "type_text" => (|| {
             only(args, &["text"])?;
@@ -438,10 +454,24 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
             Ok(C::SetGpu(c.into()))
         })(),
         "set_background" => (|| {
-            only(args, &["full", "full_colour", "youtube", "in_box", "box_colour", "refined_edges"])?;
+            only(
+                args,
+                &[
+                    "full",
+                    "full_colour",
+                    "youtube",
+                    "in_box",
+                    "box_colour",
+                    "refined_edges",
+                ],
+            )?;
             let mut m = Map::new();
             if let Some(f) = str_arg(args, "full")? {
-                let f = one_of("full", f, &["page", "image", "colour", "youtube", "blurred-room"])?;
+                let f = one_of(
+                    "full",
+                    f,
+                    &["page", "image", "colour", "youtube", "blurred-room"],
+                )?;
                 m.insert("full".into(), f.into());
             }
             if let Some(c) = colour_arg(args, "full_colour")? {

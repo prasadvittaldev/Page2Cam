@@ -97,7 +97,9 @@ fn redact_after_ci(s: &str, markers: &[&str]) -> String {
         loop {
             // ASCII lowercasing keeps byte offsets.
             let lower = out.to_ascii_lowercase();
-            let Some(p) = lower[from..].find(m) else { break };
+            let Some(p) = lower[from..].find(m) else {
+                break;
+            };
             let start = from + p + m.len();
             let len = out[start..].find(end_char).unwrap_or(out.len() - start);
             if len > 0 {
@@ -125,7 +127,9 @@ fn redact_json_keys(s: &str, keys: &[&str]) -> String {
             }
             if i < bytes.len() && bytes[i] == b':' {
                 i += 1;
-                while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\r') {
+                while i < bytes.len()
+                    && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\r')
+                {
                     i += 1;
                 }
                 if i < bytes.len() && bytes[i] == b'"' {
@@ -164,17 +168,32 @@ mod tests {
         let r = redact("rtmp://user:pw@host/app/key");
         assert!(!r.contains("pw") && !r.contains("/key"), "{r}");
         // Server only: unchanged.
-        assert_eq!(redact("rtmp://a.rtmp.youtube.com/live2"), "rtmp://a.rtmp.youtube.com/live2");
+        assert_eq!(
+            redact("rtmp://a.rtmp.youtube.com/live2"),
+            "rtmp://a.rtmp.youtube.com/live2"
+        );
     }
 
     #[test]
     fn tokens_are_masked() {
-        assert_eq!(redact("http://127.0.0.1:1/?t=SECRET&x=1"), "http://127.0.0.1:1/?t=***&x=1");
+        assert_eq!(
+            redact("http://127.0.0.1:1/?t=SECRET&x=1"),
+            "http://127.0.0.1:1/?t=***&x=1"
+        );
         assert_eq!(redact("http://h/?a=1&t=SECRET"), "http://h/?a=1&t=***");
-        assert_eq!(redact("Authorization: Bearer SECRET"), "Authorization: Bearer ***");
-        assert_eq!(redact("authorization: bearer SECRET"), "authorization: bearer ***");
+        assert_eq!(
+            redact("Authorization: Bearer SECRET"),
+            "Authorization: Bearer ***"
+        );
+        assert_eq!(
+            redact("authorization: bearer SECRET"),
+            "authorization: bearer ***"
+        );
         assert_eq!(redact("X-P2C-Token: SECRET"), "X-P2C-Token: ***");
-        assert_eq!(redact(r#"{"token": "SECRET", "a": 1}"#), r#"{"token": "***", "a": 1}"#);
+        assert_eq!(
+            redact(r#"{"token": "SECRET", "a": 1}"#),
+            r#"{"token": "***", "a": 1}"#
+        );
         assert_eq!(redact(r#"{"key":"SECRET"}"#), r#"{"key":"***"}"#);
         // Not a token: unchanged.
         assert_eq!(redact("format=json&tag=x"), "format=json&tag=x");
@@ -182,7 +201,20 @@ mod tests {
 
     #[test]
     fn redaction_never_panics_on_odd_text() {
-        for s in ["", "?t=", "&t=", "Bearer", "bearer ", "rtmp://", "rtmps://h/", "\"token\"", "\"token\":", "\"token\":\"", "é?t=é", "rtmp://é/é/é"] {
+        for s in [
+            "",
+            "?t=",
+            "&t=",
+            "Bearer",
+            "bearer ",
+            "rtmp://",
+            "rtmps://h/",
+            "\"token\"",
+            "\"token\":",
+            "\"token\":\"",
+            "é?t=é",
+            "rtmp://é/é/é",
+        ] {
             let _ = redact(s);
         }
     }

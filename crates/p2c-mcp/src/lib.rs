@@ -10,7 +10,9 @@ mod tools;
 
 pub use protocol::{ClientInfo, Server, PROTOCOL_VERSION, SUPPORTED_VERSIONS};
 pub use redact::redact;
-pub use tools::{tool_defs, tool_names, Backend, BackendCall, BackendReply, Nav, MAX_HTML_BYTES, MAX_IMAGE_BYTES};
+pub use tools::{
+    tool_defs, tool_names, Backend, BackendCall, BackendReply, Nav, MAX_HTML_BYTES, MAX_IMAGE_BYTES,
+};
 
 /// Error text when agents are switched off (the bridge answers with it too).
 pub const AGENTS_OFF: &str = "Turn on 'Allow agents' in the Page2Cam tray menu";
