@@ -2626,6 +2626,7 @@ name = "p2c-webcam"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "jpeg-encoder",
  "nokhwa",
  "p2c-core",

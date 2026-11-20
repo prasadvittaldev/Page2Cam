@@ -241,11 +241,15 @@ impl FrameSource for NokhwaSource {
         // One read of the crop for both outputs, so they cover the same area.
         let crop = *self.crop.read();
         let t0 = Instant::now();
+        // Our own reference to the frame's bytes, the only one once the
+        // frame is dropped: a full-frame NV12 twin then moves, not copies.
+        let bytes = frame.buffer_bytes();
+        drop(frame);
         match decode_cropped(
             fmt,
             res.width(),
             res.height(),
-            frame.buffer(),
+            bytes,
             &crop,
             self.gate.is_on(),
         ) {
@@ -394,24 +398,26 @@ impl WebcamCapture {
 /// always even); MJPEG decodes in full, then crops. With `want_nv12` and an
 /// NV12 camera, the same rectangle of the raw NV12 is returned too (an NV12
 /// that can't be cut, such as a short buffer, gives `None`: the BGRA covers it).
-fn decode_cropped(
+/// A full-frame NV12 takes `buf` itself (no copy when it owns its bytes).
+fn decode_cropped<B: AsRef<[u8]> + Into<Vec<u8>>>(
     fmt: crate::decode::RawFormat,
     width: u32,
     height: u32,
-    buf: &[u8],
+    buf: B,
     crop: &Crop,
     want_nv12: bool,
 ) -> anyhow::Result<(Frame, Option<Nv12Frame>)> {
     use crate::decode::{to_bgra, to_bgra_rect, RawFormat};
     if fmt == RawFormat::Mjpeg {
-        return Ok((apply_crop(to_bgra(fmt, width, height, buf)?, crop), None));
+        let full = to_bgra(fmt, width, height, buf.as_ref())?;
+        return Ok((apply_crop(full, crop), None));
     }
     let rect = if crop.is_full() {
         (0, 0, width, height)
     } else {
         crop.pixels(width, height)
     };
-    let bgra = to_bgra_rect(fmt, width, height, buf, rect)?;
+    let bgra = to_bgra_rect(fmt, width, height, buf.as_ref(), rect)?;
     let nv12 = (want_nv12 && fmt == RawFormat::Nv12)
         .then(|| nv12_rect(width, height, buf, rect))
         .flatten();
@@ -420,7 +426,14 @@ fn decode_cropped(
 
 /// The rectangle `(x, y, w, h)` (even values, inside the frame) of an NV12
 /// buffer. `None` for anything else, so it can never read out of bounds.
-fn nv12_rect(width: u32, height: u32, buf: &[u8], rect: (u32, u32, u32, u32)) -> Option<Nv12Frame> {
+/// The whole frame is `buf` itself, moved (padding past the frame cut off):
+/// a 720p frame is 1.4 MB not copied per frame.
+fn nv12_rect<B: AsRef<[u8]> + Into<Vec<u8>>>(
+    width: u32,
+    height: u32,
+    buf: B,
+    rect: (u32, u32, u32, u32),
+) -> Option<Nv12Frame> {
     let (fw, fh) = (width as usize, height as usize);
     let (x, y, w, h) = (
         rect.0 as usize,
@@ -428,16 +441,22 @@ fn nv12_rect(width: u32, height: u32, buf: &[u8], rect: (u32, u32, u32, u32)) ->
         rect.2 as usize,
         rect.3 as usize,
     );
+    let len = fw * fh * 3 / 2;
     if [x, y, w, h, fw, fh].iter().any(|v| v % 2 != 0)
         || w == 0
         || h == 0
         || x + w > fw
         || y + h > fh
-        || buf.len() < fw * fh * 3 / 2
+        || buf.as_ref().len() < len
     {
         return None;
     }
-    let (luma, uv) = buf.split_at(fw * fh);
+    if (x, y, w, h) == (0, 0, fw, fh) {
+        let mut data: Vec<u8> = buf.into();
+        data.truncate(len);
+        return Nv12Frame::new(rect.2, rect.3, data).ok();
+    }
+    let (luma, uv) = buf.as_ref().split_at(fw * fh);
     let mut data = Vec::with_capacity(w * h * 3 / 2);
     for r in y..y + h {
         data.extend_from_slice(&luma[r * fw + x..r * fw + x + w]);
@@ -610,7 +629,7 @@ mod tests {
             let full = to_bgra(fmt, w as u32, h as u32, data).unwrap();
             for crop in crops() {
                 let (got, twin) =
-                    decode_cropped(fmt, w as u32, h as u32, data, &crop, true).unwrap();
+                    decode_cropped(fmt, w as u32, h as u32, data.as_slice(), &crop, true).unwrap();
                 let want = apply_crop(full.clone(), &crop);
                 assert_eq!(got, want, "{fmt:?} {crop:?}");
                 // the twin is the same rectangle of the raw NV12
@@ -640,7 +659,7 @@ mod tests {
             w: 0.5,
             h: 0.5,
         };
-        let (f, twin) = decode_cropped(RawFormat::Mjpeg, 16, 16, &jpg, &crop, true).unwrap();
+        let (f, twin) = decode_cropped(RawFormat::Mjpeg, 16, 16, &jpg[..], &crop, true).unwrap();
         assert_eq!((f.width, f.height), (8, 8));
         assert!(twin.is_none());
     }
@@ -649,16 +668,42 @@ mod tests {
     fn nv12_twin_not_made_unless_wanted_and_bad_input_is_none() {
         use crate::decode::RawFormat;
         let data = nv12_data(8, 8);
-        let (_, twin) = decode_cropped(RawFormat::Nv12, 8, 8, &data, &Crop::FULL, false).unwrap();
+        let (_, twin) =
+            decode_cropped(RawFormat::Nv12, 8, 8, &data[..], &Crop::FULL, false).unwrap();
         assert!(twin.is_none(), "gate off: no copy");
-        assert!(nv12_rect(8, 8, &data, (0, 0, 8, 8)).is_some());
+        assert!(nv12_rect(8, 8, &data[..], (0, 0, 8, 8)).is_some());
         assert!(
             nv12_rect(8, 8, &data[..10], (0, 0, 8, 8)).is_none(),
             "short"
         );
-        assert!(nv12_rect(7, 8, &data, (0, 0, 6, 8)).is_none(), "odd width");
-        assert!(nv12_rect(8, 8, &data, (6, 0, 4, 4)).is_none(), "outside");
-        assert!(nv12_rect(8, 8, &data, (1, 0, 2, 2)).is_none(), "odd x");
+        assert!(
+            nv12_rect(7, 8, &data[..], (0, 0, 6, 8)).is_none(),
+            "odd width"
+        );
+        assert!(
+            nv12_rect(8, 8, &data[..], (6, 0, 4, 4)).is_none(),
+            "outside"
+        );
+        assert!(nv12_rect(8, 8, &data[..], (1, 0, 2, 2)).is_none(), "odd x");
+    }
+
+    /// M1: with a full-frame crop the NV12 twin is the camera's own buffer
+    /// (moved, not copied); a crop still copies just its rectangle.
+    #[test]
+    fn full_frame_nv12_reuses_the_camera_buffer() {
+        use crate::decode::RawFormat;
+        let mut data = nv12_data(8, 8);
+        data.extend_from_slice(&[7; 6]); // driver padding past the frame
+        let ptr = data.as_ptr();
+        let (_, twin) = decode_cropped(RawFormat::Nv12, 8, 8, data, &Crop::FULL, true).unwrap();
+        let n = twin.expect("nv12 twin");
+        assert_eq!(n.data.as_ptr(), ptr, "full-frame NV12 was copied");
+        assert_eq!(n.data, nv12_data(8, 8));
+        // The camera's shared buffer type: moved too while we hold the only ref.
+        let bytes = bytes::Bytes::from(nv12_data(8, 8));
+        let ptr = bytes.as_ptr();
+        let (_, twin) = decode_cropped(RawFormat::Nv12, 8, 8, bytes, &Crop::FULL, true).unwrap();
+        assert_eq!(twin.expect("nv12 twin").data.as_ptr(), ptr, "Bytes copied");
     }
 
     #[test]
