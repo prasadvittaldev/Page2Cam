@@ -7,6 +7,7 @@ mod engine;
 mod health;
 mod logging;
 mod pattern;
+mod power;
 mod restart;
 mod update;
 mod video;
@@ -336,6 +337,10 @@ fn run() -> anyhow::Result<i32> {
         }
     };
     let started = std::time::Instant::now();
+    // Offscreen with no window, Windows would treat us as a background app
+    // and throttle the CPU (EcoQoS). The Chromium helpers follow in the
+    // p2c-mic-delay thread below.
+    power::opt_out_self();
     // CEF can kill the whole process (e.g. "GPU process isn't usable.
     // Goodbye."), and then the relaunch at the end of `run` never happens:
     // let Windows restart us after a crash instead (R38). Undone in `finish`.
@@ -660,8 +665,11 @@ fn run() -> anyhow::Result<i32> {
         std::thread::Builder::new()
             .name("p2c-mic-delay".into())
             .spawn(move || {
-                // Also the health samples, every 4th round (~1 s).
+                // Also the health samples, every 4th round (~1 s), and the
+                // power-throttling opt-out for new Chromium helpers (and
+                // ffmpeg): 5 s after start, then every 30 s.
                 let mut round = 0u32;
+                let mut helpers = power::ChildOptOut::default();
                 while !quit.load(std::sync::atomic::Ordering::Relaxed) {
                     app.update_mic_delay();
                     // History moves (Back/Forward, the page itself) must not leave one
@@ -669,6 +677,9 @@ fn run() -> anyhow::Result<i32> {
                     app.keep_page_off_background();
                     if round.is_multiple_of(4) {
                         app.sample_health();
+                    }
+                    if round % 120 == 20 {
+                        helpers.sweep();
                     }
                     round = round.wrapping_add(1);
                     std::thread::sleep(std::time::Duration::from_millis(250));

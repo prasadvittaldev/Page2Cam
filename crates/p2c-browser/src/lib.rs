@@ -445,6 +445,19 @@ fn should_exit(closed: bool, closing_since: Option<Instant>, now: Instant) -> bo
     closed || closing_since.is_some_and(|t| now.duration_since(t) > Duration::from_secs(3))
 }
 
+/// Chromium switches without a value, added to every launch.
+const FLAG_SWITCHES: &[&str] = &[
+    "noerrdialogs",
+    "hide-crash-restore-bubble",
+    "disable-session-crashed-bubble",
+    "use-mock-keychain",
+    // The page is offscreen, so Chromium would treat its renderer as hidden:
+    // lower its priority (Windows then gave it Idle priority and EcoQoS) and
+    // throttle its timers. The camera shows it live, so neither.
+    "disable-renderer-backgrounding",
+    "disable-background-timer-throttling",
+];
+
 /// `adapter_luid`: value for `use-adapter-luid` (see [`luid_switch_value`]).
 pub(crate) fn add_switches(cmd: &mut cef::CommandLine, adapter_luid: Option<&str>) {
     if let Some(v) = adapter_luid {
@@ -453,13 +466,8 @@ pub(crate) fn add_switches(cmd: &mut cef::CommandLine, adapter_luid: Option<&str
             Some(&CefString::from(v)),
         );
     }
-    for s in [
-        "noerrdialogs",
-        "hide-crash-restore-bubble",
-        "disable-session-crashed-bubble",
-        "use-mock-keychain",
-    ] {
-        cmd.append_switch(Some(&CefString::from(s)));
+    for s in FLAG_SWITCHES {
+        cmd.append_switch(Some(&CefString::from(*s)));
     }
     // Pages with video should start playing without a click.
     cmd.append_switch_with_value(
@@ -471,6 +479,18 @@ pub(crate) fn add_switches(cmd: &mut cef::CommandLine, adapter_luid: Option<&str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renderers_are_never_backgrounded() {
+        // Windows put an offscreen renderer at Idle priority with EcoQoS:
+        // Chromium must not background it nor throttle its timers.
+        for s in [
+            "disable-renderer-backgrounding",
+            "disable-background-timer-throttling",
+        ] {
+            assert!(FLAG_SWITCHES.contains(&s), "missing switch {s}");
+        }
+    }
 
     #[test]
     fn exits_when_browser_closed_without_shutdown_command() {
