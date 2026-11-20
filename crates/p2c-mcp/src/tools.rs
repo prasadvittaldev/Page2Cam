@@ -330,6 +330,9 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
             if u.is_empty() || u.len() > MAX_URL_BYTES {
                 return Err("url must be 1 to 8192 characters".into());
             }
+            if !file_url_is_local(u) {
+                return Err("file: URLs must name a local file (file:///C:/...); network shares are not allowed".into());
+            }
             Ok(C::OpenUrl(u.to_string()))
         })(),
         "navigate" => (|| {
@@ -523,7 +526,45 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
     r.map_err(Some)
 }
 
+/// Non-`file:` URLs pass; a `file:` URL only as `file:///<path>` or
+/// `file://localhost/<path>` (no host: a UNC host would make Windows send
+/// the user's credentials there).
+fn file_url_is_local(u: &str) -> bool {
+    let Some(scheme) = u.get(..5) else { return true };
+    if !scheme.eq_ignore_ascii_case("file:") {
+        return true;
+    }
+    let rest = &u[5..];
+    if rest.contains('\\') {
+        return false;
+    }
+    let lower = rest.to_ascii_lowercase();
+    let path = if let Some(p) = lower.strip_prefix("//localhost/") {
+        p
+    } else if let Some(p) = lower.strip_prefix("///") {
+        p
+    } else {
+        return false;
+    };
+    // `file:////host/...` is a share too.
+    !path.starts_with('/')
+}
+
+/// A path on a local drive (`C:\...`; elsewhere an absolute `/...`), never
+/// a network share (`\\host\...`, `//host/...`, `\\?\UNC\...`).
+fn is_local_drive_path(p: &str) -> bool {
+    if cfg!(windows) {
+        let b = p.as_bytes();
+        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    } else {
+        p.starts_with('/') && !p.starts_with("//")
+    }
+}
+
 fn read_picture(path: &str) -> Result<Vec<u8>, String> {
+    if !is_local_drive_path(path) {
+        return Err("path must be a local file on a drive (like C:\\Pictures\\a.png); network shares are not allowed".into());
+    }
     let p = std::path::Path::new(path);
     let meta = std::fs::metadata(p).map_err(|e| format!("cannot read {path}: {e}"))?;
     if !meta.is_file() {

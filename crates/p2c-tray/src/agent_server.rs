@@ -985,6 +985,22 @@ mod tests {
     }
 
     #[test]
+    fn the_bridge_names_its_agent_without_a_session() {
+        let r = rig(0, true);
+        let p = r.server.port();
+        let (code, _, body) = req(
+            p,
+            "POST",
+            "/mcp",
+            &[host(p), auth(&"a".repeat(32)), ("X-P2C-Agent", "Cursor".into())],
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stop","arguments":{}}}"#,
+        );
+        assert_eq!(code, 200, "{body}");
+        let a = r.server.agents_json();
+        assert_eq!(a["activity"][0]["agent"], "Cursor", "{a}");
+    }
+
+    #[test]
     fn endless_request_line_is_cut_off() {
         let r = rig(0, true);
         let p = r.server.port();

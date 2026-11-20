@@ -441,6 +441,38 @@ mod tests {
     }
 
     #[test]
+    fn network_shares_are_refused() {
+        // A share would make Windows send the user's credentials (NTLM) to
+        // whatever host the agent names.
+        let refused: Vec<(&str, Value)> = vec![
+            ("upload_background_image", json!({ "row": "full", "path": "\\\\evil\\share\\a.png" })),
+            ("upload_background_image", json!({ "row": "full", "path": "//evil/share/a.png" })),
+            ("upload_background_image", json!({ "row": "full", "path": "\\\\?\\UNC\\evil\\s\\a.png" })),
+            ("upload_background_image", json!({ "row": "full", "path": "relative\\a.png" })),
+            ("open_url", json!({ "url": "file://evil/share/x.html" })),
+            ("open_url", json!({ "url": "FILE:////evil/share/x.html" })),
+            ("open_url", json!({ "url": "file:\\\\evil\\share\\x.html" })),
+            ("open_url", json!({ "url": "file:/\\evil\\share" })),
+        ];
+        for (name, args) in refused {
+            let s = server();
+            let t = std::time::Instant::now();
+            let r = call(&s, name, args.clone());
+            assert_eq!(r["result"]["isError"], true, "{args}: {r}");
+            // Refused by the rule, not by a failed attempt to reach it.
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("local"), "{args}: {text}");
+            assert!(t.elapsed() < std::time::Duration::from_millis(200), "{args}: tried the network");
+            assert!(s.backend().calls.borrow().is_empty(), "{args}");
+        }
+        for url in ["file:///C:/Users/u/Documents/a.html", "file://localhost/C:/a.html", "https://example.com/"] {
+            let s = server();
+            let r = call(&s, "open_url", json!({ "url": url }));
+            assert_eq!(r["result"]["isError"], false, "{url}: {r}");
+        }
+    }
+
+    #[test]
     fn background_tools_validate() {
         let cases: Vec<(&str, Value)> = vec![
             ("set_background", json!({ "full": "video" })),
