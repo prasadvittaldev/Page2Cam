@@ -14,14 +14,25 @@ pub enum MenuId {
     Update = 5,
     Autostart = 6,
     Quit = 7,
+    /// "Allow agents" (checkbox).
+    Agents = 8,
 }
 
 impl MenuId {
     pub fn from_u32(v: u32) -> Option<MenuId> {
         use MenuId::*;
-        [Start, Stop, OpenPage, ForceRestart, Update, Autostart, Quit]
-            .into_iter()
-            .find(|m| *m as u32 == v)
+        [
+            Start,
+            Stop,
+            OpenPage,
+            ForceRestart,
+            Update,
+            Autostart,
+            Quit,
+            Agents,
+        ]
+        .into_iter()
+        .find(|m| *m as u32 == v)
     }
 }
 
@@ -55,12 +66,14 @@ pub struct UpdateOffer {
 }
 
 /// The menu for `state`. `status` is the first, informational line (the
-/// tooltip text).
+/// tooltip text). `agents`: "Allow agents" checked or not (`None`: the agent
+/// endpoint isn't available, so no item).
 pub fn entries(
     state: &TrayState,
     status: &str,
     update: Option<&UpdateOffer>,
     autostart: bool,
+    agents: Option<bool>,
 ) -> Vec<Entry> {
     let mut v = vec![
         Entry::Item {
@@ -97,6 +110,14 @@ pub fn entries(
         enabled: true,
         checked: autostart,
     });
+    if let Some(on) = agents {
+        v.push(Entry::Item {
+            id: Some(MenuId::Agents),
+            label: "Allow agents (Claude, Codex…)".into(),
+            enabled: true,
+            checked: on,
+        });
+    }
     v.push(Entry::Separator);
     v.push(item(MenuId::Quit, "Quit Page2Cam", true));
     v
@@ -138,7 +159,7 @@ mod tests {
     #[test]
     fn menu_follows_state() {
         use MenuId::*;
-        let stopped = entries(&TrayState::Stopped, "Page2Cam — stopped", None, false);
+        let stopped = entries(&TrayState::Stopped, "Page2Cam — stopped", None, false, None);
         assert_eq!(
             ids(&stopped),
             vec![
@@ -149,7 +170,7 @@ mod tests {
                 (Quit, true)
             ]
         );
-        let running = entries(&TrayState::Running, "x", None, true);
+        let running = entries(&TrayState::Running, "x", None, true, None);
         assert!(ids(&running).contains(&(Stop, true)));
         assert!(ids(&running).contains(&(OpenPage, true)));
         assert!(running.iter().any(|e| matches!(
@@ -167,10 +188,39 @@ mod tests {
             "x",
             None,
             false,
+            None,
         );
         assert!(ids(&stopping).contains(&(Stop, false)));
-        let err = entries(&TrayState::Error("boom".into()), "x", None, false);
+        let err = entries(&TrayState::Error("boom".into()), "x", None, false, None);
         assert!(ids(&err).contains(&(Start, true)));
+    }
+
+    #[test]
+    fn allow_agents_item_shows_its_state() {
+        let checked = |e: &[Entry]| {
+            e.iter().find_map(|x| match x {
+                Entry::Item {
+                    id: Some(MenuId::Agents),
+                    checked,
+                    enabled,
+                    ..
+                } => Some((*checked, *enabled)),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            checked(&entries(&TrayState::Stopped, "x", None, false, Some(true))),
+            Some((true, true))
+        );
+        assert_eq!(
+            checked(&entries(&TrayState::Running, "x", None, false, Some(false))),
+            Some((false, true))
+        );
+        assert_eq!(
+            checked(&entries(&TrayState::Running, "x", None, false, None)),
+            None
+        );
+        assert_eq!(MenuId::from_u32(8), Some(MenuId::Agents));
     }
 
     #[test]
@@ -179,7 +229,7 @@ mod tests {
             version: "0.4.0".into(),
             can_install: true,
         };
-        let e = entries(&TrayState::Stopped, "x", Some(&offer), false);
+        let e = entries(&TrayState::Stopped, "x", Some(&offer), false, None);
         assert!(e
             .iter()
             .any(|x| matches!(x, Entry::Item { label, .. } if label == "Install update 0.4.0")));
@@ -187,11 +237,11 @@ mod tests {
             can_install: false,
             ..offer
         };
-        let e = entries(&TrayState::Stopped, "x", Some(&portable), false);
+        let e = entries(&TrayState::Stopped, "x", Some(&portable), false, None);
         assert!(e.iter().any(
             |x| matches!(x, Entry::Item { label, .. } if label.starts_with("Download update 0.4.0"))
         ));
-        assert!(!ids(&entries(&TrayState::Stopped, "x", None, false))
+        assert!(!ids(&entries(&TrayState::Stopped, "x", None, false, None))
             .iter()
             .any(|(id, _)| *id == MenuId::Update));
         assert_eq!(MenuId::from_u32(5), Some(MenuId::Update));

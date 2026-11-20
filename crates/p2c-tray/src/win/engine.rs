@@ -39,13 +39,20 @@ pub struct Engine {
 unsafe impl Send for Engine {}
 
 /// Start the engine for generation `gen`; its exit and polls go to `tx`.
-pub fn spawn(gen: u64, port: u16, token: &str, tx: Sender<Cmd>) -> anyhow::Result<Engine> {
+/// `extra_env` carries the tray endpoint's address and token.
+pub fn spawn(
+    gen: u64,
+    port: u16,
+    token: &str,
+    extra_env: &[(String, String)],
+    tx: Sender<Cmd>,
+) -> anyhow::Result<Engine> {
     let cmd = crate::launch::engine_command(port, std::process::id(), token)
         .context("the admin token is not valid")?;
     let exe = std::env::current_exe().context("finding page2cam.exe")?;
     let mut child = Command::new(&exe)
         .args(&cmd.args)
-        .envs(cmd.env.iter().map(|(k, v)| (k, v)))
+        .envs(cmd.env.iter().chain(extra_env).map(|(k, v)| (k, v)))
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

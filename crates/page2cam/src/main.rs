@@ -6,6 +6,7 @@ mod config;
 mod engine;
 mod health;
 mod logging;
+mod mcp_bridge;
 mod pattern;
 mod power;
 mod restart;
@@ -149,12 +150,27 @@ impl Cli {
 }
 
 fn main() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // Started by a desktop agent: the stdio MCP bridge (stdout is JSON-RPC
+    // only; it uses the pipes the agent gave, never a console). Checked
+    // first, before anything else runs: the marker lock below must exist as
+    // early as possible, or a sweep starting at the same moment could stop
+    // the bridge while it starts.
+    if is_mcp_args(&args) {
+        // Marks this process as a bridge: engine starts and the tray's
+        // leftover sweeps spare it (they would cut the agent off).
+        // (Linux reads the command line instead; no lock files left behind.)
+        let marker =
+            cfg!(windows).then(|| p2c_proc::try_lock(&p2c_proc::mcp_lock_name(std::process::id())));
+        let code = mcp_bridge::run();
+        drop(marker);
+        std::process::exit(code);
+    }
     // CEF re-launches this executable for its helper processes; handle that
-    // first (they never attach a console or print).
+    // next (they never attach a console or print; `--mcp` is never theirs).
     if let Some(code) = p2c_browser::maybe_run_subprocess() {
         std::process::exit(code);
     }
-    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     // Windows without a role flag: the tray (no console; its own log file).
     if is_tray_args(&args, cfg!(windows)) {
         run_tray(&args);
@@ -193,6 +209,11 @@ fn main() {
 /// decide about the console and logging).
 fn is_engine_args(args: &[std::ffi::OsString]) -> bool {
     args.iter().skip(1).any(|a| a == "--engine")
+}
+
+/// `--mcp` as the only argument: the MCP bridge role.
+fn is_mcp_args(args: &[std::ffi::OsString]) -> bool {
+    p2c_proc::is_mcp_args(args)
 }
 
 /// The tray role: Windows and neither `--engine` nor `--standalone`.
@@ -277,6 +298,8 @@ fn run() -> anyhow::Result<i32> {
     // from ours so Chromium's helpers and ffmpeg don't inherit it.
     let admin_token = engine::admin_token(role, std::env::var(engine::TOKEN_ENV).ok());
     std::env::remove_var(engine::TOKEN_ENV);
+    // Same for the tray endpoint's address and token (read once, now).
+    let _ = p2c_admin::TrayLink::global();
     // Engine nobody can reach: stop before touching anything (no
     // stop_others, camera or Chromium).
     let admin_token = match admin_token {
@@ -1277,6 +1300,10 @@ mod tests {
         // Other flags without a role still mean the tray (ignored there).
         assert!(is_tray_args(&a(&["page2cam", "--no-open"]), true));
         assert!(!is_tray_args(&a(&["page2cam", "--standalone"]), true));
+        // The MCP bridge: exactly `--mcp`.
+        assert!(is_mcp_args(&a(&["page2cam", "--mcp"])));
+        assert!(!is_mcp_args(&a(&["page2cam"])));
+        assert!(!is_mcp_args(&a(&["page2cam", "--engine", "--mcp"])));
         assert!(!is_tray_args(
             &a(&["page2cam", "--engine", "--parent-pid", "1"]),
             true

@@ -1151,6 +1151,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ui_has_agents_panel() {
+        let r = app(Arc::default())
+            .oneshot(req("GET", "/?t=abc123", "127.0.0.1:8765", None, None))
+            .await
+            .unwrap();
+        let html = body_string(r).await;
+        for id in [
+            "h-agents",
+            "agentsNA",
+            "agentsBody",
+            "agentsAllowed",
+            "agentsRegistered",
+            "agentsSnippetStdio",
+            "agentsSnippetUrl",
+            "agentsReset",
+            "agentsActivity",
+            "agentsErr",
+        ] {
+            assert!(html.contains(&format!("id=\"{id}\"")), "missing id {id}");
+        }
+        // Server text goes in as text, never as markup.
+        let script = &html[html.find("Agents panel").expect("agents script")..];
+        assert!(!script.contains("innerHTML"));
+    }
+
+    #[tokio::test]
     async fn ui_has_background_section() {
         let r = app(Arc::default())
             .oneshot(req("GET", "/?t=abc123", "127.0.0.1:8765", None, None))

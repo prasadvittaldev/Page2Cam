@@ -67,9 +67,62 @@ pub fn icon_rgba(level: Level, size: u32) -> Vec<u8> {
     img
 }
 
+/// Agent badge colour (brand blue).
+pub const AGENT_BADGE: [u8; 3] = [0x0b, 0x63, 0xf0];
+
+/// [`icon_rgba`] plus, when `agent` (an agent made a call in the last
+/// minute), a small brand-blue dot with a white ring in the top-right corner.
+pub fn icon_rgba_for(level: Level, size: u32, agent: bool) -> Vec<u8> {
+    let mut img = icon_rgba(level, size);
+    if !agent {
+        return img;
+    }
+    let s = size as f32;
+    let r = (s * 0.16).max(2.0);
+    let ring = (s / 16.0).max(1.0);
+    let (cx, cy) = (s - r - ring, r + ring);
+    for y in 0..size {
+        for x in 0..size {
+            let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+            let d = (dx * dx + dy * dy).sqrt();
+            let rgb = if d <= r {
+                AGENT_BADGE
+            } else if d <= r + ring {
+                [0xff, 0xff, 0xff]
+            } else {
+                continue;
+            };
+            let i = ((y * size + x) * 4) as usize;
+            img[i..i + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 0xff]);
+        }
+    }
+    img
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_badge_sits_top_right() {
+        for size in [16u32, 32] {
+            let plain = icon_rgba_for(Level::Green, size, false);
+            assert_eq!(plain, icon_rgba(Level::Green, size));
+            let badged = icon_rgba_for(Level::Green, size, true);
+            let s = size as f32;
+            let r = (s * 0.16).max(2.0);
+            let ring = (s / 16.0).max(1.0);
+            let (cx, cy) = ((s - r - ring) as u32, (r + ring) as u32);
+            let [br, bg, bb] = AGENT_BADGE;
+            assert_eq!(px(&badged, size, cx, cy), [br, bg, bb, 255], "{size}");
+            // The health dot (bottom right) is unchanged.
+            let (c, _, _) = dot_geometry(size);
+            assert_eq!(
+                px(&badged, size, c as u32, c as u32),
+                px(&plain, size, c as u32, c as u32)
+            );
+        }
+    }
 
     fn px(img: &[u8], size: u32, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * size + x) * 4) as usize;

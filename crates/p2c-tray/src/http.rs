@@ -29,6 +29,106 @@ pub fn request(port: u16, method: &str, path: &str, token: &str) -> anyhow::Resu
     parse_response(&raw)
 }
 
+/// One request with an optional body (`content type`, bytes) and an overall
+/// `timeout`; returns (status, body bytes). Bodies above `max` are an error.
+pub fn request_full(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<(&str, &[u8])>,
+    timeout: Duration,
+    max: u64,
+) -> anyhow::Result<(u16, Vec<u8>)> {
+    let deadline = std::time::Instant::now() + timeout;
+    let left = || {
+        deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| anyhow::anyhow!("Page2Cam did not answer in {} s", timeout.as_secs()))
+    };
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut s = TcpStream::connect_timeout(&addr, left()?.min(TIMEOUT))?;
+    s.set_write_timeout(Some(left()?))?;
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-P2C-Token: {token}\r\nConnection: close\r\n"
+    );
+    let bytes = match body {
+        Some((kind, b)) => {
+            head.push_str(&format!(
+                "Content-Type: {kind}\r\nContent-Length: {}\r\n",
+                b.len()
+            ));
+            b
+        }
+        None => {
+            head.push_str("Content-Length: 0\r\n");
+            &[][..]
+        }
+    };
+    head.push_str("\r\n");
+    s.write_all(head.as_bytes())?;
+    s.write_all(bytes)?;
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        s.set_read_timeout(Some(left()?))?;
+        let n = s.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+        anyhow::ensure!(
+            raw.len() as u64 <= max + 64 * 1024,
+            "the answer is too large"
+        );
+    }
+    parse_response_bytes(&raw)
+}
+
+/// [`parse_response`] for binary bodies.
+pub fn parse_response_bytes(raw: &[u8]) -> anyhow::Result<(u16, Vec<u8>)> {
+    let end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("incomplete HTTP response"))?;
+    let head = String::from_utf8_lossy(&raw[..end]);
+    let body = &raw[end + 4..];
+    let mut lines = head.split("\r\n");
+    let status: u16 = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("bad HTTP status line"))?;
+    let chunked = lines.any(|l| {
+        l.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("transfer-encoding")
+                && v.trim().eq_ignore_ascii_case("chunked")
+        })
+    });
+    if !chunked {
+        return Ok((status, body.to_vec()));
+    }
+    let mut out = Vec::new();
+    let mut rest = body;
+    loop {
+        let nl = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| anyhow::anyhow!("bad chunk"))?;
+        let size_text = String::from_utf8_lossy(&rest[..nl]);
+        let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)?;
+        rest = &rest[nl + 2..];
+        if size == 0 {
+            return Ok((status, out));
+        }
+        anyhow::ensure!(rest.len() >= size, "short chunk");
+        out.extend_from_slice(&rest[..size]);
+        rest = &rest[size..];
+        rest = rest.strip_prefix(b"\r\n").unwrap_or(rest);
+    }
+}
+
 /// Split a full HTTP/1.1 response into status and body (handles chunked).
 pub fn parse_response(raw: &[u8]) -> anyhow::Result<(u16, String)> {
     let text = String::from_utf8_lossy(raw);

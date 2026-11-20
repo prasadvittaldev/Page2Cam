@@ -165,6 +165,10 @@
   .corners { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .state { font-size: 13px; color: var(--muted); min-height: 1.4em; word-break: break-word; }
   .state.err { color: var(--amber); }
+  .snippet { font-size: 12px; background: var(--well); border: 1px solid var(--line); padding: 6px; border-radius: 6px; overflow-x: auto; white-space: pre; max-width: 100%; }
+  .activity { font-size: 13px; padding-left: 18px; margin: 4px 0; max-height: 220px; overflow-y: auto; }
+  .activity li { margin: 2px 0; word-break: break-word; }
+  li.bad { color: var(--amber); }
   /* Background choices: tiles with a small preview each. */
   .tiles { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
   .tile {
@@ -379,6 +383,32 @@
         <input type="range" id="micGain" min="0" max="150" aria-label="Microphone volume">
       </div>
       <div class="state" id="micState"></div>
+    </section>
+
+    <section class="panel" id="agentsPanel" aria-labelledby="h-agents">
+      <h2 id="h-agents">Agents</h2>
+      <p class="sub" id="agentsNA">Not available: Page2Cam runs without its tray (standalone), or the tray is not answering.</p>
+      <div id="agentsBody" hidden>
+        <div class="row">
+          <input type="checkbox" id="agentsAllowed">
+          <label for="agentsAllowed">Allow agents (Claude, Codex, Cursor…) to control Page2Cam</label>
+        </div>
+        <p class="sub">Agents act without asking. Each change is listed below, and the tray tells you when one starts or stops Page2Cam or your stream. Restart Claude Desktop after switching this on.</p>
+        <ul class="sub" id="agentsRegistered"></ul>
+        <details>
+          <summary class="sub">Set up another agent</summary>
+          <p class="sub">Command (stdio):</p>
+          <pre class="snippet" id="agentsSnippetStdio"></pre>
+          <button class="btn" data-copy="agentsSnippetStdio">Copy</button>
+          <p class="sub">Local address (token in %LOCALAPPDATA%\page2cam\agent.json):</p>
+          <pre class="snippet" id="agentsSnippetUrl"></pre>
+          <button class="btn" data-copy="agentsSnippetUrl">Copy</button>
+        </details>
+        <div class="row"><button class="btn" id="agentsReset">Reset agent access</button></div>
+        <p class="sub">Activity</p>
+        <ol class="activity" id="agentsActivity"></ol>
+        <div class="state" id="agentsErr"></div>
+      </div>
     </section>
   </aside>
 </main>
@@ -1011,6 +1041,7 @@
       $("restartRow").hidden = !s.restart_needed;
       $("restartText").textContent = s.gpu_override ? "Restart to try the GPU again" : "Restart Page2Cam to apply";
       showUpdate(s.update);
+      syncAgents(s);
       setState("micState", /^error/.test(s.mic) ? s.mic : s.mic === "none" ? "No microphone found." : "");
       const camOn = /^ok/.test(s.vcam);
       const mon = $("monitor");
@@ -1024,6 +1055,60 @@
       setState("streamState", "error: Page2Cam is not responding. Is it still running?");
     }
   }
+  // ---- Agents panel (proxied to the tray by /api/agents) ----
+  let agentsShown = false;
+  function renderAgents(a) {
+    $("agentsAllowed").checked = !!a.allowed;
+    const reg = $("agentsRegistered");
+    reg.replaceChildren(...(a.registered || []).map((r) => {
+      const li = document.createElement("li");
+      li.textContent = r.app + (r.ok ? ": registered" : ": " + (r.error || "failed"));
+      if (!r.ok) li.className = "bad";
+      return li;
+    }));
+    $("agentsSnippetStdio").textContent = (a.snippets && a.snippets.stdio) || "";
+    $("agentsSnippetUrl").textContent = (a.snippets && a.snippets.url) || "";
+    const act = $("agentsActivity");
+    const items = (a.activity || []).map((e) => {
+      const li = document.createElement("li");
+      const t = new Date(e.time * 1000).toLocaleTimeString();
+      li.textContent = t + " · " + e.agent + " · " + e.action + (e.result === "ok" ? "" : " — " + e.result);
+      if (e.result !== "ok") li.className = "bad";
+      return li;
+    });
+    if (!items.length) {
+      const li = document.createElement("li");
+      li.textContent = "No agent activity yet.";
+      items.push(li);
+    }
+    act.replaceChildren(...items);
+  }
+  async function loadAgents(body) {
+    try {
+      const r = await api("/api/agents", body);
+      if (!r.ok) { bgMessage("agentsErr", await errorText(r)); return; }
+      bgMessage("agentsErr", "");
+      renderAgents(await r.json());
+    } catch { bgMessage("agentsErr", "The tray did not answer."); }
+  }
+  $("agentsAllowed").addEventListener("change", (e) => loadAgents({ allowed: e.target.checked }));
+  $("agentsReset").addEventListener("click", () => loadAgents({ reset_token: true }).then(() =>
+    bgMessage("agentsErr", "New access token. Agents set up by Page2Cam keep working; clients using the local address need the new token from agent.json.", false)));
+  document.querySelectorAll("[data-copy]").forEach((b) => b.addEventListener("click", () => {
+    const text = $(b.dataset.copy).textContent;
+    if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+  }));
+  function syncAgents(s) {
+    const available = s.agents_allowed === true || s.agents_allowed === false;
+    $("agentsNA").hidden = available;
+    $("agentsBody").hidden = !available;
+    if (available && !agentsShown) { agentsShown = true; loadAgents(); }
+    if (!available) agentsShown = false;
+  }
+  setInterval(() => {
+    if (agentsShown && document.visibilityState === "visible") loadAgents();
+  }, 5000);
+
   refresh();
   setInterval(refresh, 1000);
 })();

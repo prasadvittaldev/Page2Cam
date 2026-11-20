@@ -62,7 +62,8 @@ struct Wnd {
     tx: Sender<Cmd>,
     ui: Arc<Ui>,
     icons: icon::Icons,
-    level: Option<Level>,
+    /// The icon shown: health level and agent badge.
+    level: Option<(Level, bool)>,
     tooltip: String,
     taskbar_created: u32,
     show_msg: u32,
@@ -213,12 +214,12 @@ fn add_icon(hwnd: HWND) {
         let Some(w) = w.as_mut() else { return };
         let (level, tip) = {
             let s = w.ui.state.lock();
-            (s.level, s.tooltip.clone())
+            ((s.level, s.agent_badge), s.tooltip.clone())
         };
         let mut d = nid(hwnd);
         d.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         d.uCallbackMessage = WM_TRAY;
-        if let Some(h) = w.icons.get(level) {
+        if let Some(h) = w.icons.get(level.0, level.1) {
             d.hIcon = h;
         }
         copy_wide(&mut d.szTip, &tip);
@@ -243,7 +244,7 @@ fn refresh(hwnd: HWND) {
     let (level, tip, balloons, show_menu, quit) = {
         let mut s = ui.state.lock();
         (
-            s.level,
+            (s.level, s.agent_badge),
             s.tooltip.clone(),
             std::mem::take(&mut s.balloons),
             std::mem::take(&mut s.show_menu),
@@ -266,7 +267,7 @@ fn refresh(hwnd: HWND) {
         if w.level != Some(level) || w.tooltip != tip {
             let mut d = nid(hwnd);
             d.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-            if let Some(h) = w.icons.get(level) {
+            if let Some(h) = w.icons.get(level.0, level.1) {
                 d.hIcon = h;
             }
             copy_wide(&mut d.szTip, &tip);

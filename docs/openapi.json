@@ -1,0 +1,104 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Page2Cam local admin API",
+    "version": "0.3.0",
+    "description": "The engine's control routes on http://127.0.0.1:<port>. Every request needs Host: 127.0.0.1:<port> (or localhost:<port>) and the per-launch token in X-P2C-Token (or ?t=). Bodies are JSON unless stated; at most 2 MB (pictures 20 MB). Errors: 4xx/5xx with {\"error\": \"…\"} or plain text."
+  },
+  "servers": [{ "url": "http://127.0.0.1:{port}", "variables": { "port": { "default": "8765" } } }],
+  "security": [{ "token": [] }],
+  "components": {
+    "securitySchemes": {
+      "token": { "type": "apiKey", "in": "header", "name": "X-P2C-Token" }
+    },
+    "schemas": {
+      "Pip": {
+        "type": "object",
+        "required": ["visible", "x", "y", "width"],
+        "properties": {
+          "visible": { "type": "boolean" },
+          "x": { "type": "number", "minimum": 0, "maximum": 1 },
+          "y": { "type": "number", "minimum": 0, "maximum": 1 },
+          "width": { "type": "number", "minimum": 0.05, "maximum": 0.5 },
+          "style": { "type": "string", "enum": ["box", "cutout-small", "cutout-full"] }
+        }
+      },
+      "Audio": {
+        "type": "object",
+        "required": ["page_on", "page_gain", "mic_on", "mic_gain"],
+        "properties": {
+          "page_on": { "type": "boolean" }, "page_gain": { "type": "number" },
+          "mic_on": { "type": "boolean" }, "mic_gain": { "type": "number" }
+        }
+      },
+      "Crop": {
+        "type": "object",
+        "required": ["x", "y", "w", "h"],
+        "properties": {
+          "x": { "type": "number" }, "y": { "type": "number" },
+          "w": { "type": "number" }, "h": { "type": "number" },
+          "save": { "type": "boolean", "description": "POST only: also write it to the settings file" }
+        }
+      },
+      "Background": {
+        "type": "object",
+        "required": ["full", "in_box"],
+        "properties": {
+          "full": { "type": "string", "enum": ["page", "image", "colour", "youtube", "blurred-room"] },
+          "full_colour": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" },
+          "full_youtube": { "type": "string", "description": "A YouTube link or video id" },
+          "in_box": { "type": "string", "enum": ["room", "blur", "image", "colour"] },
+          "box_colour": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" },
+          "refined_edges": { "type": "boolean" },
+          "full_image": { "type": "boolean", "readOnly": true },
+          "box_image": { "type": "boolean", "readOnly": true }
+        }
+      },
+      "Input": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["click", "move", "scroll", "key", "text"] },
+          "x": { "type": "number", "minimum": 0, "maximum": 1, "description": "0..1 of the output" },
+          "y": { "type": "number", "minimum": 0, "maximum": 1 },
+          "dx": { "type": "number" }, "dy": { "type": "number" },
+          "key": { "type": "string" }, "text": { "type": "string", "maxLength": 10000 }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/api/state": { "get": { "summary": "Status (never the stream key), overlay, audio, crop", "responses": { "200": { "description": "{status, pip, audio, crop}" } } } },
+    "/api/navigate": { "post": { "summary": "Show a page", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "required": ["url"], "properties": { "url": { "type": "string" } } } } } }, "responses": { "200": { "description": "{url} as normalised" }, "400": { "description": "Refused scheme or bad URL" } } } },
+    "/api/nav": { "post": { "summary": "Back / forward / reload", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "required": ["action"], "properties": { "action": { "type": "string", "enum": ["back", "forward", "reload"] } } } } } }, "responses": { "200": { "description": "Done" } } } },
+    "/api/input": { "post": { "summary": "Click, scroll, key or text in the page (output coordinates)", "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Input" } } } }, "responses": { "200": { "description": "{ok: true}" }, "400": { "description": "Out of range or unknown key" } } } },
+    "/api/snapshot": { "get": { "summary": "The current output as a 1280x720 JPEG", "responses": { "200": { "description": "image/jpeg" }, "503": { "description": "No frame yet" } } } },
+    "/api/pip": { "post": { "summary": "Webcam overlay layout and style", "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Pip" } } } }, "responses": { "200": { "description": "Done" }, "400": { "description": "Unknown style" } } } },
+    "/api/cutout": { "post": { "summary": "Cut-out model", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "required": ["engine"], "properties": { "engine": { "type": "string", "enum": ["quality", "fast"] } } } } } }, "responses": { "200": { "description": "Done" } } } },
+    "/api/crop": {
+      "get": { "summary": "Webcam crop", "responses": { "200": { "description": "Crop" } } },
+      "post": { "summary": "Set the webcam crop (clamped)", "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Crop" } } } }, "responses": { "200": { "description": "The crop as applied" } } }
+    },
+    "/api/audio": { "post": { "summary": "Stream sound", "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Audio" } } } }, "responses": { "200": { "description": "Done" } } } },
+    "/api/stream/start": { "post": { "summary": "Start the RTMP stream (empty key = the saved key)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "required": ["url"], "properties": { "url": { "type": "string" }, "key": { "type": "string" }, "remember": { "type": "boolean" } } } } } }, "responses": { "200": { "description": "Starting" } } } },
+    "/api/stream/stop": { "post": { "summary": "Stop the stream", "responses": { "200": { "description": "Done" } } } },
+    "/api/gpus": { "get": { "summary": "Video processing choices", "responses": { "200": { "description": "[{name, kind}]" } } } },
+    "/api/gpu": { "post": { "summary": "Save the GPU choice (applies after a restart)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "required": ["choice"], "properties": { "choice": { "type": "string" } } } } } }, "responses": { "200": { "description": "Saved" } } } },
+    "/api/restart": { "post": { "summary": "Restart Page2Cam", "responses": { "200": { "description": "Restarting" } } } },
+    "/api/quit": { "post": { "summary": "Stop Page2Cam", "responses": { "200": { "description": "Stopping" } } } },
+    "/api/update/install": { "post": { "summary": "Install the update on offer", "responses": { "200": { "description": "Installing" } } } },
+    "/api/background": {
+      "get": { "summary": "Background choices", "responses": { "200": { "description": "Background" } } },
+      "post": { "summary": "Apply and save background choices", "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Background" } } } }, "responses": { "200": { "description": "The choices as applied" }, "400": { "description": "Bad colour or link, or no picture uploaded" } } }
+    },
+    "/api/background/image": {
+      "get": { "summary": "The stored picture", "parameters": [{ "name": "row", "in": "query", "required": true, "schema": { "type": "string", "enum": ["full", "box"] } }], "responses": { "200": { "description": "image/png or image/jpeg" }, "404": { "description": "None" } } },
+      "post": { "summary": "Upload a picture (raw body, PNG/JPEG/WebP, at most 20 MB) and show it", "parameters": [{ "name": "row", "in": "query", "required": true, "schema": { "type": "string", "enum": ["full", "box"] } }], "requestBody": { "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } }, "responses": { "200": { "description": "Background" }, "413": { "description": "Larger than 20 MB" }, "415": { "description": "Not PNG, JPEG or WebP" } } }
+    },
+    "/api/background/thumb": { "get": { "summary": "YouTube thumbnail (fetched by Page2Cam)", "parameters": [{ "name": "link", "in": "query", "schema": { "type": "string" } }], "responses": { "200": { "description": "image/jpeg" } } } },
+    "/api/agents": {
+      "get": { "summary": "Agents panel data (from the tray)", "responses": { "200": { "description": "{allowed, url, registered, activity, snippets}" }, "503": { "description": "No tray (standalone)" } } },
+      "post": { "summary": "Switch agents on/off or reset their token", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "allowed": { "type": "boolean" }, "reset_token": { "type": "boolean" } } } } } }, "responses": { "200": { "description": "As GET" } } }
+    }
+  }
+}

@@ -18,6 +18,8 @@ p2c-segment.workspace = true
 p2c-update.workspace = true
 p2c-proc = { path = "../p2c-proc" }
 p2c-tray = { path = "../p2c-tray" }
+p2c-mcp = { path = "../p2c-mcp" }
+serde_json = "1"
 parking_lot.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

@@ -82,6 +82,22 @@ a note under the panel says so. Blur and Blurred room then blur everything,
 you included, rather than showing your room sharp.
 
 
+AI AGENTS (Claude, Codex, Cursor, VS Code)
+------------------------------------------
+Desktop AI agents can run Page2Cam for you: start it, show a page they
+write (e.g. your agenda), change the background, move the webcam overlay,
+take a snapshot of what the camera sends, start or stop your stream.
+It is OFF until you tick "Allow agents" in the tray menu (or the Agents
+panel of the control page). Page2Cam then adds itself to the agents it
+finds (restart Claude Desktop afterwards). Agents do not ask first: the
+Agents panel lists everything they did, and the tray tells you when one
+starts or stops Page2Cam or your stream. They can never see your stream
+key. Untick "Allow agents" to stop them at once.
+Uninstalling Page2Cam leaves the "page2cam" entry in the agents' settings;
+remove it there if the agent complains it can't start Page2Cam.
+Details: docs/agent-api.md in the source.
+
+
 THINGS TO TRY AND REPORT BACK
 -----------------------------
 [ ] The control page opens and shows the website.
