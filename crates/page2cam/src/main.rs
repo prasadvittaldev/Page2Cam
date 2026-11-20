@@ -6,6 +6,7 @@ mod config;
 mod engine;
 mod health;
 mod logging;
+mod mcp_bridge;
 mod pattern;
 mod restart;
 mod update;
@@ -155,6 +156,11 @@ fn main() {
         std::process::exit(code);
     }
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // Started by a desktop agent: the stdio MCP bridge (stdout is JSON-RPC
+    // only; it uses the pipes the agent gave, never a console).
+    if is_mcp_args(&args) {
+        std::process::exit(mcp_bridge::run());
+    }
     // Windows without a role flag: the tray (no console; its own log file).
     if is_tray_args(&args, cfg!(windows)) {
         run_tray(&args);
@@ -193,6 +199,11 @@ fn main() {
 /// decide about the console and logging).
 fn is_engine_args(args: &[std::ffi::OsString]) -> bool {
     args.iter().skip(1).any(|a| a == "--engine")
+}
+
+/// `--mcp` as the only argument: the MCP bridge role.
+fn is_mcp_args(args: &[std::ffi::OsString]) -> bool {
+    args.len() == 2 && args[1] == "--mcp"
 }
 
 /// The tray role: Windows and neither `--engine` nor `--standalone`.
@@ -1265,6 +1276,10 @@ mod tests {
         // Other flags without a role still mean the tray (ignored there).
         assert!(is_tray_args(&a(&["page2cam", "--no-open"]), true));
         assert!(!is_tray_args(&a(&["page2cam", "--standalone"]), true));
+        // The MCP bridge: exactly `--mcp`.
+        assert!(is_mcp_args(&a(&["page2cam", "--mcp"])));
+        assert!(!is_mcp_args(&a(&["page2cam"])));
+        assert!(!is_mcp_args(&a(&["page2cam", "--engine", "--mcp"])));
         assert!(!is_tray_args(
             &a(&["page2cam", "--engine", "--parent-pid", "1"]),
             true
