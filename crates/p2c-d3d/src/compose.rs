@@ -26,9 +26,9 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use p2c_compositor::{
-    fit_rect, pip_rect, plan_compose, refined_size, Backdrop, BoxBackdrop, ComposeNote,
+    fit_rect, pip_rect, plan_compose, refined_size, Backdrop, BoxBackdrop, Changed, ComposeNote,
     ComposePlan, FullBackdrop, Output, OutputFormat, OutputProducer, OutputSpec, Pip, PipDraw,
-    PipLayout, PlanBase, PlannedPip, TickInputs,
+    PipLayout, PlanBase, PlannedPip, RedrawWhy, TickInputs,
 };
 use p2c_core::{camera_size, EdgeRange, Frame, Mask, Nv12Frame};
 use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -192,27 +192,40 @@ fn same<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
 }
 
 impl Key {
+    /// A hidden PIP's webcam, mask and layout are left out: they change
+    /// nothing in the output ([`ComposePlan::shown_pip`]).
     fn of(page_seq: u64, inputs: &TickInputs) -> Key {
         let plan = plan_of(inputs);
+        let shown = plan.shown_pip();
         let (page_seq, cam) = match plan.base {
-            PlanBase::Page(_) => (page_seq, plan.pip.map(|p| p.cam.clone())),
+            PlanBase::Page(_) => (page_seq, shown.map(|p| p.cam.clone())),
             PlanBase::BlurredRoom(cam) => (0, Some(cam.clone())),
         };
         Key {
             page_seq,
             cam,
-            mask: plan.pip.and_then(|p| p.mask.cloned()),
-            layout: plan.pip.map(|p| p.layout),
+            mask: shown.and_then(|p| p.mask.cloned()),
+            layout: shown.map(|p| p.layout),
             backdrop: inputs.backdrop.clone(),
         }
     }
 
-    fn same_as(&self, o: &Key) -> bool {
-        self.page_seq == o.page_seq
-            && same(&self.cam, &o.cam)
-            && same(&self.mask, &o.mask)
-            && self.layout == o.layout
-            && self.backdrop == o.backdrop
+    /// What differs from `prev` (`None`: no previous composite).
+    fn changes(&self, prev: Option<&Key>) -> Changed {
+        let Some(o) = prev else {
+            return Changed {
+                other: true,
+                ..Changed::default()
+            };
+        };
+        Changed {
+            page: self.page_seq != o.page_seq,
+            webcam: !same(&self.cam, &o.cam),
+            mask: !same(&self.mask, &o.mask),
+            layout: self.layout != o.layout,
+            backdrop: self.backdrop != o.backdrop,
+            other: false,
+        }
     }
 }
 
@@ -341,6 +354,8 @@ pub struct GpuProducer {
     drain: u8,
     /// Counts composites (0 = none yet).
     composite: u64,
+    /// Composites by cause since the stats line last took them.
+    why: RedrawWhy,
     /// Debug builds: `P2C_FAKE_DEVICE_LOSS` → (fail after this many
     /// `produce` calls, calls so far).
     #[cfg(debug_assertions)]
@@ -425,6 +440,7 @@ impl GpuProducer {
             last: None,
             drain: 0,
             composite: 0,
+            why: RedrawWhy::default(),
             #[cfg(debug_assertions)]
             fake_loss: fake_loss_after().map(|n| (n, 0)),
             profiling: false,
@@ -741,16 +757,18 @@ impl GpuProducer {
             PlanBase::BlurredRoom(cam) => Some(cam),
             PlanBase::Page(_) => None,
         };
-        self.upload(
-            room_cam.or(plan.pip.map(|p| p.cam)),
-            plan.pip.and_then(|p| p.mask),
-        )?;
-        self.mark("upload")?;
-        let refined = inputs.backdrop.refined_edges;
+        // The PIP drawn (none while hidden or empty).
         let pip = plan.pip.and_then(|p| {
             let rect = pip_rect(&p.layout, p.cam.width, p.cam.height, ow, oh)?;
             (rect.2 > 0 && rect.3 > 0).then_some((p, rect))
         });
+        // Only what is drawn is uploaded (not a hidden PIP's webcam or mask).
+        self.upload(
+            room_cam.or(pip.map(|(p, _)| p.cam)),
+            pip.and_then(|(p, _)| p.mask),
+        )?;
+        self.mark("upload")?;
+        let refined = inputs.backdrop.refined_edges;
         let room = match room_cam {
             Some(cam) => Some(self.blur(cam, (ow, oh), true)?),
             None => None,
@@ -1084,6 +1102,10 @@ impl OutputProducer for GpuProducer {
     fn fallback_request(&mut self) -> Option<String> {
         self.fallback.take()
     }
+
+    fn take_redraw_why(&mut self) -> Option<RedrawWhy> {
+        Some(std::mem::take(&mut self.why))
+    }
 }
 
 impl GpuProducer {
@@ -1093,8 +1115,9 @@ impl GpuProducer {
             return Ok(None);
         }
         let key = Key::of(self.page.seq(), inputs);
-        let changed = !self.last_key.as_ref().is_some_and(|k| k.same_as(&key));
-        let fresh = if changed {
+        let changed = key.changes(self.last_key.as_ref());
+        let fresh = if changed.any() {
+            self.why.count(changed);
             self.composite(key.page_seq, inputs)?;
             self.composite += 1;
             self.last_key = Some(key);
@@ -1157,6 +1180,168 @@ mod tests {
         assert!(!use_sampler(1280, 720, 1280, 720)); // same size: exact Load
         assert!(!use_sampler(1280, 720, 480, 270)); // Box at 0.25: exact filter
         assert!(!use_sampler(1280, 720, 1300, 700)); // mixed: exact filter
+    }
+
+    fn frame(px: u8) -> Arc<Frame> {
+        Arc::new(Frame::from_bgra(16, 9, vec![px; 16 * 9 * 4]).unwrap())
+    }
+
+    fn mask(v: u8) -> Arc<Mask> {
+        Arc::new(Mask::new(16, 9, vec![v; 16 * 9]).unwrap())
+    }
+
+    fn inputs(
+        cam: &Arc<Frame>,
+        m: Option<&Arc<Mask>>,
+        layout: PipLayout,
+        backdrop: Backdrop,
+    ) -> TickInputs {
+        TickInputs {
+            page: None,
+            cam: Some(cam.clone()),
+            mask: m.cloned(),
+            layout,
+            backdrop,
+        }
+    }
+
+    fn cutout(visible: bool) -> PipLayout {
+        PipLayout {
+            visible,
+            x: 0.5,
+            y: 0.0,
+            width: 0.3,
+            style: p2c_compositor::OverlayStyle::CutoutFull,
+        }
+    }
+
+    fn room() -> Backdrop {
+        Backdrop {
+            full: FullBackdrop::BlurredRoom,
+            ..Backdrop::default()
+        }
+    }
+
+    /// What changed from `a` (page seq `sa`) to `b` (page seq `sb`).
+    fn changes(sa: u64, a: &TickInputs, sb: u64, b: &TickInputs) -> Changed {
+        Key::of(sb, b).changes(Some(&Key::of(sa, a)))
+    }
+
+    #[test]
+    fn key_unchanged_when_nothing_changed() {
+        let (cam, m) = (frame(1), mask(255));
+        let none = TickInputs {
+            page: None,
+            cam: None,
+            mask: None,
+            layout: cutout(true),
+            backdrop: Backdrop::default(),
+        };
+        let cases = [
+            none,
+            inputs(&cam, None, cutout(true), Backdrop::default()),
+            inputs(&cam, Some(&m), cutout(true), Backdrop::default()),
+            inputs(&cam, Some(&m), cutout(false), Backdrop::default()),
+            inputs(&cam, Some(&m), cutout(true), room()),
+        ];
+        for i in &cases {
+            // A fresh clone each tick, as the ticker reads its inputs anew.
+            let c = changes(7, i, 7, &i.clone());
+            assert_eq!(c, Changed::default(), "{i:?}");
+            assert!(!c.any());
+        }
+    }
+
+    #[test]
+    fn key_names_what_changed() {
+        let (cam_a, cam_b, m_a, m_b) = (frame(1), frame(2), mask(255), mask(0));
+        let base = inputs(&cam_a, Some(&m_a), cutout(true), Backdrop::default());
+        let page = Changed {
+            page: true,
+            ..Changed::default()
+        };
+        assert_eq!(changes(1, &base, 2, &base), page);
+        let cam = inputs(&cam_b, Some(&m_a), cutout(true), Backdrop::default());
+        assert_eq!(
+            changes(1, &base, 1, &cam),
+            Changed {
+                webcam: true,
+                ..Changed::default()
+            }
+        );
+        let m = inputs(&cam_a, Some(&m_b), cutout(true), Backdrop::default());
+        assert_eq!(
+            changes(1, &base, 1, &m),
+            Changed {
+                mask: true,
+                ..Changed::default()
+            }
+        );
+        let moved = PipLayout {
+            x: 0.1,
+            ..cutout(true)
+        };
+        let l = inputs(&cam_a, Some(&m_a), moved, Backdrop::default());
+        assert_eq!(
+            changes(1, &base, 1, &l),
+            Changed {
+                layout: true,
+                ..Changed::default()
+            }
+        );
+        let refined = Backdrop {
+            refined_edges: true,
+            ..Backdrop::default()
+        };
+        let b = inputs(&cam_a, Some(&m_a), cutout(true), refined);
+        assert_eq!(
+            changes(1, &base, 1, &b),
+            Changed {
+                backdrop: true,
+                ..Changed::default()
+            }
+        );
+        let first = Key::of(1, &base).changes(None);
+        assert_eq!(
+            first,
+            Changed {
+                other: true,
+                ..Changed::default()
+            }
+        );
+    }
+
+    #[test]
+    fn hidden_pip_does_not_count_webcam_changes() {
+        let (cam_a, cam_b, m_a, m_b) = (frame(1), frame(2), mask(255), mask(0));
+        let d = Backdrop::default;
+        let a = inputs(&cam_a, Some(&m_a), cutout(false), d());
+        // New webcam frame, new mask, no mask, moved: nothing visible changes.
+        for b in [
+            inputs(&cam_b, Some(&m_b), cutout(false), d()),
+            inputs(&cam_b, None, cutout(false), d()),
+            inputs(
+                &cam_a,
+                Some(&m_a),
+                PipLayout {
+                    x: 0.1,
+                    ..cutout(false)
+                },
+                d(),
+            ),
+        ] {
+            assert!(!changes(3, &a, 3, &b).any(), "{b:?}");
+        }
+        // The page still counts, and showing the PIP does.
+        assert!(changes(3, &a, 4, &a).page);
+        let shown = inputs(&cam_a, Some(&m_a), cutout(true), d());
+        assert!(changes(3, &a, 3, &shown).layout);
+        // Under the blurred room the webcam is the whole background.
+        let ra = inputs(&cam_a, Some(&m_a), cutout(false), room());
+        let rb = inputs(&cam_b, Some(&m_a), cutout(false), room());
+        assert!(changes(3, &ra, 3, &rb).webcam);
+        let rm = inputs(&cam_a, Some(&m_b), cutout(false), room());
+        assert!(!changes(3, &ra, 3, &rm).any());
     }
 
     #[test]

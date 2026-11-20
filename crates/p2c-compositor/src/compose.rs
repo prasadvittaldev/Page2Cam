@@ -109,6 +109,8 @@ pub struct Compositor {
     guided_out: Vec<u8>,
     /// Time per refined matte (guided filter + upscale), for the stats line.
     refined_t: DurationStats,
+    /// Composites by cause since the last [`Compositor::take_redraw_why`].
+    why: RedrawWhy,
 }
 
 /// The page scaled to fit the output.
@@ -199,6 +201,85 @@ pub struct ComposePlan<'a> {
     pub pip: Option<PlannedPip<'a>>,
 }
 
+impl<'a> ComposePlan<'a> {
+    /// The PIP as it shows: `None` while the layout is hidden, when its
+    /// webcam frames, masks and position change nothing in the output. (The
+    /// blurred room still depends on the webcam: [`PlanBase::BlurredRoom`].)
+    pub fn shown_pip(&self) -> Option<PlannedPip<'a>> {
+        self.pip.filter(|p| p.layout.visible)
+    }
+}
+
+/// Which inputs of a composite differ from the previous composite's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Changed {
+    /// A new page frame (not counted under a blurred room).
+    pub page: bool,
+    /// A new webcam frame the output shows (PIP or blurred room).
+    pub webcam: bool,
+    pub mask: bool,
+    /// PIP position, size, style or visibility.
+    pub layout: bool,
+    pub backdrop: bool,
+    /// No previous composite (first one, after an error, output size).
+    pub other: bool,
+}
+
+impl Changed {
+    pub fn any(&self) -> bool {
+        self.page || self.webcam || self.mask || self.layout || self.backdrop || self.other
+    }
+}
+
+/// Composites and why they happened, over a stats window. A composite with
+/// several changed inputs counts under each of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RedrawWhy {
+    pub composites: u32,
+    pub page: u32,
+    pub webcam: u32,
+    pub mask: u32,
+    pub layout: u32,
+    pub backdrop: u32,
+    pub other: u32,
+}
+
+impl RedrawWhy {
+    /// Count one composite made because of `c` (nothing when nothing changed).
+    pub fn count(&mut self, c: Changed) {
+        if !c.any() {
+            return;
+        }
+        self.composites += 1;
+        for (n, yes) in [
+            (&mut self.page, c.page),
+            (&mut self.webcam, c.webcam),
+            (&mut self.mask, c.mask),
+            (&mut self.layout, c.layout),
+            (&mut self.backdrop, c.backdrop),
+            (&mut self.other, c.other),
+        ] {
+            *n += u32::from(yes);
+        }
+    }
+}
+
+impl std::fmt::Display for RedrawWhy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "composites {} (page {}, webcam {}, mask {}, layout {}, backdrop {}, other {})",
+            self.composites,
+            self.page,
+            self.webcam,
+            self.mask,
+            self.layout,
+            self.backdrop,
+            self.other
+        )
+    }
+}
+
 /// In-box Blur, for a Box under a blurred room.
 static BLUR: BoxBackdrop = BoxBackdrop::Blur;
 
@@ -267,11 +348,11 @@ fn base_page<'a>(plan: &ComposePlan<'a>) -> Option<&'a Arc<Frame>> {
     }
 }
 
-/// The webcam frame the output depends on (PIP or blurred room).
+/// The webcam frame the output depends on (shown PIP or blurred room).
 fn base_cam<'a>(plan: &ComposePlan<'a>) -> Option<&'a Arc<Frame>> {
     match plan.base {
         PlanBase::BlurredRoom(cam) => Some(cam),
-        PlanBase::Page(_) => plan.pip.map(|p| p.cam),
+        PlanBase::Page(_) => plan.shown_pip().map(|p| p.cam),
     }
 }
 
@@ -295,6 +376,7 @@ impl Compositor {
             guided: GuidedScratch::new(),
             guided_out: Vec::new(),
             refined_t: DurationStats::default(),
+            why: RedrawWhy::default(),
         }
     }
 
@@ -324,9 +406,11 @@ impl Compositor {
         out: &mut Frame,
     ) -> bool {
         let plan = plan_compose(page, pip, backdrop);
-        if self.same_inputs(&plan, backdrop, (out.width, out.height)) {
+        let changed = self.changes(&plan, backdrop, (out.width, out.height));
+        if !changed.any() {
             return false;
         }
+        self.why.count(changed);
         match plan.base {
             PlanBase::Page(page) => self.draw_page(page, out),
             PlanBase::BlurredRoom(cam) => self.draw_blurred_room(cam, out),
@@ -359,8 +443,8 @@ impl Compositor {
         self.last = Some(Inputs {
             page: base_page(&plan).cloned(),
             cam: base_cam(&plan).cloned(),
-            mask: plan.pip.and_then(|p| p.mask.cloned()),
-            layout: plan.pip.map(|p| p.layout),
+            mask: plan.shown_pip().and_then(|p| p.mask.cloned()),
+            layout: plan.shown_pip().map(|p| p.layout),
             backdrop: backdrop.clone(),
             out: (out.width, out.height),
         });
@@ -384,19 +468,36 @@ impl Compositor {
         )
     }
 
+    /// Composites since the last call, by cause (for the stats line).
+    pub fn take_redraw_why(&mut self) -> RedrawWhy {
+        std::mem::take(&mut self.why)
+    }
+
     /// Every cached layer (scaled page, webcam layer, both blurs, scaled
     /// image) is a function of these, so equal inputs mean an equal output:
     /// a blur is only rebuilt for a new webcam frame or a new size, and both
-    /// are compared here.
+    /// are compared here. A hidden PIP's webcam, mask and layout don't count
+    /// ([`ComposePlan::shown_pip`]).
+    fn changes(&self, plan: &ComposePlan, backdrop: &Backdrop, out: (u32, u32)) -> Changed {
+        let Some(l) = &self.last else {
+            return Changed {
+                other: true,
+                ..Changed::default()
+            };
+        };
+        let shown = plan.shown_pip();
+        Changed {
+            page: !same(&l.page, base_page(plan)),
+            webcam: !same(&l.cam, base_cam(plan)),
+            mask: !same(&l.mask, shown.and_then(|p| p.mask)),
+            layout: l.layout != shown.map(|p| p.layout),
+            backdrop: l.backdrop != *backdrop,
+            other: l.out != out,
+        }
+    }
+
     fn same_inputs(&self, plan: &ComposePlan, backdrop: &Backdrop, out: (u32, u32)) -> bool {
-        self.last.as_ref().is_some_and(|l| {
-            same(&l.page, base_page(plan))
-                && same(&l.cam, base_cam(plan))
-                && same(&l.mask, plan.pip.and_then(|p| p.mask))
-                && l.layout == plan.pip.map(|p| p.layout)
-                && l.backdrop == *backdrop
-                && l.out == out
-        })
+        !self.changes(plan, backdrop, out).any()
     }
 
     fn draw_page(&mut self, page: Option<&Arc<Frame>>, out: &mut Frame) {
@@ -1785,5 +1886,106 @@ mod tests {
         assert_eq!((out.width, out.height, out.data.len()), (8, 4, 128));
         assert_eq!(out.pixel(4, 2), RED);
         assert_eq!(out.pixel(0, 2), BLACK);
+    }
+
+    // --- Redraws ---
+
+    fn pip<'a>(
+        cam: &'a Arc<Frame>,
+        m: Option<&'a Arc<Mask>>,
+        layout: &'a crate::PipLayout,
+    ) -> Option<Pip<'a>> {
+        Some(Pip {
+            cam,
+            mask: m,
+            layout,
+        })
+    }
+
+    #[test]
+    fn hidden_pip_ignores_webcam_and_mask_changes() {
+        let page = solid(64, 36, RED);
+        let shown = full_layout(crate::OverlayStyle::CutoutFull);
+        let hidden = crate::PipLayout {
+            visible: false,
+            ..shown
+        };
+        let (cam_a, cam_b) = (solid(16, 9, BLUE), solid(16, 9, GREEN));
+        let (m_a, m_b) = (mask(16, 9, vec![255; 144]), mask(16, 9, vec![0; 144]));
+        let b = Backdrop::default();
+        let mut c = Compositor::new();
+        let mut out = Frame::new_black(64, 36);
+        assert!(c.compose(Some(&page), pip(&cam_a, Some(&m_a), &hidden), &b, &mut out));
+        let first = out.clone();
+        // New webcam frames and masks behind a hidden PIP change nothing.
+        assert!(!c.compose(Some(&page), pip(&cam_b, Some(&m_b), &hidden), &b, &mut out));
+        assert!(!c.compose(Some(&page), pip(&cam_a, None, &hidden), &b, &mut out));
+        // Moving a hidden PIP changes nothing either.
+        let moved = crate::PipLayout { x: 0.1, ..hidden };
+        assert!(!c.compose(Some(&page), pip(&cam_a, None, &moved), &b, &mut out));
+        assert!(out == first);
+        // Showing it redraws.
+        assert!(c.compose(Some(&page), pip(&cam_a, Some(&m_a), &shown), &b, &mut out));
+        // Under the blurred room the webcam is the background: it still counts.
+        let room = backdrop(FullBackdrop::BlurredRoom, BoxBackdrop::Room);
+        assert!(c.compose(
+            Some(&page),
+            pip(&cam_a, Some(&m_a), &hidden),
+            &room,
+            &mut out
+        ));
+        assert!(c.compose(
+            Some(&page),
+            pip(&cam_b, Some(&m_a), &hidden),
+            &room,
+            &mut out
+        ));
+        // ...but its mask doesn't (nothing is drawn over the room).
+        assert!(!c.compose(
+            Some(&page),
+            pip(&cam_b, Some(&m_b), &hidden),
+            &room,
+            &mut out
+        ));
+    }
+
+    #[test]
+    fn redraws_are_counted_by_cause() {
+        let (p1, p2) = (solid(64, 36, RED), solid(64, 36, GREEN));
+        let l = full_layout(crate::OverlayStyle::CutoutFull);
+        let (cam_a, cam_b) = (solid(16, 9, BLUE), solid(16, 9, GREEN));
+        let (m_a, m_b) = (mask(16, 9, vec![255; 144]), mask(16, 9, vec![0; 144]));
+        let b = Backdrop::default();
+        let mut c = Compositor::new();
+        let mut out = Frame::new_black(64, 36);
+        c.compose(Some(&p1), pip(&cam_a, Some(&m_a), &l), &b, &mut out); // first
+        c.compose(Some(&p1), pip(&cam_a, Some(&m_a), &l), &b, &mut out); // none
+        c.compose(Some(&p2), pip(&cam_a, Some(&m_a), &l), &b, &mut out); // page
+        c.compose(Some(&p2), pip(&cam_b, Some(&m_b), &l), &b, &mut out); // webcam + mask
+        let moved = crate::PipLayout { x: 0.1, ..l };
+        c.compose(Some(&p2), pip(&cam_b, Some(&m_b), &moved), &b, &mut out); // layout
+        let b2 = Backdrop {
+            refined_edges: true,
+            ..Backdrop::default()
+        };
+        c.compose(Some(&p2), pip(&cam_b, Some(&m_b), &moved), &b2, &mut out); // backdrop
+        let why = c.take_redraw_why();
+        assert_eq!(
+            why,
+            RedrawWhy {
+                composites: 5,
+                page: 1,
+                webcam: 1,
+                mask: 1,
+                layout: 1,
+                backdrop: 1,
+                other: 1,
+            }
+        );
+        assert_eq!(c.take_redraw_why(), RedrawWhy::default(), "taking resets");
+        assert_eq!(
+            why.to_string(),
+            "composites 5 (page 1, webcam 1, mask 1, layout 1, backdrop 1, other 1)"
+        );
     }
 }

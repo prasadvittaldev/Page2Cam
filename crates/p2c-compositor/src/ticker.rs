@@ -11,7 +11,7 @@ use p2c_core::{
 
 use parking_lot::RwLock;
 
-use crate::{Backdrop, ComposeNote, Compositor, Pip, PipLayout};
+use crate::{Backdrop, ComposeNote, Compositor, Pip, PipLayout, RedrawWhy};
 
 const WEBCAM_STALE_AFTER: Duration = Duration::from_secs(1);
 /// How often the ticker's timing is written to the log.
@@ -138,6 +138,11 @@ pub trait OutputProducer: Send {
     /// Refined-edges (guided filter) times since the last call, for the
     /// stats line. Only the CPU compositor measures them.
     fn take_refined_summary(&mut self) -> Option<Summary> {
+        None
+    }
+    /// Composites since the last call and what caused them, for the stats
+    /// line (`None`: this producer doesn't count them).
+    fn take_redraw_why(&mut self) -> Option<RedrawWhy> {
         None
     }
 }
@@ -349,6 +354,10 @@ impl OutputProducer for CpuProducer {
 
     fn take_refined_summary(&mut self) -> Option<Summary> {
         self.compositor.take_refined_summary()
+    }
+
+    fn take_redraw_why(&mut self) -> Option<RedrawWhy> {
+        Some(self.compositor.take_redraw_why())
     }
 }
 
@@ -744,11 +753,19 @@ impl Ticker {
                                 .take_refined_summary()
                                 .map(|r| format!("; refined edges {r}"))
                                 .unwrap_or_default();
+                            // `redrawn` counts new outputs (on the GPU also
+                            // the readback drain after a change); this, the
+                            // composites and what caused them.
+                            let why = slot
+                                .producer
+                                .take_redraw_why()
+                                .map(|w| format!("; {w}"))
+                                .unwrap_or_default();
                             tracing::info!(
                                 ticks,
                                 redrawn,
                                 skipped,
-                                "output ({}): compose {c}; sinks {s}{refined}",
+                                "output ({}): compose {c}; sinks {s}{refined}{why}",
                                 slot.name
                             );
                         }

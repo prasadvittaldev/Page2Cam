@@ -369,4 +369,8 @@ impl OutputProducer for RecoveringProducer {
     fn fallback_request(&mut self) -> Option<String> {
         self.producer.fallback_request()
     }
+
+    fn take_redraw_why(&mut self) -> Option<p2c_compositor::RedrawWhy> {
+        self.producer.take_redraw_why()
+    }
 }
