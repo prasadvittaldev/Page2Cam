@@ -150,14 +150,12 @@ impl Cli {
 }
 
 fn main() {
-    // CEF re-launches this executable for its helper processes; handle that
-    // first (they never attach a console or print).
-    if let Some(code) = p2c_browser::maybe_run_subprocess() {
-        std::process::exit(code);
-    }
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     // Started by a desktop agent: the stdio MCP bridge (stdout is JSON-RPC
-    // only; it uses the pipes the agent gave, never a console).
+    // only; it uses the pipes the agent gave, never a console). Checked
+    // first, before anything else runs: the marker lock below must exist as
+    // early as possible, or a sweep starting at the same moment could stop
+    // the bridge while it starts.
     if is_mcp_args(&args) {
         // Marks this process as a bridge: engine starts and the tray's
         // leftover sweeps spare it (they would cut the agent off).
@@ -166,6 +164,11 @@ fn main() {
             cfg!(windows).then(|| p2c_proc::try_lock(&p2c_proc::mcp_lock_name(std::process::id())));
         let code = mcp_bridge::run();
         drop(marker);
+        std::process::exit(code);
+    }
+    // CEF re-launches this executable for its helper processes; handle that
+    // next (they never attach a console or print; `--mcp` is never theirs).
+    if let Some(code) = p2c_browser::maybe_run_subprocess() {
         std::process::exit(code);
     }
     // Windows without a role flag: the tray (no console; its own log file).

@@ -9,7 +9,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use p2c_mcp::{ClientInfo, Server};
 use parking_lot::Mutex;
@@ -320,15 +320,66 @@ struct Request {
     body: Vec<u8>,
 }
 
+/// Reads from the buffered socket until one overall deadline (each read
+/// gets only the time that is left).
+struct DeadlineRead<'a> {
+    r: &'a mut BufReader<TcpStream>,
+    deadline: Instant,
+}
+
+impl Read for DeadlineRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.fill_buf()
+            .map(<[u8]>::len)
+            .and_then(|_| self.r.read(buf))
+    }
+}
+
+impl BufRead for DeadlineRead<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.r.buffer().is_empty() {
+            let left = self
+                .deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "head too slow")
+                })?;
+            self.r.get_ref().set_read_timeout(Some(left))?;
+        }
+        self.r.fill_buf()
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.r.consume(n)
+    }
+}
+
 /// Read the request line and headers (at most [`MAX_HEAD`] bytes in all);
 /// no body yet. `Err(status)` for a bad or too large head.
 fn read_head(r: &mut BufReader<TcpStream>) -> Result<Request, u16> {
     let mut head = Vec::new();
-    // `take` bounds even a line that never ends.
-    let mut limited = r.by_ref().take(MAX_HEAD as u64 + 1);
+    // One deadline for the whole head (a client trickling a byte at a time
+    // would otherwise reset a per-read timeout forever), and `take` bounds
+    // even a line that never ends.
+    let deadline = Instant::now() + HEAD_TIMEOUT;
+    let mut limited = DeadlineRead {
+        r: r.by_ref(),
+        deadline,
+    }
+    .take(MAX_HEAD as u64 + 1);
     loop {
         let before = head.len();
-        let n = limited.read_until(b'\n', &mut head).map_err(|_| 400u16)?;
+        let n = limited.read_until(b'\n', &mut head).map_err(|e| {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                408u16
+            } else {
+                400u16
+            }
+        })?;
         if head.len() > MAX_HEAD {
             return Err(431);
         }
@@ -410,6 +461,7 @@ fn reason(code: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         411 => "Length Required",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
@@ -465,6 +517,7 @@ fn handle(inner: &Arc<Inner>, stream: TcpStream) {
         Ok(x) => x,
         Err(code) => {
             let _ = respond(&mut s, code, "text/plain", reason(code).as_bytes(), &[]);
+            drain_briefly(r);
             return;
         }
     };
@@ -479,6 +532,7 @@ fn handle(inner: &Arc<Inner>, stream: TcpStream) {
     });
     if !host_ok || !origin_ok {
         let _ = respond(&mut s, 403, "text/plain", b"forbidden", &[]);
+        drain_briefly(r);
         return;
     }
     let read_all = match req.path.as_str() {
@@ -493,7 +547,19 @@ fn handle(inner: &Arc<Inner>, stream: TcpStream) {
     // an unread body; a refused one is not waited for).
     if read_all {
         let _ = std::io::copy(&mut r.take(64 * 1024), &mut std::io::sink());
+    } else {
+        drain_briefly(r);
     }
+}
+
+/// After an early refusal: take a little of what the client is still
+/// sending (briefly), so closing with unread data doesn't reset the
+/// connection before the client has read our answer.
+fn drain_briefly(r: BufReader<TcpStream>) {
+    let _ = r
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(200)));
+    let _ = std::io::copy(&mut r.take(8 * 1024), &mut std::io::sink());
 }
 
 /// Returns whether the request was read completely.
@@ -1007,6 +1073,59 @@ mod tests {
         assert_eq!(code, 200, "{body}");
         let a = r.server.agents_json();
         assert_eq!(a["activity"][0]["agent"], "Cursor", "{a}");
+    }
+
+    #[test]
+    fn a_trickled_head_is_cut_off_after_5_s() {
+        let r = rig(0, true);
+        let p = r.server.port();
+        let mut s = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        let mut w = s.try_clone().unwrap();
+        // One byte every 300 ms, never finishing the head (each read alone
+        // is well inside 5 s).
+        std::thread::spawn(move || {
+            for _ in 0..60 {
+                if w.write_all(b"X").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
+        s.set_read_timeout(Some(Duration::from_secs(12))).unwrap();
+        let t = std::time::Instant::now();
+        let mut raw = Vec::new();
+        let _ = s.read_to_end(&mut raw);
+        assert!(
+            t.elapsed() < Duration::from_millis(6500),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(
+            String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 4"),
+            "{raw:?}"
+        );
+    }
+
+    #[test]
+    fn an_early_refusal_reaches_a_client_that_sent_a_body() {
+        // The body the server never read must not turn the 401 into a reset.
+        let r = rig(0, true);
+        let p = r.server.port();
+        for _ in 0..20 {
+            let mut s = TcpStream::connect(("127.0.0.1", p)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let body = vec![b'x'; 3000];
+            let head = format!(
+                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer wrong\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            s.write_all(head.as_bytes()).unwrap();
+            let _ = s.write_all(&body);
+            let mut raw = Vec::new();
+            let got = s.read_to_end(&mut raw);
+            let text = String::from_utf8_lossy(&raw);
+            assert!(text.starts_with("HTTP/1.1 401"), "{got:?} {text}");
+        }
     }
 
     #[test]

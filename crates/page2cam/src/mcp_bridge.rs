@@ -279,6 +279,22 @@ impl<E: Env> Bridge<E> {
     }
 }
 
+/// A failed read of the tray's answer. A reset before any answer byte is
+/// the tray refusing early (it acts only after answering 200); anything
+/// else may have been acted on.
+fn read_failure(e: std::io::Error, got_answer: bool) -> PostError {
+    use std::io::ErrorKind;
+    let reset = matches!(
+        e.kind(),
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+    );
+    if reset && !got_answer {
+        PostError::unsent(e.to_string())
+    } else {
+        PostError::sent(e.to_string())
+    }
+}
+
 /// One HTTP POST to the tray (`url` = `http://127.0.0.1:<port>/mcp`).
 pub fn http_post(
     url: &str,
@@ -328,7 +344,9 @@ pub fn http_post(
             .filter(|d| !d.is_zero())
             .ok_or_else(|| PostError::sent("the tray did not answer in time"))?;
         s.set_read_timeout(Some(left)).map_err(sent)?;
-        let n = s.read(&mut buf).map_err(sent)?;
+        let n = s
+            .read(&mut buf)
+            .map_err(|e| read_failure(e, !raw.is_empty()))?;
         if n == 0 {
             break;
         }
@@ -806,6 +824,18 @@ mod tests {
         assert!(head.contains("Mcp-Session-Id: S0\r\n"));
         assert!(head.contains("X-P2C-Agent: Claude Desktop\r\n"));
         assert!(http_post("http://10.0.0.1:1/mcp", "t", None, None, b"{}").is_err());
+    }
+
+    #[test]
+    fn a_reset_before_any_answer_counts_as_not_sent() {
+        use std::io::{Error, ErrorKind};
+        // The tray refused early and the close turned into a reset: it did
+        // not act, so the call may go again (or the tray be started).
+        assert!(!read_failure(Error::from(ErrorKind::ConnectionReset), false).sent);
+        assert!(!read_failure(Error::from(ErrorKind::ConnectionAborted), false).sent);
+        // Part of an answer came, or it just took too long: it may have acted.
+        assert!(read_failure(Error::from(ErrorKind::ConnectionReset), true).sent);
+        assert!(read_failure(Error::from(ErrorKind::TimedOut), false).sent);
     }
 
     #[test]
