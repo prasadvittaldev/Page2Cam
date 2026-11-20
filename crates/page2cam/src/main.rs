@@ -22,8 +22,7 @@ use p2c_admin::{AdminConfig, PreviewSink};
 use p2c_audio::{MixSettings, Mixer};
 use p2c_browser::BrowserConfig;
 use p2c_compositor::{
-    CpuProducer, FrameSink, OutputFormat, OutputProducer, OutputSpec, OverlayStyle, ProducerEvent,
-    Ticker,
+    CpuProducer, FrameSink, OutputFormat, OutputProducer, OutputSpec, ProducerEvent, Ticker,
 };
 use p2c_core::AudioRing;
 use p2c_core::{FrameSlot, Nv12Gate, Nv12Slot};
@@ -424,10 +423,12 @@ fn run() -> anyhow::Result<i32> {
     for w in &bg_warnings {
         tracing::warn!("background setting: {w}");
     }
-    if bg_state.full != background::FullBg::Page && layout.read().style == OverlayStyle::Box {
-        // A full-frame background needs a cut-out style (hand-edited settings).
-        layout.write().style = OverlayStyle::CutoutFull;
-    }
+    // A full-frame background needs a cut-out style (hand-edited settings).
+    background::cutout_for_full_background(
+        &bg_state.full,
+        &mut layout.write(),
+        config::save_path(cli.config.as_deref()).as_deref(),
+    );
     let backdrop = Arc::new(RwLock::new(bg_state.backdrop()));
     let crop: p2c_core::SharedCrop = Arc::new(RwLock::new(cfg.crop()));
     // NV12 originals of the webcam frames (stays empty for fake/test input).

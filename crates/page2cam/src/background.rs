@@ -249,6 +249,32 @@ pub fn background_html(kind: &FullBg, image_url: Option<&str>) -> String {
     )
 }
 
+/// Start-up: a full-frame background needs a cut-out style, so a Box style
+/// (hand-edited settings) becomes cutout-full. Like the admin page's switch,
+/// it is logged and saved to `settings`. Returns whether it switched.
+pub fn cutout_for_full_background(
+    full: &FullBg,
+    layout: &mut p2c_compositor::PipLayout,
+    settings: Option<&std::path::Path>,
+) -> bool {
+    use p2c_compositor::OverlayStyle;
+    if *full == FullBg::Page || layout.style != OverlayStyle::Box {
+        return false;
+    }
+    layout.style = OverlayStyle::CutoutFull;
+    tracing::info!(
+        background = full.as_str(),
+        "full-frame background saved with the Box style: style set to cutout-full"
+    );
+    if let Some(p) = settings {
+        let style = OverlayStyle::CutoutFull.as_str();
+        if let Err(e) = crate::config::save_choice(p, "overlay_style", style) {
+            tracing::warn!("could not save the overlay style: {e:#}");
+        }
+    }
+    true
+}
+
 /// The page to open at start-up: the saved `last_page_url` when it is a
 /// user page and no `--url` was given, else `url`.
 pub fn initial_page_url(cli_url_given: bool, saved: &str, url: &str) -> String {
@@ -1045,5 +1071,55 @@ mod tests {
             let b = backdrop(&full, &BoxBg::Room, None, false);
             assert_eq!(b.hides_room, hides, "{full:?}");
         }
+    }
+
+    /// M3: a hand-edited Box style with a full-frame background becomes
+    /// cutout-full at start-up, and that is saved (comments kept).
+    #[test]
+    fn start_style_switch_to_cutout_full_is_saved() {
+        use p2c_compositor::{OverlayStyle, PipLayout};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page2cam.toml");
+        std::fs::write(&path, "# mine\noverlay_style = \"box\"\n").unwrap();
+        let read = || std::fs::read_to_string(&path).unwrap();
+        let mut l = PipLayout {
+            style: OverlayStyle::Box,
+            ..PipLayout::default()
+        };
+        // Page, or a cut-out style already: nothing changes, nothing written.
+        assert!(!cutout_for_full_background(
+            &FullBg::Page,
+            &mut l,
+            Some(&path)
+        ));
+        assert_eq!(l.style, OverlayStyle::Box);
+        let mut small = PipLayout {
+            style: OverlayStyle::CutoutSmall,
+            ..l
+        };
+        assert!(!cutout_for_full_background(
+            &FullBg::Image,
+            &mut small,
+            Some(&path)
+        ));
+        assert_eq!(small.style, OverlayStyle::CutoutSmall);
+        assert!(read().contains("overlay_style = \"box\""));
+        // Box + a full-frame background: switched and saved.
+        assert!(cutout_for_full_background(
+            &FullBg::BlurredRoom,
+            &mut l,
+            Some(&path)
+        ));
+        assert_eq!(l.style, OverlayStyle::CutoutFull);
+        let text = read();
+        assert!(text.contains("# mine"), "{text}");
+        assert!(text.contains("overlay_style = \"cutout-full\""), "{text}");
+        // No settings file to write: switched in memory only.
+        let mut l2 = PipLayout {
+            style: OverlayStyle::Box,
+            ..l
+        };
+        assert!(cutout_for_full_background(&FullBg::Image, &mut l2, None));
+        assert_eq!(l2.style, OverlayStyle::CutoutFull);
     }
 }
