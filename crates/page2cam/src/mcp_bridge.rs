@@ -38,7 +38,14 @@ pub trait Env {
     fn launch_tray(&self) -> bool;
     /// POST one message (with the agent's name when known); returns
     /// (status, session id header, body).
-    fn post(&self, url: &str, token: &str, session: Option<&str>, agent: Option<&str>, body: &[u8]) -> PostResult;
+    fn post(
+        &self,
+        url: &str,
+        token: &str,
+        session: Option<&str>,
+        agent: Option<&str>,
+        body: &[u8],
+    ) -> PostResult;
     fn sleep(&self, d: Duration) {
         std::thread::sleep(d)
     }
@@ -54,10 +61,16 @@ pub struct PostError {
 
 impl PostError {
     fn unsent(msg: impl Into<String>) -> Self {
-        PostError { sent: false, msg: msg.into() }
+        PostError {
+            sent: false,
+            msg: msg.into(),
+        }
     }
     fn sent(msg: impl Into<String>) -> Self {
-        PostError { sent: true, msg: msg.into() }
+        PostError {
+            sent: true,
+            msg: msg.into(),
+        }
     }
 }
 
@@ -154,7 +167,9 @@ impl<E: Env> Bridge<E> {
     }
 
     fn forward(&mut self, msg: &Value) -> Result<Option<Value>, PostError> {
-        let (url, token) = self.endpoint().ok_or_else(|| PostError::unsent(NOT_RUNNING))?;
+        let (url, token) = self
+            .endpoint()
+            .ok_or_else(|| PostError::unsent(NOT_RUNNING))?;
         let body = msg.to_string();
         let (code, session, out) = self.env.post(
             &url,
@@ -187,7 +202,8 @@ impl<E: Env> Bridge<E> {
         self.session = None;
         if let Some(init) = self.init.clone().filter(|_| msg["method"] != "initialize") {
             self.forward(&init)?;
-            let _ = self.forward(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+            let _ =
+                self.forward(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
         }
         self.forward(msg)
     }
@@ -355,7 +371,7 @@ fn prune_bridge_logs(dir: &std::path::Path, keep: usize) {
         })
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
-    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    logs.sort_by_key(|l| std::cmp::Reverse(l.0));
     for (_, p) in logs.into_iter().skip(keep) {
         let _ = std::fs::remove_file(p);
     }
@@ -409,7 +425,14 @@ impl Env for RealEnv {
         false
     }
 
-    fn post(&self, url: &str, token: &str, session: Option<&str>, agent: Option<&str>, body: &[u8]) -> PostResult {
+    fn post(
+        &self,
+        url: &str,
+        token: &str,
+        session: Option<&str>,
+        agent: Option<&str>,
+        body: &[u8],
+    ) -> PostResult {
         http_post(url, token, session, agent, body)
     }
 }
@@ -417,7 +440,8 @@ impl Env for RealEnv {
 /// Run the bridge on stdin/stdout; returns the exit code.
 pub fn run() -> i32 {
     // One log per bridge (several agents run their own at once).
-    let log = crate::logging::init_named(false, &format!("page2cam-mcp-{}.log", std::process::id()));
+    let log =
+        crate::logging::init_named(false, &format!("page2cam-mcp-{}.log", std::process::id()));
     if let Some(dir) = log.as_deref().and_then(std::path::Path::parent) {
         prune_bridge_logs(dir, KEEP_LOGS);
     }
@@ -440,7 +464,14 @@ pub fn run() -> i32 {
             fn launch_tray(&self) -> bool {
                 false
             }
-            fn post(&self, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: &[u8]) -> PostResult {
+            fn post(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: &[u8],
+            ) -> PostResult {
                 Err(PostError::unsent("agent control is Windows-only for now"))
             }
         }
@@ -496,7 +527,14 @@ mod tests {
             }
             true
         }
-        fn post(&self, url: &str, token: &str, session: Option<&str>, agent: Option<&str>, body: &[u8]) -> PostResult {
+        fn post(
+            &self,
+            url: &str,
+            token: &str,
+            session: Option<&str>,
+            agent: Option<&str>,
+            body: &[u8],
+        ) -> PostResult {
             if self.fail.get() || (self.need_tray.get() && !self.running.get()) {
                 return Err(PostError::unsent("connection refused"));
             }
@@ -563,7 +601,12 @@ mod tests {
         f.fail_after_send.set(1);
         let out = run_lines(&mut b, CALL);
         assert_eq!(out[0]["result"]["isError"], true, "{out:?}");
-        let calls = f.posts.borrow().iter().filter(|p| p.2["method"] == "tools/call").count();
+        let calls = f
+            .posts
+            .borrow()
+            .iter()
+            .filter(|p| p.2["method"] == "tools/call")
+            .count();
         assert_eq!(calls, 1, "typed once, not twice");
         // Other methods may be repeated.
         f.fail_after_send.set(1);
@@ -604,7 +647,14 @@ mod tests {
         left.sort();
         assert_eq!(
             left,
-            ["page2cam-mcp-3.log", "page2cam-mcp-4.log", "page2cam-mcp-5.log", "page2cam-mcp-6.log", "page2cam-mcp-7.log", "page2cam.log"]
+            [
+                "page2cam-mcp-3.log",
+                "page2cam-mcp-4.log",
+                "page2cam-mcp-5.log",
+                "page2cam-mcp-6.log",
+                "page2cam-mcp-7.log",
+                "page2cam.log"
+            ]
         );
     }
 
@@ -761,7 +811,14 @@ mod tests {
     #[test]
     fn a_refused_connection_was_never_sent() {
         let port = p2c_tray::launch::pick_free_port().unwrap();
-        let e = http_post(&format!("http://127.0.0.1:{port}/mcp"), "t", None, None, b"{}").unwrap_err();
+        let e = http_post(
+            &format!("http://127.0.0.1:{port}/mcp"),
+            "t",
+            None,
+            None,
+            b"{}",
+        )
+        .unwrap_err();
         assert!(!e.sent, "{e:?}");
     }
 }

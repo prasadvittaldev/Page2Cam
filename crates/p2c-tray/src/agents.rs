@@ -383,8 +383,18 @@ pub fn run_cli(exe: &Path, args: &[&str], limit: std::time::Duration) -> Result<
             String::from_utf8_lossy(&keep).into_owned()
         })
     };
-    let out = drain(child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
-    let err = drain(child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
     let until = std::time::Instant::now() + limit;
     let status = loop {
         match child.try_wait() {
@@ -395,7 +405,11 @@ pub fn run_cli(exe: &Path, args: &[&str], limit: std::time::Duration) -> Result<
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("{} did not finish in {} s", exe.display(), limit.as_secs()));
+                return Err(format!(
+                    "{} did not finish in {} s",
+                    exe.display(),
+                    limit.as_secs()
+                ));
             }
             Err(e) => return Err(e.to_string()),
         }
@@ -783,7 +797,11 @@ mod tests {
         );
         let e = r.unwrap_err();
         assert!(e.contains("failed") && e.contains("eee"), "{e}");
-        assert!(t.elapsed() < std::time::Duration::from_secs(15), "{:?}", t.elapsed());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(15),
+            "{:?}",
+            t.elapsed()
+        );
     }
 
     #[test]
@@ -807,10 +825,21 @@ mod tests {
     #[test]
     fn balloon_names_are_marked_and_short() {
         // An agent can't make a balloon read like Page2Cam or Windows itself.
-        let b = balloon_for("Page2Cam: your camera is hacked, call 555", &BackendCall::StartStream, true).unwrap();
-        assert!(b.starts_with("Agent “Page2Cam: your camera is hacked"), "{b}");
+        let b = balloon_for(
+            "Page2Cam: your camera is hacked, call 555",
+            &BackendCall::StartStream,
+            true,
+        )
+        .unwrap();
+        assert!(
+            b.starts_with("Agent “Page2Cam: your camera is hacked"),
+            "{b}"
+        );
         let long = balloon_for(&"x".repeat(100), &BackendCall::StopStream, true).unwrap();
-        assert_eq!(long, format!("Agent “{}” stopped your stream", "x".repeat(40)));
+        assert_eq!(
+            long,
+            format!("Agent “{}” stopped your stream", "x".repeat(40))
+        );
     }
 
     #[test]

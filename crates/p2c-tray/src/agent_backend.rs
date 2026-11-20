@@ -524,7 +524,13 @@ pub(crate) mod tests {
             Arc::new(Mutex::new(Activity::default())),
         );
         let e = b
-            .call("A", BackendCall::ShowPage { name: "a".into(), html: "<p>".into() })
+            .call(
+                "A",
+                BackendCall::ShowPage {
+                    name: "a".into(),
+                    html: "<p>".into(),
+                },
+            )
             .unwrap_err();
         assert!(e.contains("Documents"), "{e}");
         assert!(b.call("A", BackendCall::ListPages).is_err());
@@ -608,7 +614,10 @@ pub(crate) mod tests {
         assert_eq!(log[0].1, "/api/navigate");
         let body: Value = serde_json::from_slice(&log[0].2).unwrap();
         assert_eq!(body["url"], file_url(&p));
-        assert_eq!(tray.balloons.lock().as_slice(), ["Agent “Claude” changed the page"]);
+        assert_eq!(
+            tray.balloons.lock().as_slice(),
+            ["Agent “Claude” changed the page"]
+        );
         assert_eq!(b.activity.lock().list()[0].agent, "Claude");
     }
 
@@ -689,7 +698,10 @@ pub(crate) mod tests {
             Ok(BackendReply::Done(_))
         ));
         assert_eq!(*tray.started.lock(), 1);
-        assert_eq!(tray.balloons.lock().as_slice(), ["Agent “Claude” started Page2Cam"]);
+        assert_eq!(
+            tray.balloons.lock().as_slice(),
+            ["Agent “Claude” started Page2Cam"]
+        );
         // Already running: no second start, no balloon.
         b.call("Claude", BackendCall::Start).unwrap();
         assert_eq!(*tray.started.lock(), 1);

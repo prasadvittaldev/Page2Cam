@@ -162,8 +162,8 @@ fn main() {
         // Marks this process as a bridge: engine starts and the tray's
         // leftover sweeps spare it (they would cut the agent off).
         // (Linux reads the command line instead; no lock files left behind.)
-        let marker = cfg!(windows)
-            .then(|| p2c_proc::try_lock(&p2c_proc::mcp_lock_name(std::process::id())));
+        let marker =
+            cfg!(windows).then(|| p2c_proc::try_lock(&p2c_proc::mcp_lock_name(std::process::id())));
         let code = mcp_bridge::run();
         drop(marker);
         std::process::exit(code);

@@ -243,7 +243,10 @@ mod tests {
         std::env::set_var(URL_ENV, "http://127.0.0.1:8766");
         std::env::set_var(TOKEN_ENV, "sekret-token");
         let got = take_env();
-        assert_eq!(got, Some(("http://127.0.0.1:8766".into(), "sekret-token".into())));
+        assert_eq!(
+            got,
+            Some(("http://127.0.0.1:8766".into(), "sekret-token".into()))
+        );
         assert!(std::env::var_os(URL_ENV).is_none());
         assert!(std::env::var_os(TOKEN_ENV).is_none());
         assert_eq!(take_env(), None);

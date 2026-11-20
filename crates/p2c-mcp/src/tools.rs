@@ -530,7 +530,9 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
 /// `file://localhost/<path>` (no host: a UNC host would make Windows send
 /// the user's credentials there).
 fn file_url_is_local(u: &str) -> bool {
-    let Some(scheme) = u.get(..5) else { return true };
+    let Some(scheme) = u.get(..5) else {
+        return true;
+    };
     if !scheme.eq_ignore_ascii_case("file:") {
         return true;
     }
@@ -555,7 +557,10 @@ fn file_url_is_local(u: &str) -> bool {
 fn is_local_drive_path(p: &str) -> bool {
     if cfg!(windows) {
         let b = p.as_bytes();
-        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+        b.len() >= 3
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && (b[2] == b'\\' || b[2] == b'/')
     } else {
         p.starts_with('/') && !p.starts_with("//")
     }

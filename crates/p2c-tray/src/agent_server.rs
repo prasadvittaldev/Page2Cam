@@ -363,7 +363,12 @@ fn read_head(r: &mut BufReader<TcpStream>) -> Result<Request, u16> {
 
 /// Read the body (only after the checks passed), at most `max` bytes;
 /// answers the error itself and returns false when it can't.
-fn read_body(r: &mut BufReader<TcpStream>, s: &mut TcpStream, req: &mut Request, max: usize) -> bool {
+fn read_body(
+    r: &mut BufReader<TcpStream>,
+    s: &mut TcpStream,
+    req: &mut Request,
+    max: usize,
+) -> bool {
     let res = (|| {
         if req
             .headers
@@ -966,7 +971,7 @@ mod tests {
         // A 30 MB body is announced but never sent: the answer must not wait for it.
         for (head, want) in [
             (format!("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer wrong\r\nContent-Length: 30000000\r\n\r\n"), "401"),
-            (format!("POST /mcp HTTP/1.1\r\nHost: evil.example\r\nContent-Length: 30000000\r\n\r\n"), "403"),
+            ("POST /mcp HTTP/1.1\r\nHost: evil.example\r\nContent-Length: 30000000\r\n\r\n".to_string(), "403"),
             (format!("POST /nope HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nContent-Length: 30000000\r\n\r\n"), "404"),
             (format!("POST /tray/agents HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nContent-Length: 30000000\r\n\r\n"), "401"),
         ] {
@@ -992,7 +997,11 @@ mod tests {
             p,
             "POST",
             "/mcp",
-            &[host(p), auth(&"a".repeat(32)), ("X-P2C-Agent", "Cursor".into())],
+            &[
+                host(p),
+                auth(&"a".repeat(32)),
+                ("X-P2C-Agent", "Cursor".into()),
+            ],
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stop","arguments":{}}}"#,
         );
         assert_eq!(code, 200, "{body}");
@@ -1029,7 +1038,8 @@ mod tests {
             save: Box::new(|_, _| {}),
             registrar: Arc::new(|_| Vec::new()),
         };
-        let _s = AgentServer::start(0, false, Some("a".repeat(32)), deps, backend, activity).unwrap();
+        let _s =
+            AgentServer::start(0, false, Some("a".repeat(32)), deps, backend, activity).unwrap();
         assert!(!disc.exists());
     }
 

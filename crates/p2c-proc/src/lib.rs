@@ -492,8 +492,7 @@ mod platform {
             // The command line, NUL-separated.
             let mcp_bridge = name == "page2cam"
                 && std::fs::read(entry.path().join("cmdline")).is_ok_and(|c| {
-                    let args: Vec<&[u8]> =
-                        c.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
+                    let args: Vec<&[u8]> = c.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
                     let args: Vec<String> = args
                         .iter()
                         .map(|a| String::from_utf8_lossy(a).into_owned())
