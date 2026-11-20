@@ -38,7 +38,8 @@ const MAX_ANSWER: u64 = 8 * 1024 * 1024;
 
 pub struct TrayBackend {
     ctl: Arc<dyn TrayControl>,
-    pages_dir: PathBuf,
+    /// `Documents\Page2Cam\pages`, or why it can't be found (pages refused).
+    pages_dir: Result<PathBuf, String>,
     activity: Arc<Mutex<Activity>>,
     /// How often start/stop re-check the state (tests make it short).
     pub poll: Duration,
@@ -47,7 +48,7 @@ pub struct TrayBackend {
 impl TrayBackend {
     pub fn new(
         ctl: Arc<dyn TrayControl>,
-        pages_dir: PathBuf,
+        pages_dir: Result<PathBuf, String>,
         activity: Arc<Mutex<Activity>>,
     ) -> Self {
         TrayBackend {
@@ -190,13 +191,17 @@ impl TrayBackend {
                 ))
             }
             C::InstallUpdate => self.ctl.install_update().map(BackendReply::Done),
-            C::ListPages => Ok(BackendReply::Json(json!({
-                "folder": self.pages_dir.display().to_string(),
-                "pages": list_pages(&self.pages_dir),
-            }))),
+            C::ListPages => {
+                let dir = self.pages_dir.as_ref().map_err(Clone::clone)?;
+                Ok(BackendReply::Json(json!({
+                    "folder": dir.display().to_string(),
+                    "pages": list_pages(dir),
+                })))
+            }
             C::ShowPage { name, html } => {
+                let dir = self.pages_dir.as_ref().map_err(Clone::clone)?;
                 self.engine()?;
-                let p = write_page(&self.pages_dir, name, html)
+                let p = write_page(dir, name, html)
                     .map_err(|e| format!("could not save the page: {e}"))?;
                 let url = file_url(&p);
                 self.post("/api/navigate", &json!({ "url": url }))?;
@@ -500,11 +505,30 @@ pub(crate) mod tests {
     fn backend(tray: Arc<FakeTray>, dir: &std::path::Path) -> TrayBackend {
         let mut b = TrayBackend::new(
             tray,
-            dir.to_path_buf(),
+            Ok(dir.to_path_buf()),
             Arc::new(Mutex::new(Activity::default())),
         );
         b.poll = Duration::from_millis(10);
         b
+    }
+
+    #[test]
+    fn no_documents_folder_means_no_pages() {
+        let (port, log) = fake_engine(|_, _, _| (200, b"{}".to_vec()));
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "running".into();
+        *tray.engine.lock() = Some((port, "tok".into()));
+        let b = TrayBackend::new(
+            tray,
+            Err("the Documents folder could not be found".into()),
+            Arc::new(Mutex::new(Activity::default())),
+        );
+        let e = b
+            .call("A", BackendCall::ShowPage { name: "a".into(), html: "<p>".into() })
+            .unwrap_err();
+        assert!(e.contains("Documents"), "{e}");
+        assert!(b.call("A", BackendCall::ListPages).is_err());
+        assert!(log.lock().is_empty(), "nothing shown");
     }
 
     #[test]
@@ -584,7 +608,7 @@ pub(crate) mod tests {
         assert_eq!(log[0].1, "/api/navigate");
         let body: Value = serde_json::from_slice(&log[0].2).unwrap();
         assert_eq!(body["url"], file_url(&p));
-        assert_eq!(tray.balloons.lock().as_slice(), ["Claude changed the page"]);
+        assert_eq!(tray.balloons.lock().as_slice(), ["Agent “Claude” changed the page"]);
         assert_eq!(b.activity.lock().list()[0].agent, "Claude");
     }
 
@@ -649,7 +673,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             tray.balloons.lock().as_slice(),
-            ["Claude started your stream"]
+            ["Agent “Claude” started your stream"]
         );
     }
 
@@ -665,7 +689,7 @@ pub(crate) mod tests {
             Ok(BackendReply::Done(_))
         ));
         assert_eq!(*tray.started.lock(), 1);
-        assert_eq!(tray.balloons.lock().as_slice(), ["Claude started Page2Cam"]);
+        assert_eq!(tray.balloons.lock().as_slice(), ["Agent “Claude” started Page2Cam"]);
         // Already running: no second start, no balloon.
         b.call("Claude", BackendCall::Start).unwrap();
         assert_eq!(*tray.started.lock(), 1);

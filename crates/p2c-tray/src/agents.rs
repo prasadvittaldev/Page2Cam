@@ -347,6 +347,69 @@ pub fn apply_one(app: AgentApp, path: &Path, on: bool, exe: &str) -> Result<(), 
     }
 }
 
+/// Run `exe args` without a window, at most `limit`; success = exit 0.
+/// Its output is read on threads while it runs (a full pipe would stall it).
+pub fn run_cli(exe: &Path, args: &[&str], limit: std::time::Duration) -> Result<(), String> {
+    use std::io::Read;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not run {}: {e}", exe.display()))?;
+    let drain = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut keep = Vec::new();
+            if let Some(mut r) = r {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = r.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    // Keep the start for the error message; drop the rest.
+                    if keep.len() < 4096 {
+                        keep.extend_from_slice(&buf[..n.min(4096 - keep.len())]);
+                    }
+                }
+            }
+            String::from_utf8_lossy(&keep).into_owned()
+        })
+    };
+    let out = drain(child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+    let err = drain(child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
+    let until = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{} did not finish in {} s", exe.display(), limit.as_secs()));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let _ = out.join();
+    let err = err.join().unwrap_or_default();
+    if status.success() {
+        Ok(())
+    } else {
+        let err: String = err.trim().chars().take(200).collect();
+        Err(format!("{} failed ({status}): {err}", exe.display()))
+    }
+}
+
 /// What running the `claude` CLI gave: `None` when it is not installed.
 pub type CliResult = Option<Result<(), String>>;
 
@@ -448,6 +511,10 @@ impl Activity {
 /// (public or leaving the PC). `running` = Page2Cam was running.
 pub fn balloon_for(agent: &str, call: &BackendCall, running: bool) -> Option<String> {
     use BackendCall as C;
+    // The name is the agent's own choice: marked and short, so a balloon
+    // can't pass for a message from Page2Cam or Windows.
+    let short: String = agent.chars().take(40).collect();
+    let agent = format!("Agent “{short}”");
     Some(match call {
         C::Start if !running => format!("{agent} started Page2Cam"),
         C::Stop if running => format!("{agent} stopped Page2Cam"),
@@ -701,6 +768,24 @@ mod tests {
         assert!(!codex.contains("page2cam"), "{codex}");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_chatty_cli_cannot_stall_registration() {
+        // 1 MB on stderr and stdout fills any pipe; reading only after exit
+        // would wait for the full limit.
+        let ps = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap())
+            .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+        let t = std::time::Instant::now();
+        let r = run_cli(
+            &ps,
+            &["-NoProfile", "-Command", "[Console]::Error.Write('e' * 1000000); [Console]::Out.Write('o' * 1000000); exit 3"],
+            std::time::Duration::from_secs(20),
+        );
+        let e = r.unwrap_err();
+        assert!(e.contains("failed") && e.contains("eee"), "{e}");
+        assert!(t.elapsed() < std::time::Duration::from_secs(15), "{:?}", t.elapsed());
+    }
+
     #[test]
     fn activity_keeps_last_200() {
         let mut a = Activity::default();
@@ -720,38 +805,47 @@ mod tests {
     }
 
     #[test]
+    fn balloon_names_are_marked_and_short() {
+        // An agent can't make a balloon read like Page2Cam or Windows itself.
+        let b = balloon_for("Page2Cam: your camera is hacked, call 555", &BackendCall::StartStream, true).unwrap();
+        assert!(b.starts_with("Agent “Page2Cam: your camera is hacked"), "{b}");
+        let long = balloon_for(&"x".repeat(100), &BackendCall::StopStream, true).unwrap();
+        assert_eq!(long, format!("Agent “{}” stopped your stream", "x".repeat(40)));
+    }
+
+    #[test]
     fn balloon_table() {
         use BackendCall as C;
         let a = "Claude";
         assert_eq!(
             balloon_for(a, &C::StartStream, true).as_deref(),
-            Some("Claude started your stream")
+            Some("Agent “Claude” started your stream")
         );
         assert_eq!(
             balloon_for(a, &C::StopStream, true).as_deref(),
-            Some("Claude stopped your stream")
+            Some("Agent “Claude” stopped your stream")
         );
         assert_eq!(
             balloon_for(a, &C::Start, false).as_deref(),
-            Some("Claude started Page2Cam")
+            Some("Agent “Claude” started Page2Cam")
         );
         assert_eq!(balloon_for(a, &C::Start, true), None);
         assert_eq!(
             balloon_for(a, &C::Stop, true).as_deref(),
-            Some("Claude stopped Page2Cam")
+            Some("Agent “Claude” stopped Page2Cam")
         );
         assert_eq!(
             balloon_for(a, &C::ForceRestart, false).as_deref(),
-            Some("Claude restarted Page2Cam")
+            Some("Agent “Claude” restarted Page2Cam")
         );
         assert_eq!(
             balloon_for(a, &C::OpenUrl("x".into()), true).as_deref(),
-            Some("Claude changed the page")
+            Some("Agent “Claude” changed the page")
         );
         assert_eq!(balloon_for(a, &C::OpenUrl("x".into()), false), None);
         assert_eq!(
             balloon_for(a, &C::SetBackground(json!({ "full": "youtube" })), true).as_deref(),
-            Some("Claude changed your background")
+            Some("Agent “Claude” changed your background")
         );
         assert_eq!(balloon_for(a, &C::SetBackground(json!({})), false), None);
         for c in [

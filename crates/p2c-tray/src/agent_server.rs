@@ -25,6 +25,8 @@ const MAX_TRAY_BODY: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 16;
 const MAX_SESSIONS: usize = 64;
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
+/// The request line and headers must arrive within this.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Saves `agents_allowed` and `agent_token`.
 pub type SaveFn = Box<dyn Fn(bool, &str) + Send + Sync>;
@@ -125,9 +127,13 @@ impl AgentServer {
         });
         let me = AgentServer { inner };
         if allowed {
+            // Rewrites a leftover file (a crash or a forced update leaves one).
             me.write_discovery();
             // Keep registrations pointing at this exe (it may have moved).
             me.register(true);
+        } else if let Some(p) = &me.inner.deps.discovery {
+            // A leftover from a tray that didn't close normally.
+            let _ = remove_discovery(p);
         }
         let inner = me.inner.clone();
         std::thread::Builder::new()
@@ -314,55 +320,80 @@ struct Request {
     body: Vec<u8>,
 }
 
-/// Read one request; `Err(status)` for a bad or too large one.
-fn read_request(
-    r: &mut BufReader<TcpStream>,
-    max_body: impl Fn(&str) -> usize,
-) -> Result<Request, u16> {
-    let mut head_len = 0usize;
-    let mut line = String::new();
-    r.read_line(&mut line).map_err(|_| 400u16)?;
-    head_len += line.len();
-    let mut parts = line.split_whitespace();
+/// Read the request line and headers (at most [`MAX_HEAD`] bytes in all);
+/// no body yet. `Err(status)` for a bad or too large head.
+fn read_head(r: &mut BufReader<TcpStream>) -> Result<Request, u16> {
+    let mut head = Vec::new();
+    // `take` bounds even a line that never ends.
+    let mut limited = r.by_ref().take(MAX_HEAD as u64 + 1);
+    loop {
+        let before = head.len();
+        let n = limited.read_until(b'\n', &mut head).map_err(|_| 400u16)?;
+        if head.len() > MAX_HEAD {
+            return Err(431);
+        }
+        if n == 0 {
+            return Err(400);
+        }
+        let line = &head[before..];
+        if before > 0 && (line == b"\r\n" || line == b"\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8(head).map_err(|_| 400u16)?;
+    let mut lines = text.lines();
+    let first = lines.next().ok_or(400u16)?;
+    let mut parts = first.split_whitespace();
     let method = parts.next().ok_or(400u16)?.to_string();
     let target = parts.next().ok_or(400u16)?;
     let path = target.split('?').next().unwrap_or("").to_string();
     let mut headers = HashMap::new();
-    loop {
-        let mut h = String::new();
-        let n = r.read_line(&mut h).map_err(|_| 400u16)?;
-        head_len += n;
-        if head_len > MAX_HEAD {
-            return Err(431);
-        }
-        if n == 0 || h == "\r\n" || h == "\n" {
-            break;
-        }
+    for h in lines {
         if let Some((k, v)) = h.split_once(':') {
             headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
-    let len: usize = match headers.get("content-length") {
-        Some(v) => v.parse().map_err(|_| 400u16)?,
-        None => 0,
-    };
-    if headers
-        .get("transfer-encoding")
-        .is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
-    {
-        return Err(411);
-    }
-    if len > max_body(&path) {
-        return Err(413);
-    }
-    let mut body = vec![0; len];
-    r.read_exact(&mut body).map_err(|_| 400u16)?;
     Ok(Request {
         method,
         path,
         headers,
-        body,
+        body: Vec::new(),
     })
+}
+
+/// Read the body (only after the checks passed), at most `max` bytes;
+/// answers the error itself and returns false when it can't.
+fn read_body(r: &mut BufReader<TcpStream>, s: &mut TcpStream, req: &mut Request, max: usize) -> bool {
+    let res = (|| {
+        if req
+            .headers
+            .get("transfer-encoding")
+            .is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
+        {
+            return Err(411u16);
+        }
+        let len: usize = match req.headers.get("content-length") {
+            Some(v) => v.parse().map_err(|_| 400u16)?,
+            None => 0,
+        };
+        if len > max {
+            return Err(413);
+        }
+        let _ = r.get_ref().set_read_timeout(Some(IO_TIMEOUT));
+        let mut body = vec![0; len];
+        r.read_exact(&mut body).map_err(|_| 400u16)?;
+        Ok(body)
+    })();
+    match res {
+        Ok(b) => {
+            req.body = b;
+            true
+        }
+        Err(code) => {
+            let _ = respond(s, code, "text/plain", reason(code).as_bytes(), &[]);
+            false
+        }
+    }
 }
 
 fn reason(code: u16) -> &'static str {
@@ -416,20 +447,16 @@ fn bearer(req: &Request) -> Option<&str> {
 }
 
 fn handle(inner: &Arc<Inner>, stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    // A slow or silent client gets a few seconds for its head; the body
+    // (read only after the checks) gets longer.
+    let _ = stream.set_read_timeout(Some(HEAD_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
     let mut s = stream;
     let mut r = BufReader::new(read_half);
-    let req = match read_request(&mut r, |p| {
-        if p == "/mcp" {
-            MAX_MCP_BODY
-        } else {
-            MAX_TRAY_BODY
-        }
-    }) {
+    let mut req = match read_head(&mut r) {
         Ok(x) => x,
         Err(code) => {
             let _ = respond(&mut s, code, "text/plain", reason(code).as_bytes(), &[]);
@@ -449,23 +476,36 @@ fn handle(inner: &Arc<Inner>, stream: TcpStream) {
         let _ = respond(&mut s, 403, "text/plain", b"forbidden", &[]);
         return;
     }
-    match req.path.as_str() {
-        "/tray/agents" => tray_route(inner, &req, &mut s),
-        "/mcp" => mcp_route(inner, &req, &mut s),
+    let read_all = match req.path.as_str() {
+        "/tray/agents" => tray_route(inner, &mut r, &mut req, &mut s),
+        "/mcp" => mcp_route(inner, &mut r, &mut req, &mut s),
         _ => {
             let _ = respond(&mut s, 404, "text/plain", b"not found", &[]);
+            false
         }
+    };
+    // Let the client read the answer before the socket goes (a little of
+    // an unread body; a refused one is not waited for).
+    if read_all {
+        let _ = std::io::copy(&mut r.take(64 * 1024), &mut std::io::sink());
     }
-    // Let the client read everything before the socket goes.
-    let _ = std::io::copy(&mut r.take(64 * 1024), &mut std::io::sink());
 }
 
-fn tray_route(inner: &Arc<Inner>, req: &Request, s: &mut TcpStream) {
+/// Returns whether the request was read completely.
+fn tray_route(
+    inner: &Arc<Inner>,
+    r: &mut BufReader<TcpStream>,
+    req: &mut Request,
+    s: &mut TcpStream,
+) -> bool {
     let ok = bearer(req)
         .is_some_and(|t| constant_time_eq(t.as_bytes(), inner.deps.tray_token.as_bytes()));
     if !ok {
         json_reply(s, 401, &json!({ "error": "unauthorized" }), &[]);
-        return;
+        return false;
+    }
+    if !read_body(r, s, req, MAX_TRAY_BODY) {
+        return false;
     }
     match req.method.as_str() {
         "GET" => json_reply(s, 200, &agents_json(inner), &[]),
@@ -474,7 +514,7 @@ fn tray_route(inner: &Arc<Inner>, req: &Request, s: &mut TcpStream) {
                 Ok(v) => v,
                 Err(_) => {
                     json_reply(s, 400, &json!({ "error": "body must be JSON" }), &[]);
-                    return;
+                    return true;
                 }
             };
             if v["reset_token"] == json!(true) {
@@ -488,7 +528,7 @@ fn tray_route(inner: &Arc<Inner>, req: &Request, s: &mut TcpStream) {
                     &json!({ "error": "give allowed or reset_token" }),
                     &[],
                 );
-                return;
+                return true;
             }
             json_reply(s, 200, &agents_json(inner), &[]);
         }
@@ -499,16 +539,35 @@ fn tray_route(inner: &Arc<Inner>, req: &Request, s: &mut TcpStream) {
             &[("Allow", "GET, POST".into())],
         ),
     }
+    true
 }
 
-fn mcp_route(inner: &Arc<Inner>, req: &Request, s: &mut TcpStream) {
+/// The agent name a bridge passes (`X-P2C-Agent`), cleaned like `initialize`'s.
+fn agent_header(req: &Request) -> Option<ClientInfo> {
+    let n: String = req
+        .headers
+        .get("x-p2c-agent")?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect();
+    (!n.trim().is_empty()).then_some(ClientInfo { name: n })
+}
+
+/// Returns whether the request was read completely.
+fn mcp_route(
+    inner: &Arc<Inner>,
+    r: &mut BufReader<TcpStream>,
+    req: &mut Request,
+    s: &mut TcpStream,
+) -> bool {
     let (allowed, token) = {
         let sh = inner.shared.lock();
         (sh.allowed, sh.token.clone())
     };
     if !allowed {
         let _ = respond(s, 404, "text/plain", b"agents are switched off", &[]);
-        return;
+        return false;
     }
     if !bearer(req).is_some_and(|t| constant_time_eq(t.as_bytes(), token.as_bytes())) {
         json_reply(
@@ -517,7 +576,7 @@ fn mcp_route(inner: &Arc<Inner>, req: &Request, s: &mut TcpStream) {
             &json!({ "error": "unauthorized" }),
             &[("WWW-Authenticate", "Bearer".into())],
         );
-        return;
+        return false;
     }
     let session = req.headers.get("mcp-session-id").cloned();
     match req.method.as_str() {
@@ -527,7 +586,7 @@ fn mcp_route(inner: &Arc<Inner>, req: &Request, s: &mut TcpStream) {
                 inner.shared.lock().sessions.retain(|(s, _)| *s != id);
             }
             let _ = respond(s, 200, "text/plain", b"", &[]);
-            return;
+            return false;
         }
         _ => {
             let _ = respond(
@@ -537,8 +596,11 @@ fn mcp_route(inner: &Arc<Inner>, req: &Request, s: &mut TcpStream) {
                 b"POST only",
                 &[("Allow", "POST, DELETE".into())],
             );
-            return;
+            return false;
         }
+    }
+    if !read_body(r, s, req, MAX_MCP_BODY) {
+        return false;
     }
     let msg: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
@@ -549,7 +611,7 @@ fn mcp_route(inner: &Arc<Inner>, req: &Request, s: &mut TcpStream) {
                 &json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "parse error" } }),
                 &[],
             );
-            return;
+            return true;
         }
     };
     let is_init = msg["method"] == "initialize";
@@ -567,6 +629,7 @@ fn mcp_route(inner: &Arc<Inner>, req: &Request, s: &mut TcpStream) {
                     .find(|(s, _)| s == id)
                     .map(|(_, c)| c.clone())
             })
+            .or_else(|| agent_header(req))
             .unwrap_or_default()
     };
     let answer = inner.mcp.handle(&msg, &mut client);
@@ -590,6 +653,7 @@ fn mcp_route(inner: &Arc<Inner>, req: &Request, s: &mut TcpStream) {
             let _ = respond(s, 202, "application/json", b"", &extra);
         }
     }
+    true
 }
 
 #[cfg(test)]
@@ -614,7 +678,7 @@ mod tests {
         let tray = Arc::new(FakeTray::default());
         *tray.state.lock() = "stopped".into();
         let activity = Arc::new(Mutex::new(Activity::default()));
-        let backend = TrayBackend::new(tray, dir.path().join("pages"), activity.clone());
+        let backend = TrayBackend::new(tray, Ok(dir.path().join("pages")), activity.clone());
         let deps = ServerDeps {
             tray_token: "traytoken".into(),
             discovery: Some(disc.clone()),
@@ -882,6 +946,74 @@ mod tests {
         assert!(r.disc.exists());
         let disc = r.disc.clone();
         drop(r.server);
+        assert!(!disc.exists());
+    }
+
+    /// Sends only a head (no body) and reads the answer within `limit`.
+    fn head_only(port: u16, head: &str, limit: Duration) -> std::io::Result<String> {
+        let mut s = TcpStream::connect(("127.0.0.1", port))?;
+        s.set_read_timeout(Some(limit))?;
+        s.write_all(head.as_bytes())?;
+        let mut raw = String::new();
+        s.read_to_string(&mut raw)?;
+        Ok(raw)
+    }
+
+    #[test]
+    fn unauthorised_requests_are_refused_before_any_body() {
+        let r = rig(0, true);
+        let p = r.server.port();
+        // A 30 MB body is announced but never sent: the answer must not wait for it.
+        for (head, want) in [
+            (format!("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer wrong\r\nContent-Length: 30000000\r\n\r\n"), "401"),
+            (format!("POST /mcp HTTP/1.1\r\nHost: evil.example\r\nContent-Length: 30000000\r\n\r\n"), "403"),
+            (format!("POST /nope HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nContent-Length: 30000000\r\n\r\n"), "404"),
+            (format!("POST /tray/agents HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nContent-Length: 30000000\r\n\r\n"), "401"),
+        ] {
+            let raw = head_only(p, &head, Duration::from_secs(3)).expect("answered without the body");
+            assert!(raw.starts_with(&format!("HTTP/1.1 {want}")), "{raw}");
+        }
+        // Agents off: 404 before any body as well.
+        r.server.set_allowed(false);
+        let raw = head_only(
+            p,
+            &format!("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer {}\r\nContent-Length: 30000000\r\n\r\n", "a".repeat(32)),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        assert!(raw.starts_with("HTTP/1.1 404"), "{raw}");
+    }
+
+    #[test]
+    fn endless_request_line_is_cut_off() {
+        let r = rig(0, true);
+        let p = r.server.port();
+        let mut s = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        // 64 KB with no newline: refused after the 16 KB head limit.
+        let _ = s.write_all(&vec![b'A'; 64 * 1024]);
+        let mut raw = Vec::new();
+        let _ = s.read_to_end(&mut raw);
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.starts_with("HTTP/1.1 4"), "{text}");
+    }
+
+    #[test]
+    fn a_leftover_discovery_file_goes_when_agents_are_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let disc = dir.path().join("agent.json");
+        std::fs::write(&disc, r#"{"url":"http://127.0.0.1:1/mcp","token":"old"}"#).unwrap();
+        let tray = Arc::new(FakeTray::default());
+        let activity = Arc::new(Mutex::new(Activity::default()));
+        let backend = TrayBackend::new(tray, Ok(dir.path().join("pages")), activity.clone());
+        let deps = ServerDeps {
+            tray_token: "t".into(),
+            discovery: Some(disc.clone()),
+            exe: "x".into(),
+            save: Box::new(|_, _| {}),
+            registrar: Arc::new(|_| Vec::new()),
+        };
+        let _s = AgentServer::start(0, false, Some("a".repeat(32)), deps, backend, activity).unwrap();
         assert!(!disc.exists());
     }
 

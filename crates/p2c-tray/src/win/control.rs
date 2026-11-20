@@ -847,7 +847,7 @@ fn start_agents(c: &Controller) -> Option<crate::agent_server::AgentServer> {
 
 /// `<Documents>\Page2Cam\pages` (the Documents known folder follows OneDrive
 /// and moved folders).
-fn pages_dir() -> PathBuf {
+fn pages_dir() -> Result<PathBuf, String> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
     // SAFETY: the returned string is freed with CoTaskMemFree.
@@ -858,54 +858,23 @@ fn pages_dir() -> PathBuf {
                 CoTaskMemFree(Some(p.0 as *const _));
                 s.map(PathBuf::from)
             }
-            Err(_) => None,
+            Err(e) => {
+                tracing::warn!("the Documents folder could not be found: {e}");
+                None
+            }
         }
     };
-    docs.or_else(|| directories::UserDirs::new().and_then(|u| u.document_dir().map(PathBuf::from)))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Page2Cam")
-        .join("pages")
+    // Pages go only under Documents (never a temp folder).
+    docs.map(|d| d.join("Page2Cam").join("pages"))
+        .ok_or_else(|| "Pages can't be saved: Windows could not find your Documents folder".into())
 }
 
 /// Run `claude <args>` (Claude Code's CLI) when it is on PATH; `None` when
 /// it isn't. Waits up to 30 s.
 fn claude_cli(args: &[&str]) -> Option<Result<(), String>> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let path = std::env::var_os("PATH")?;
     let exe = std::env::split_paths(&path)
         .flat_map(|d| ["claude.exe", "claude.cmd"].map(|n| d.join(n)))
         .find(|p| p.is_file())?;
-    let child = std::process::Command::new(&exe)
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => return Some(Err(format!("could not run claude: {e}"))),
-    };
-    let until = Instant::now() + Duration::from_secs(30);
-    loop {
-        match child.try_wait() {
-            Ok(Some(st)) if st.success() => return Some(Ok(())),
-            Ok(Some(st)) => {
-                let mut err = String::new();
-                if let Some(mut e) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = e.read_to_string(&mut err);
-                }
-                let err: String = err.trim().chars().take(200).collect();
-                return Some(Err(format!("claude mcp failed ({st}): {err}")));
-            }
-            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(100)),
-            Ok(None) => {
-                let _ = child.kill();
-                return Some(Err("claude mcp did not finish in 30 s".into()));
-            }
-            Err(e) => return Some(Err(e.to_string())),
-        }
-    }
+    Some(crate::agents::run_cli(&exe, args, Duration::from_secs(30)))
 }
