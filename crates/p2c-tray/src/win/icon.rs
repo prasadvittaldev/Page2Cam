@@ -13,16 +13,18 @@ use crate::health::Level;
 
 pub struct Icons {
     size: u32,
-    cache: [Option<HICON>; 4],
+    /// Per level, without and with the agent badge.
+    cache: [Option<HICON>; 8],
 }
 
-fn slot(level: Level) -> usize {
-    match level {
+fn slot(level: Level, agent: bool) -> usize {
+    let l = match level {
         Level::Grey => 0,
         Level::Green => 1,
         Level::Amber => 2,
         Level::Red => 3,
-    }
+    };
+    l + if agent { 4 } else { 0 }
 }
 
 impl Icons {
@@ -31,15 +33,19 @@ impl Icons {
         let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.clamp(16, 64) as u32;
         Icons {
             size,
-            cache: [None; 4],
+            cache: [None; 8],
         }
     }
 
-    /// The icon for `level` (made on first use; `None` if Windows refused).
-    pub fn get(&mut self, level: Level) -> Option<HICON> {
-        let i = slot(level);
+    /// The icon for `level` (+ agent badge) (made on first use; `None` if
+    /// Windows refused).
+    pub fn get(&mut self, level: Level, agent: bool) -> Option<HICON> {
+        let i = slot(level, agent);
         if self.cache[i].is_none() {
-            match hicon(&crate::icon::icon_rgba(level, self.size), self.size) {
+            match hicon(
+                &crate::icon::icon_rgba_for(level, self.size, agent),
+                self.size,
+            ) {
                 Ok(h) => self.cache[i] = Some(h),
                 Err(e) => tracing::warn!("cannot make the tray icon: {e}"),
             }

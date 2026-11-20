@@ -28,6 +28,59 @@ pub fn with_tray_seen(text: &str) -> String {
     toml::to_string(&t).unwrap_or_else(|_| "tray_seen = true\n".into())
 }
 
+/// `agents_allowed = true` in this tray.toml text? (Default off.)
+pub fn agents_allowed_in(text: &str) -> bool {
+    table(text)
+        .get("agents_allowed")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// `text` with `agents_allowed` set (other keys kept).
+pub fn with_agents_allowed(text: &str, on: bool) -> String {
+    let mut t = table(text);
+    t.insert("agents_allowed".into(), toml::Value::Boolean(on));
+    toml::to_string(&t).unwrap_or_default()
+}
+
+/// The saved agent token, if it looks like one of ours (32+ hex chars).
+pub fn agent_token_in(text: &str) -> Option<String> {
+    table(text)
+        .get("agent_token")
+        .and_then(toml::Value::as_str)
+        .filter(|t| t.len() >= 32 && t.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(String::from)
+}
+
+/// `text` with `agent_token` set (other keys kept).
+pub fn with_agent_token(text: &str, token: &str) -> String {
+    let mut t = table(text);
+    t.insert("agent_token".into(), toml::Value::String(token.into()));
+    toml::to_string(&t).unwrap_or_default()
+}
+
+/// The tray's `tray.toml` path.
+pub fn tray_toml_path() -> Option<PathBuf> {
+    user_dir().map(|d| d.join("tray.toml"))
+}
+
+/// tray.toml's text ("" when missing).
+pub fn read_tray_toml() -> String {
+    tray_toml_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default()
+}
+
+/// Replace tray.toml's text.
+pub fn write_tray_toml(text: &str) -> anyhow::Result<()> {
+    let path = tray_toml_path().ok_or_else(|| anyhow::anyhow!("no config directory"))?;
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    crate::agents::write_atomic(&path, text.as_bytes())?;
+    Ok(())
+}
+
 /// The `check_updates` setting in this settings text (default on).
 pub fn check_updates_in(text: &str) -> bool {
     table(text)
@@ -116,6 +169,26 @@ mod tests {
         assert!(tray_seen_in(&t));
         assert!(t.contains("other = 3"), "{t}");
         assert!(tray_seen_in(&with_tray_seen("tray_seen = false")));
+    }
+
+    #[test]
+    fn agents_settings_roundtrip_keep_other_keys() {
+        assert!(!agents_allowed_in(""));
+        assert!(!agents_allowed_in("broken ["));
+        let t = with_agents_allowed("tray_seen = true\n", true);
+        assert!(agents_allowed_in(&t) && tray_seen_in(&t), "{t}");
+        let tok = "0123456789abcdef0123456789abcdef";
+        let t = with_agent_token(&t, tok);
+        assert_eq!(agent_token_in(&t).as_deref(), Some(tok));
+        assert!(agents_allowed_in(&t) && tray_seen_in(&t), "{t}");
+        let t = with_agents_allowed(&t, false);
+        assert!(!agents_allowed_in(&t));
+        assert_eq!(agent_token_in(&t).as_deref(), Some(tok));
+        assert_eq!(agent_token_in("agent_token = \"short\""), None);
+        assert_eq!(agent_token_in("agent_token = 5"), None);
+        // tray_seen keeps the agent keys too.
+        let t = with_tray_seen(&t);
+        assert_eq!(agent_token_in(&t).as_deref(), Some(tok));
     }
 
     #[test]

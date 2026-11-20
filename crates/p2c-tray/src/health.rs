@@ -238,6 +238,17 @@ fn clip(mut s: String) -> String {
     s
 }
 
+/// `tip` with `line` added on a new line, `tip` shortened so `line` always fits.
+pub fn append_line(tip: &str, line: &str) -> String {
+    let room = TOOLTIP_MAX.saturating_sub(line.chars().count() + 1);
+    let mut base: String = tip.chars().take(room).collect();
+    if base.chars().count() < tip.chars().count() && room > 0 {
+        base = base.chars().take(room - 1).collect();
+        base.push('…');
+    }
+    clip(format!("{base}\n{line}"))
+}
+
 /// What the icon and tooltip show: [`effective_level`] and [`tooltip`],
 /// except that a camera problem the tray found itself (driver not installed
 /// or out of date) makes the icon red in every state and leads the tooltip.

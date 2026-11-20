@@ -3,6 +3,9 @@
 //! shell under `win/` drives it with events and carries out the returned
 //! actions.
 
+pub mod agent_backend;
+pub mod agent_server;
+pub mod agents;
 pub mod health;
 pub mod http;
 pub mod icon;
