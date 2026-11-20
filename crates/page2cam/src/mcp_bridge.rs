@@ -280,8 +280,11 @@ impl<E: Env> Bridge<E> {
 }
 
 /// A failed read of the tray's answer. A reset before any answer byte is
-/// the tray refusing early (it acts only after answering 200); anything
-/// else may have been acted on.
+/// taken as the tray refusing early (401/404 before reading the body), so
+/// the call may go again. Caveat: the tray acts first and answers after,
+/// so if it dies mid-call (reset, no answer yet) a call it already carried
+/// out can be sent again. Any other failure may have been acted on and is
+/// not repeated.
 fn read_failure(e: std::io::Error, got_answer: bool) -> PostError {
     use std::io::ErrorKind;
     let reset = matches!(

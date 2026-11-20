@@ -555,11 +555,14 @@ fn handle(inner: &Arc<Inner>, stream: TcpStream) {
 /// After an early refusal: take a little of what the client is still
 /// sending (briefly), so closing with unread data doesn't reset the
 /// connection before the client has read our answer.
-fn drain_briefly(r: BufReader<TcpStream>) {
-    let _ = r
-        .get_ref()
-        .set_read_timeout(Some(Duration::from_millis(200)));
-    let _ = std::io::copy(&mut r.take(8 * 1024), &mut std::io::sink());
+fn drain_briefly(mut r: BufReader<TcpStream>) {
+    // One 200 ms deadline in all (a client dripping bytes can't hold the
+    // connection open by keeping each read short).
+    let mut d = DeadlineRead {
+        r: &mut r,
+        deadline: Instant::now() + Duration::from_millis(200),
+    };
+    let _ = std::io::copy(&mut (&mut d).take(8 * 1024), &mut std::io::sink());
 }
 
 /// Returns whether the request was read completely.
@@ -1103,6 +1106,33 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 4"),
             "{raw:?}"
+        );
+    }
+
+    #[test]
+    fn a_client_trickling_after_a_refusal_is_closed_quickly() {
+        let r = rig(0, true);
+        let p = r.server.port();
+        let mut s = TcpStream::connect(("127.0.0.1", p)).unwrap();
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nAuthorization: Bearer wrong\r\nContent-Length: 100000\r\n\r\n"
+        );
+        s.write_all(head.as_bytes()).unwrap();
+        // A byte every 150 ms (each read alone is inside 200 ms) until the
+        // server has closed the connection and writes start failing.
+        let t = std::time::Instant::now();
+        let mut closed_after = None;
+        for _ in 0..100 {
+            if s.write_all(b"x").is_err() {
+                closed_after = Some(t.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        let closed_after = closed_after.expect("the server kept reading for 15 s");
+        assert!(
+            closed_after < Duration::from_millis(1500),
+            "{closed_after:?}"
         );
     }
 
