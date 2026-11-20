@@ -277,6 +277,8 @@ pub struct RegEnv {
     pub appdata: Option<PathBuf>,
     /// The user's home folder.
     pub home: Option<PathBuf>,
+    /// `%LOCALAPPDATA%` (packaged apps keep their files under `Packages`).
+    pub localappdata: Option<PathBuf>,
 }
 
 impl RegEnv {
@@ -284,23 +286,76 @@ impl RegEnv {
         RegEnv {
             appdata: std::env::var_os("APPDATA").map(PathBuf::from),
             home: directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()),
+            localappdata: std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
         }
     }
 }
 
+/// One agent config file to edit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub app: AgentApp,
+    pub path: PathBuf,
+    /// Read instead while `path` doesn't exist yet: the packaged Claude
+    /// Desktop sees the real `%APPDATA%` file until it has its own copy, so
+    /// its copy starts from that file (the user's other servers stay).
+    pub seed: Option<PathBuf>,
+}
+
+/// The packaged (MSIX) Claude Desktop's config folder:
+/// `%LOCALAPPDATA%\Packages\Claude_<publisher id>\LocalCache\Roaming\Claude`
+/// (its writes to `%APPDATA%` are redirected there).
+fn packaged_claude_dir(localappdata: &Path) -> Option<PathBuf> {
+    let mut pkgs: Vec<PathBuf> = std::fs::read_dir(localappdata.join("Packages"))
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.to_ascii_lowercase().starts_with("claude_"))
+        })
+        .map(|e| e.path())
+        .filter(|p| p.join("LocalCache").join("Roaming").is_dir())
+        .collect();
+    pkgs.sort();
+    Some(
+        pkgs.first()?
+            .join("LocalCache")
+            .join("Roaming")
+            .join("Claude"),
+    )
+}
+
 /// Each installed agent's config file (only when its folder exists).
-pub fn registration_targets(env: &RegEnv) -> Vec<(AgentApp, PathBuf)> {
+pub fn registration_targets(env: &RegEnv) -> Vec<Target> {
     let mut v = Vec::new();
+    const CLAUDE_FILE: &str = "claude_desktop_config.json";
+    let real_claude = env.appdata.as_ref().map(|a| a.join("Claude"));
+    match env.localappdata.as_deref().and_then(packaged_claude_dir) {
+        Some(dir) => v.push(Target {
+            app: AgentApp::ClaudeDesktop,
+            path: dir.join(CLAUDE_FILE),
+            seed: real_claude.map(|d| d.join(CLAUDE_FILE)),
+        }),
+        None => {
+            if let Some(d) = real_claude.filter(|d| d.is_dir()) {
+                v.push(Target {
+                    app: AgentApp::ClaudeDesktop,
+                    path: d.join(CLAUDE_FILE),
+                    seed: None,
+                });
+            }
+        }
+    }
     let mut add = |app, dir: Option<PathBuf>, file: &str| {
         if let Some(d) = dir.filter(|d| d.is_dir()) {
-            v.push((app, d.join(file)));
+            v.push(Target {
+                app,
+                path: d.join(file),
+                seed: None,
+            });
         }
     };
-    add(
-        AgentApp::ClaudeDesktop,
-        env.appdata.as_ref().map(|a| a.join("Claude")),
-        "claude_desktop_config.json",
-    );
     add(
         AgentApp::Codex,
         env.home.as_ref().map(|h| h.join(".codex")),
@@ -321,15 +376,33 @@ pub fn registration_targets(env: &RegEnv) -> Vec<(AgentApp, PathBuf)> {
 
 /// Add (`on`) or remove our entry in one agent's config file.
 pub fn apply_one(app: AgentApp, path: &Path, on: bool, exe: &str) -> Result<(), String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            if !on {
-                return Ok(());
-            }
-            String::new()
-        }
-        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    apply_target(
+        &Target {
+            app,
+            path: path.to_path_buf(),
+            seed: None,
+        },
+        on,
+        exe,
+    )
+}
+
+/// [`apply_one`] for a [`Target`]: a missing file starts from its seed.
+pub fn apply_target(t: &Target, on: bool, exe: &str) -> Result<(), String> {
+    let (app, path) = (t.app, t.path.as_path());
+    let read = |p: &Path| match std::fs::read_to_string(p) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("could not read {}: {e}", p.display())),
+    };
+    let text = match read(path)? {
+        Some(t) => t,
+        // Nothing of ours to remove: the agent reads the seed, untouched.
+        None if !on => return Ok(()),
+        None => match &t.seed {
+            Some(s) => read(s)?.unwrap_or_default(),
+            None => String::new(),
+        },
     };
     let new = match (app, on) {
         (AgentApp::Codex, true) => register_codex_toml(&text, exe).map(Some),
@@ -341,7 +414,10 @@ pub fn apply_one(app: AgentApp, path: &Path, on: bool, exe: &str) -> Result<(), 
     }
     .map_err(|e| e.to_string())?;
     match new {
-        Some(t) if t != text => write_atomic(path, t.as_bytes())
+        Some(new) if new != text || !path.exists() => path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| write_atomic(path, new.as_bytes()))
             .map_err(|e| format!("could not write {}: {e}", path.display())),
         _ => Ok(()),
     }
@@ -445,9 +521,9 @@ pub fn apply_registration(
 ) -> Vec<RegResult> {
     let mut out: Vec<RegResult> = registration_targets(env)
         .into_iter()
-        .map(|(app, path)| RegResult {
-            app: app.label().into(),
-            result: apply_one(app, &path, on, exe),
+        .map(|t| RegResult {
+            app: t.app.label().into(),
+            result: apply_target(&t, on, exe),
         })
         .collect();
     // Claude Code rewrites ~/.claude.json while it runs: only its own CLI.
@@ -742,19 +818,59 @@ mod tests {
         assert_eq!(unregister_codex_toml(&out).unwrap(), None);
     }
 
+    /// The packaged (MSIX) Claude Desktop reads its own copy under
+    /// `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude`, and the
+    /// real `%APPDATA%\Claude` file only until that copy exists.
+    #[test]
+    fn packaged_claude_desktop_gets_its_own_copy_seeded_from_the_real_one() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("Roaming/Claude/claude_desktop_config.json");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        let other = r#"{"mcpServers":{"other":{"command":"x"}}}"#;
+        std::fs::write(&real, other).unwrap();
+        let pkg = d.path().join("Local/Packages/Claude_abc123");
+        std::fs::create_dir_all(pkg.join("LocalCache/Roaming")).unwrap();
+        std::fs::create_dir_all(d.path().join("Local/Packages/ClaudeNot/x")).unwrap();
+        let env = RegEnv {
+            appdata: Some(d.path().join("Roaming")),
+            home: Some(d.path().join("home")),
+            localappdata: Some(d.path().join("Local")),
+        };
+        let private = pkg.join("LocalCache/Roaming/Claude/claude_desktop_config.json");
+        let t = registration_targets(&env);
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert_eq!(t[0].app, AgentApp::ClaudeDesktop);
+        assert_eq!(t[0].path, private);
+        let r = apply_registration(true, EXE, &env, &|_: &[&str]| None);
+        assert!(r.iter().all(|x| x.result.is_ok()), "{r:?}");
+        let text = std::fs::read_to_string(&private).unwrap();
+        assert!(
+            text.contains("page2cam") && text.contains("other"),
+            "{text}"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), other);
+        apply_registration(false, EXE, &env, &|_: &[&str]| None);
+        let text = std::fs::read_to_string(&private).unwrap();
+        assert!(
+            !text.contains("page2cam") && text.contains("other"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn registration_targets_only_existing_dirs_and_round_trip() {
         let d = tempfile::tempdir().unwrap();
         let env = RegEnv {
             appdata: Some(d.path().join("Roaming")),
             home: Some(d.path().join("home")),
+            localappdata: Some(d.path().join("Local")),
         };
         assert!(registration_targets(&env).is_empty());
         std::fs::create_dir_all(d.path().join("Roaming/Claude")).unwrap();
         std::fs::create_dir_all(d.path().join("home/.codex")).unwrap();
         let t = registration_targets(&env);
         assert_eq!(
-            t.iter().map(|x| x.0).collect::<Vec<_>>(),
+            t.iter().map(|x| x.app).collect::<Vec<_>>(),
             vec![AgentApp::ClaudeDesktop, AgentApp::Codex]
         );
         let calls = std::cell::RefCell::new(Vec::<String>::new());
