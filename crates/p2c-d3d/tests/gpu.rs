@@ -1654,6 +1654,7 @@ fn backdrop(full: FullBackdrop, in_box: BoxBackdrop, refined_edges: bool) -> Bac
         full,
         in_box,
         refined_edges,
+        hides_room: false,
     }
 }
 
@@ -2271,6 +2272,78 @@ fn gpu_backdrop_shader_failure_hands_backdrops_to_cpu() {
             }
             println!("{what} on {}: handed to the CPU ({reason})", a.name);
         }
+    }
+}
+
+/// I1: under a generated full frame (`hides_room`), a cut-out without a
+/// mask draws the whole box blurred on the GPU as on the CPU; with a mask,
+/// the plain cut-out. Without the backdrop shaders the blurred box can't be
+/// drawn, so the GPU hands over to the CPU instead of showing the room.
+#[test]
+#[ignore = "real GPU; run with --test-threads 1"]
+fn gpu_generated_full_frame_blurs_the_box_like_cpu() {
+    let page = noise(640, 360, 23);
+    let cam = person_cam(320, 180);
+    let m = person_mask();
+    let generated = Backdrop {
+        hides_room: true,
+        ..Backdrop::default()
+    };
+    let mut cases: Vec<Case> = Vec::new();
+    for style in [OverlayStyle::CutoutSmall, OverlayStyle::CutoutFull] {
+        for fresh in [true, false] {
+            cases.push((
+                format!("generated {style:?} fresh={fresh}"),
+                Some(page.clone()),
+                (640, 360),
+                ti(
+                    &cam,
+                    fresh.then_some(&m),
+                    layout(style, 0.3, 0.0, 0.5),
+                    generated.clone(),
+                ),
+            ));
+        }
+    }
+    let page1080 = noise(1920, 1080, 52);
+    let cam720 = person_cam(1280, 720);
+    cases.push((
+        "1080p generated cutout full no mask".into(),
+        Some(page1080),
+        (1920, 1080),
+        ti(
+            &cam720,
+            None,
+            layout(OverlayStyle::CutoutFull, 0.5, 0.0, 0.25),
+            generated.clone(),
+        ),
+    ));
+    backdrop_parity("gpu_generated_full_frame_blurs_the_box_like_cpu", &cases);
+
+    let stale = ti(
+        &cam,
+        None,
+        layout(OverlayStyle::CutoutFull, 0.3, 0.0, 0.5),
+        generated.clone(),
+    );
+    let fresh = ti(
+        &cam,
+        Some(&m),
+        layout(OverlayStyle::CutoutFull, 0.3, 0.0, 0.5),
+        generated,
+    );
+    for a in adapters_or_skip("gpu_generated_full_frame_blurs_the_box_like_cpu") {
+        let gpu = Gpu::new(a.luid).unwrap();
+        let mut p = producer(&gpu, Some(&page), (640, 360));
+        p.fail_backdrop_shaders_for_test();
+        // With a mask nothing needs the shaders: drawn here.
+        p.produce(&fresh, false).unwrap();
+        assert_eq!(p.producer_note(), None, "{}", a.name);
+        assert!(p.fallback_request().is_none(), "{}", a.name);
+        // Without one the blurred box needs them: held, CPU requested.
+        assert!(p.produce(&stale, false).unwrap().is_none(), "{}", a.name);
+        assert_eq!(p.producer_note(), Some(ComposeNote::BackdropUnavailable));
+        assert!(p.fallback_request().is_some(), "{}", a.name);
     }
 }
 

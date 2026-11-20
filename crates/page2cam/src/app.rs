@@ -1618,6 +1618,25 @@ mod tests {
         assert!(!text.contains("/bg/"), "{text}");
     }
 
+    /// I1: a generated full frame tells the compositor the room is hidden,
+    /// so a cut-out without a mask gives "cut-out not ready".
+    #[test]
+    fn generated_full_frame_reports_cutout_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = bg_app(dir.path());
+        let colour = BackgroundDto {
+            full_colour: Some("#112233".into()),
+            ..bg("colour", "room")
+        };
+        app.set_background(colour).unwrap();
+        let b = app.backdrop.read().clone();
+        assert!(b.hides_room);
+        let note = p2c_compositor::ComposeNote::of(&b, &app.pip(), true, false);
+        assert_eq!(note, p2c_compositor::ComposeNote::CutoutNotReady);
+        app.set_background(bg("page", "room")).unwrap();
+        assert!(!app.backdrop.read().hides_room);
+    }
+
     #[test]
     fn box_switch_resets_full_background() {
         let dir = tempfile::tempdir().unwrap();

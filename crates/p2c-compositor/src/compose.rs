@@ -69,7 +69,8 @@ impl ComposeNote {
         }
         let box_needs_mask =
             layout.style == OverlayStyle::Box && backdrop.in_box != BoxBackdrop::Room;
-        if blurred_room || box_needs_mask {
+        let cutout_hides_room = backdrop.hides_room && layout.style.is_cutout();
+        if blurred_room || box_needs_mask || cutout_hides_room {
             ComposeNote::CutoutNotReady
         } else {
             ComposeNote::None
@@ -175,7 +176,8 @@ pub enum PipDraw<'a> {
     Opaque,
     /// The person (premultiplied by the matte) over what is beneath.
     Cutout,
-    /// The whole box blurred (Blur backdrop without a mask).
+    /// The whole box blurred (Blur backdrop without a mask, or a cut-out
+    /// without a mask under a full frame that hides the room).
     BlurAll,
     /// Box backdrop first, then the person over it.
     Over(&'a BoxBackdrop),
@@ -308,7 +310,12 @@ pub fn plan_compose<'a>(
                 PipDraw::Cutout
             } else {
                 layout.style = OverlayStyle::Box;
-                PipDraw::Opaque
+                // A generated full frame hides the room: never show it sharp.
+                if b.hides_room {
+                    PipDraw::BlurAll
+                } else {
+                    PipDraw::Opaque
+                }
             }
         } else {
             // Under a blurred room the box's room is blurred too, even if the
@@ -1436,6 +1443,7 @@ mod tests {
             full,
             in_box,
             refined_edges: false,
+            hides_room: false,
         }
     }
 
@@ -1620,6 +1628,7 @@ mod tests {
                                 full: FullBackdrop::BlurredRoom,
                                 in_box: in_box.clone(),
                                 refined_edges: refined,
+                                hides_room: false,
                             };
                             let (out, _) = draw(&cam, fresh.then_some(&m), &l, &b);
                             let sharp = out
@@ -1997,5 +2006,51 @@ mod tests {
             why.to_string(),
             "composites 5 (page 1, webcam 1, mask 1, layout 1, backdrop 1, other 1)"
         );
+    }
+
+    /// I1: under a generated full frame (image, colour, video page) a
+    /// cut-out without a fresh mask shows the whole PIP box blurred (as the
+    /// in-box Blur fallback), never the sharp room, and the note says so.
+    #[test]
+    fn generated_full_frame_blurs_the_box_without_a_mask() {
+        let cam = person_cam(256, 144);
+        let m = person_mask();
+        let generated = Backdrop {
+            hides_room: true,
+            ..Backdrop::default()
+        };
+        for style in [OverlayStyle::CutoutSmall, OverlayStyle::CutoutFull] {
+            let l = crate::PipLayout {
+                visible: true,
+                x: 0.3,
+                y: 0.0,
+                width: 0.5,
+                style,
+            };
+            // No mask: the box the Box fallback would draw, but blurred.
+            let (got, note) = draw(&cam, None, &l, &generated);
+            assert_eq!(note, ComposeNote::CutoutNotReady, "{style:?}");
+            let as_box = crate::PipLayout {
+                style: OverlayStyle::Box,
+                ..l
+            };
+            let blur = backdrop(FullBackdrop::Page, BoxBackdrop::Blur);
+            let (want, _) = draw(&cam, None, &as_box, &blur);
+            assert!(got == want, "{style:?}: not the blurred box");
+            let px = got.data.as_chunks::<4>().0;
+            assert!(!px.iter().any(|p| sharp_room(*p)), "{style:?}: sharp room");
+            // With a fresh mask: exactly the plain cut-out, no note.
+            let (got, note) = draw(&cam, Some(&m), &l, &generated);
+            let (want, _) = draw(&cam, Some(&m), &l, &Backdrop::default());
+            assert!(got == want, "{style:?}: cut-out changed");
+            assert_eq!(note, ComposeNote::None);
+        }
+        // A Box style keeps its own rules (the app never pairs Box with a
+        // generated full frame, but layout and backdrop are read separately).
+        let b = full_layout(OverlayStyle::Box);
+        let (got, note) = draw(&cam, None, &b, &generated);
+        let (want, _) = draw(&cam, None, &b, &Backdrop::default());
+        assert!(got == want);
+        assert_eq!(note, ComposeNote::None);
     }
 }

@@ -92,6 +92,7 @@ pub fn backdrop(
         full: full.backdrop(),
         in_box: in_box.backdrop(image),
         refined_edges: refined,
+        hides_room: full.is_generated(),
     }
 }
 
@@ -1023,5 +1024,20 @@ mod tests {
             backdrop(&FullBg::Page, &BoxBg::Image, None, false).in_box,
             BoxBackdrop::Room
         );
+    }
+
+    /// I1: the generated full frames tell the compositor they hide the room.
+    #[test]
+    fn generated_full_frames_hide_the_room() {
+        for (full, hides) in [
+            (FullBg::Page, false),
+            (FullBg::BlurredRoom, false),
+            (FullBg::Image, true),
+            (FullBg::Colour("#000000".into()), true),
+            (FullBg::YouTube("dQw4w9WgXcQ".into()), true),
+        ] {
+            let b = backdrop(&full, &BoxBg::Room, None, false);
+            assert_eq!(b.hides_room, hides, "{full:?}");
+        }
     }
 }

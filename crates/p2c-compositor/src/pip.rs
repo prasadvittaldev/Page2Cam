@@ -105,6 +105,11 @@ pub struct Backdrop {
     /// Matte from guided upsampling of the mask (webcam as guide) instead of
     /// bilinear upscaling plus the mask's `EdgeRange` LUT.
     pub refined_edges: bool,
+    /// The full frame is a Page that hides the room: a generated background
+    /// (image, colour or video page). A cut-out style without a fresh mask
+    /// then draws the whole PIP box blurred (as the in-box Blur fallback),
+    /// never the sharp room, and the note says the cut-out isn't ready.
+    pub hides_room: bool,
 }
 
 impl Backdrop {

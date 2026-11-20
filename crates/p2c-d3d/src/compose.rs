@@ -626,11 +626,19 @@ impl GpuProducer {
     /// failed to compile: drawing Page/Room instead would show the sharp
     /// room under a blur setting, so this asks the ticker to hand over to
     /// the CPU compositor ([`OutputProducer::fallback_request`]) and the
-    /// note says why. Page/Room keeps working on the GPU.
+    /// note says why. Page/Room keeps working on the GPU. A cut-out without
+    /// a mask under a full frame that hides the room is drawn as a blurred
+    /// box ([`PipDraw::BlurAll`]), so it needs them too.
     fn can_draw(&mut self, inputs: &TickInputs) -> bool {
         let b = &inputs.backdrop;
-        let wants =
-            b.full != FullBackdrop::Page || b.in_box != BoxBackdrop::Room || b.refined_edges;
+        let blur_all = b.hides_room
+            && plan_of(inputs)
+                .pip
+                .is_some_and(|p| matches!(p.draw, PipDraw::BlurAll));
+        let wants = b.full != FullBackdrop::Page
+            || b.in_box != BoxBackdrop::Room
+            || b.refined_edges
+            || blur_all;
         self.note = None;
         if !wants || self.backdrop_available() {
             return true;
