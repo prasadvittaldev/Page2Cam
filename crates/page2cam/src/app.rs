@@ -1923,12 +1923,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = bg_app(dir.path());
         let saved = || settings(dir.path()).last_page_url;
+        // Taken before `navigate` stamps its write with the real clock, so a
+        // slow settings write can't push that stamp before t0.
+        let t0 = Instant::now();
         app.navigate("https://user.test/a");
         assert_eq!(app.bg.lock().last_page_url, "https://user.test/a");
         assert_eq!(saved(), "https://user.test/a");
         // The page moves by itself (link click, Back/Forward): remembered at
         // once, written once 2 s have passed since the last write.
-        let t0 = Instant::now();
         app.remember_page_url("https://user.test/b", t0);
         assert_eq!(app.bg.lock().last_page_url, "https://user.test/b");
         app.remember_page_url("https://user.test/c", t0 + Duration::from_millis(500));
@@ -1936,7 +1938,7 @@ mod tests {
         let written = saved();
         app.remember_page_url("https://user.test/c", t0 + Duration::from_millis(1900));
         assert_eq!(saved(), written, "more than one write within 2 s");
-        app.remember_page_url("https://user.test/c", t0 + Duration::from_millis(2600));
+        app.remember_page_url("https://user.test/c", t0 + Duration::from_millis(4000));
         assert_eq!(saved(), "https://user.test/c", "pending write not flushed");
         // The watchdog poll sees the shown URL change.
         *app.fallback_url.lock() = "https://user.test/d".into();

@@ -211,6 +211,7 @@ mod tests {
             name: name.into(),
             path: path.map(PathBuf::from),
             started: None,
+            mcp_bridge: false,
         }
     }
 
