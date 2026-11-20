@@ -28,6 +28,23 @@ pub struct Proc {
     pub path: Option<PathBuf>,
     /// Start time in platform ticks (`platform::TICKS_PER_SEC`), when known.
     pub started: Option<u64>,
+    /// A `page2cam --mcp` bridge (a desktop agent's connection): never
+    /// stopped as a leftover.
+    pub mcp_bridge: bool,
+}
+
+/// Prefix of the lock each `--mcp` bridge holds (`<prefix><pid>`), so the
+/// process sweeps can tell it apart without reading its command line.
+pub const MCP_LOCK_PREFIX: &str = "Page2Cam.Mcp.";
+
+/// The lock name a bridge with this pid holds.
+pub fn mcp_lock_name(pid: u32) -> String {
+    format!("{MCP_LOCK_PREFIX}{pid}")
+}
+
+/// `page2cam --mcp` and nothing else: the MCP bridge role.
+pub fn is_mcp_args<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> bool {
+    args.len() == 2 && args[1].as_ref() == "--mcp"
 }
 
 /// Maximum parent-chain steps followed (guards against pid-reuse cycles).
@@ -174,7 +191,7 @@ pub fn to_stop_keeping(procs: &[Proc], me: u32, force: Option<u32>, keep: &[u32]
     };
     procs
         .iter()
-        .filter(|p| is_page2cam(&p.name))
+        .filter(|p| is_page2cam(&p.name) && !p.mcp_bridge)
         .filter(|p| p.pid != me && !keep_up.contains(&p.pid))
         .filter(|p| !ancestors(procs, p.pid).contains(&me))
         .filter(|p| Some(p.pid) == force || !racing(p))
@@ -190,7 +207,7 @@ pub fn to_stop_for_tray(procs: &[Proc], me: u32) -> Vec<u32> {
     let up = ancestors(procs, me);
     procs
         .iter()
-        .filter(|p| is_page2cam(&p.name))
+        .filter(|p| is_page2cam(&p.name) && !p.mcp_bridge)
         .filter(|p| p.pid != me && !up.contains(&p.pid))
         .map(|p| p.pid)
         .collect()
@@ -357,12 +374,16 @@ mod platform {
                         let _ = CloseHandle(h);
                     }
                 }
+                // A bridge holds `Local\Page2Cam.Mcp.<pid>` for its life.
+                let mcp_bridge = name.eq_ignore_ascii_case("page2cam.exe")
+                    && lock_held(&super::mcp_lock_name(e.th32ProcessID));
                 out.push(Proc {
                     pid: e.th32ProcessID,
                     parent: e.th32ParentProcessID,
                     name,
                     path,
                     started,
+                    mcp_bridge,
                 });
                 ok = Process32NextW(snap, &mut e).is_ok();
             }
@@ -468,12 +489,24 @@ mod platform {
             let parent = fields.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
             let started = fields.get(19).and_then(|s| s.parse().ok());
             let path: Option<PathBuf> = std::fs::read_link(entry.path().join("exe")).ok();
+            // The command line, NUL-separated.
+            let mcp_bridge = name == "page2cam"
+                && std::fs::read(entry.path().join("cmdline")).is_ok_and(|c| {
+                    let args: Vec<&[u8]> =
+                        c.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
+                    let args: Vec<String> = args
+                        .iter()
+                        .map(|a| String::from_utf8_lossy(a).into_owned())
+                        .collect();
+                    super::is_mcp_args(&args)
+                });
             out.push(Proc {
                 pid,
                 parent,
                 name,
                 path,
                 started,
+                mcp_bridge,
             });
         }
         out
@@ -522,7 +555,37 @@ mod tests {
             name: name.to_string(),
             path: None,
             started: None,
+            mcp_bridge: false,
         }
+    }
+
+    fn bridge(mut proc: Proc) -> Proc {
+        proc.mcp_bridge = true;
+        proc
+    }
+
+    #[test]
+    fn bridges_are_never_stopped() {
+        // An agent's `page2cam --mcp` (pid 30) next to an old engine (pid 10):
+        // starting an engine (20) or the tray's sweep (5) stops 10 only.
+        let procs = [
+            p(5, 1, exe()),
+            p(10, 1, exe()),
+            p(20, 5, exe()),
+            bridge(p(30, 77, exe())),
+        ];
+        assert_eq!(to_stop(&procs, 20, None), vec![10]);
+        assert_eq!(to_stop_keeping(&procs, 20, None, &[5]), vec![10]);
+        assert_eq!(to_stop_for_tray(&procs, 5), vec![10, 20]);
+    }
+
+    #[test]
+    fn mcp_args_are_exactly_dash_dash_mcp() {
+        assert!(is_mcp_args(&["page2cam.exe", "--mcp"]));
+        assert!(!is_mcp_args(&["page2cam.exe"]));
+        assert!(!is_mcp_args(&["page2cam.exe", "--engine", "--mcp"]));
+        assert!(!is_mcp_args(&["page2cam.exe", "--mcpx"]));
+        assert_eq!(mcp_lock_name(42), "Page2Cam.Mcp.42");
     }
 
     fn started(mut proc: Proc, at: u64) -> Proc {

@@ -159,7 +159,14 @@ fn main() {
     // Started by a desktop agent: the stdio MCP bridge (stdout is JSON-RPC
     // only; it uses the pipes the agent gave, never a console).
     if is_mcp_args(&args) {
-        std::process::exit(mcp_bridge::run());
+        // Marks this process as a bridge: engine starts and the tray's
+        // leftover sweeps spare it (they would cut the agent off).
+        // (Linux reads the command line instead; no lock files left behind.)
+        let marker = cfg!(windows)
+            .then(|| p2c_proc::try_lock(&p2c_proc::mcp_lock_name(std::process::id())));
+        let code = mcp_bridge::run();
+        drop(marker);
+        std::process::exit(code);
     }
     // Windows without a role flag: the tray (no console; its own log file).
     if is_tray_args(&args, cfg!(windows)) {
@@ -203,7 +210,7 @@ fn is_engine_args(args: &[std::ffi::OsString]) -> bool {
 
 /// `--mcp` as the only argument: the MCP bridge role.
 fn is_mcp_args(args: &[std::ffi::OsString]) -> bool {
-    args.len() == 2 && args[1] == "--mcp"
+    p2c_proc::is_mcp_args(args)
 }
 
 /// The tray role: Windows and neither `--engine` nor `--standalone`.
