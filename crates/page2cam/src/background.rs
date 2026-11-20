@@ -459,6 +459,10 @@ pub struct BgState {
     pub box_image: Option<StoredImage>,
     /// The operator's page, restored when the full frame goes back to Page.
     pub last_page_url: String,
+    /// `last_page_url` changed and isn't written yet (writes are spaced).
+    pub page_url_unsaved: bool,
+    /// When `last_page_url` was last written by a page change.
+    pub page_url_saved_at: Option<Instant>,
     /// A note about an automatic change, and when it was made.
     pub note: Option<(String, Instant)>,
     /// Bumped whenever the generated page changes (`current.html?v=<n>`).
@@ -551,6 +555,8 @@ impl BgState {
             full_image,
             box_image,
             last_page_url,
+            page_url_unsaved: false,
+            page_url_saved_at: None,
             note: None,
             version: 1,
             history_moved: false,

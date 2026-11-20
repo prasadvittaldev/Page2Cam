@@ -337,6 +337,9 @@ impl App {
 const NOTE_TO_CUTOUT: &str =
     "Style set to full-height cut-out: a full-frame background needs the person cut out";
 /// Note shown when choosing Box put the full frame back to the page.
+/// `last_page_url` is written at most this often while the page moves.
+const PAGE_URL_SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
 const NOTE_TO_PAGE: &str = "Full-frame background set back to Page: the Box style shows the page";
 
 /// One change of the background choices (see [`App::apply_background`]).
@@ -391,6 +394,38 @@ impl App {
         if let Some(u) = url.filter(|u| !u.is_empty()) {
             tracing::info!(url = %u, "history reached a background page: back to the user's page");
             self.load_url(&u);
+            return;
+        }
+        // The page's own navigations and Back/Forward.
+        self.remember_page_url(&shown, std::time::Instant::now());
+    }
+
+    /// The user's page changed while Chromium shows it (no generated
+    /// background up): remember `url` as `last_page_url` at once and save
+    /// it, at most once per [`PAGE_URL_SAVE_EVERY`] (a later call writes
+    /// what is pending). A `/bg/` or non-page URL is never remembered.
+    /// Callers hold `apply_lock`.
+    pub(crate) fn remember_page_url(&self, url: &str, now: std::time::Instant) {
+        let save = {
+            let mut s = self.bg.lock();
+            if !s.full.is_generated()
+                && crate::background::is_user_page_url(url)
+                && url != s.last_page_url
+            {
+                s.last_page_url = url.to_string();
+                s.page_url_unsaved = true;
+            }
+            let due = s
+                .page_url_saved_at
+                .is_none_or(|t| now.saturating_duration_since(t) >= PAGE_URL_SAVE_EVERY);
+            (s.page_url_unsaved && due).then(|| {
+                s.page_url_unsaved = false;
+                s.page_url_saved_at = Some(now);
+                s.last_page_url.clone()
+            })
+        };
+        if let Some(u) = save {
+            self.save_values(&[("last_page_url", u.as_str().into())]);
         }
     }
 
@@ -512,8 +547,9 @@ impl App {
             if let crate::background::BoxBg::Colour(col) = &s.in_box {
                 saves.push(("box_background_colour", col.as_str().into()));
             }
-            if s.last_page_url != old_last {
+            if s.last_page_url != old_last || s.page_url_unsaved {
                 saves.push(("last_page_url", s.last_page_url.as_str().into()));
+                s.page_url_unsaved = false;
             }
             if s.full.is_generated() {
                 if full_changed || c.reload {
@@ -631,6 +667,7 @@ impl Controls for App {
             return;
         }
         self.load_url(url);
+        self.remember_page_url(url, std::time::Instant::now());
     }
 
     fn nav(&self, a: NavAction) {
@@ -1877,6 +1914,53 @@ mod tests {
         }
     }
 
+    /// I2: the user's page is saved whenever it changes on Page (admin
+    /// navigation, Back/Forward and the page's own navigations, seen when
+    /// the shown URL changes), at most once per 2 s; a /bg/ URL never is.
+    #[test]
+    fn page_changes_on_page_save_last_page_url() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let app = bg_app(dir.path());
+        let saved = || settings(dir.path()).last_page_url;
+        app.navigate("https://user.test/a");
+        assert_eq!(app.bg.lock().last_page_url, "https://user.test/a");
+        assert_eq!(saved(), "https://user.test/a");
+        // The page moves by itself (link click, Back/Forward): remembered at
+        // once, written once 2 s have passed since the last write.
+        let t0 = Instant::now();
+        app.remember_page_url("https://user.test/b", t0);
+        assert_eq!(app.bg.lock().last_page_url, "https://user.test/b");
+        app.remember_page_url("https://user.test/c", t0 + Duration::from_millis(500));
+        assert_eq!(app.bg.lock().last_page_url, "https://user.test/c");
+        let written = saved();
+        app.remember_page_url("https://user.test/c", t0 + Duration::from_millis(1900));
+        assert_eq!(saved(), written, "more than one write within 2 s");
+        app.remember_page_url("https://user.test/c", t0 + Duration::from_millis(2600));
+        assert_eq!(saved(), "https://user.test/c", "pending write not flushed");
+        // The watchdog poll sees the shown URL change.
+        *app.fallback_url.lock() = "https://user.test/d".into();
+        app.keep_page_off_background();
+        assert_eq!(app.bg.lock().last_page_url, "https://user.test/d");
+        // A /bg/ URL or a non-page URL never becomes the user's page.
+        let later = Instant::now() + Duration::from_secs(10);
+        for (i, u) in [format!("{BG_BASE}current.html?v=7"), "about:blank".into()]
+            .iter()
+            .enumerate()
+        {
+            app.remember_page_url(u, later + Duration::from_secs(3 * i as u64));
+            assert_eq!(app.bg.lock().last_page_url, "https://user.test/d");
+        }
+        app.remember_page_url("https://user.test/d", later + Duration::from_secs(9));
+        assert_eq!(saved(), "https://user.test/d");
+        // While a generated background shows, nothing is remembered from
+        // what Chromium shows.
+        app.set_background(bg("colour", "room")).unwrap();
+        app.remember_page_url("https://user.test/e", later + Duration::from_secs(20));
+        assert_eq!(app.bg.lock().last_page_url, "https://user.test/d");
+        assert_eq!(saved(), "https://user.test/d");
+    }
+
     #[test]
     fn back_and_forward_never_leave_a_background_page_showing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1956,13 +2040,14 @@ mod tests {
         *app.fallback_url.lock() = still_bg.clone();
         app.keep_page_off_background();
         assert_eq!(shown(&app), "https://user.test/a", "page-driven history");
-        // ... and from another user page onto a different /bg/ URL.
+        // ... and from another user page onto a different /bg/ URL: the page
+        // it last showed (remembered when the shown URL changed) comes back.
         *app.fallback_url.lock() = "https://user.test/b".into();
         app.keep_page_off_background();
         let other_bg = format!("{BG_BASE}current.html?v=99");
         *app.fallback_url.lock() = other_bg;
         app.keep_page_off_background();
-        assert_eq!(shown(&app), "https://user.test/a", "page-driven history 2");
+        assert_eq!(shown(&app), "https://user.test/b", "page-driven history 2");
     }
 
     #[test]
