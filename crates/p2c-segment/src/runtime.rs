@@ -81,6 +81,14 @@ pub fn cpu_threads(size: ModelSize, available: usize) -> usize {
     }
 }
 
+/// Threads for the nodes a DirectML session still runs on the CPU (shape
+/// glue, input/output copies). ONNX Runtime's default is one spinning thread
+/// per core (28 on the user's laptop) while the GPU does the work. One
+/// sleeping thread measured within 2 % of the default on RVM (2026-11-20).
+pub fn dml_threads(available: usize) -> usize {
+    available.clamp(1, 1)
+}
+
 /// Open `model`. With `gpu` (a DXGI plain-order adapter index) on Windows,
 /// DirectML is tried first on that adapter and the CPU is used if that fails.
 /// `None` means CPU only. Returns the device actually in use.
@@ -96,8 +104,23 @@ pub fn session(
         // ("or an error is returned"), and must be the EP we asked for.
         // The adapter is named by its DXGI plain-order index (see `p2c_d3d`).
         let ep = ort::ep::DirectML::default().with_device_id(index as i32);
+        let threads = dml_threads(std::thread::available_parallelism().map_or(1, |n| n.get()));
         let dml = Session::builder(env()?)
             .map_err(anyhow::Error::from)
+            .and_then(|b| {
+                b.with_intra_threads(threads)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .and_then(|b| b.with_inter_threads(1).map_err(|e| anyhow::anyhow!("{e}")))
+            // Idle threads sleep instead of spinning between frames.
+            .and_then(|b| {
+                b.with_intra_op_spinning(false)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .and_then(|b| {
+                b.with_inter_op_spinning(false)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
             .and_then(|b| {
                 b.with_memory_pattern(false)
                     .map_err(|e| anyhow::anyhow!("{e}"))
@@ -118,7 +141,7 @@ pub fn session(
                     .find(|a| a.index == index)
                     .map_or_else(|| "unknown".to_string(), |a| a.name);
                 let gpu = format!("{name} (adapter {index})");
-                tracing::info!(model = %model.display(), %gpu, "running on the GPU (DirectML)");
+                tracing::info!(model = %model.display(), %gpu, threads, "running on the GPU (DirectML)");
                 return Ok((s, Device::DirectMl));
             }
             Err(e) => tracing::warn!("DirectML unavailable, using CPU: {e:#}"),
@@ -156,6 +179,12 @@ mod tests {
     fn small_models_use_few_threads() {
         assert_eq!(cpu_threads(ModelSize::Small, 28), 2);
         assert_eq!(cpu_threads(ModelSize::Small, 1), 1);
+    }
+
+    #[test]
+    fn directml_keeps_cpu_nodes_to_few_sleeping_threads() {
+        assert_eq!(dml_threads(28), 1);
+        assert_eq!(dml_threads(1), 1);
     }
 
     #[test]

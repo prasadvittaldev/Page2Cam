@@ -327,3 +327,199 @@ fn bench_dml_adapters() {
         }
     }
 }
+
+/// BT.601 limited-range NV12 of a BGRA frame (test input only).
+fn to_nv12(f: &p2c_core::Frame) -> p2c_core::Nv12Frame {
+    let (w, h) = (f.width as usize & !1, f.height as usize & !1);
+    let px = |x: usize, y: usize| {
+        let i = (y * f.width as usize + x) * 4;
+        let (b, g, r) = (f.data[i] as f32, f.data[i + 1] as f32, f.data[i + 2] as f32);
+        (r, g, b)
+    };
+    let mut data = Vec::with_capacity(w * h * 3 / 2);
+    for y in 0..h {
+        for x in 0..w {
+            let (r, g, b) = px(x, y);
+            data.push((16.0 + 0.257 * r + 0.504 * g + 0.098 * b).round() as u8);
+        }
+    }
+    for y in (0..h).step_by(2) {
+        for x in (0..w).step_by(2) {
+            let (r, g, b) = px(x, y);
+            data.push((128.0 - 0.148 * r - 0.291 * g + 0.439 * b).round() as u8);
+            data.push((128.0 + 0.439 * r - 0.368 * g - 0.071 * b).round() as u8);
+        }
+    }
+    p2c_core::Nv12Frame::new(w as u32, h as u32, data).unwrap()
+}
+
+/// The live path: Quality on the auto GPU fed a 1280x720 NV12 frame, with the
+/// model time and the input prep time reported apart (and the CPU it costs).
+/// `cargo test -p p2c-segment --test models bench_quality_nv12 -- --ignored --nocapture`
+#[test]
+#[ignore = "needs scripts/fetch-models.sh; benchmark"]
+fn bench_quality_nv12() {
+    runtime::init(&ort_dir()).unwrap();
+    let models = assets_dir().join("models");
+    let mut person = person_frame();
+    if (person.width, person.height) != (1280, 720) {
+        person = p2c_compositor::scale_frame_straight(&person, 1280, 720);
+    }
+    let nv12 = to_nv12(&person);
+    let mut q =
+        p2c_segment::open_engine(&models, p2c_segment::EngineChoice::Quality, auto_gpu()).unwrap();
+    let mut prep = p2c_core::DurationStats::default();
+    let mut model = p2c_core::DurationStats::default();
+    let total = bench(&format!("Quality NV12 1280x720 on {}", q.device()), || {
+        let t = std::time::Instant::now();
+        q.infer_nv12(&nv12).unwrap();
+        let all = t.elapsed();
+        let p = q.take_prep().unwrap();
+        prep.record(p);
+        model.record(all.saturating_sub(p));
+    });
+    println!("  total p50 {total:?}");
+    println!("  model {}", model.summary().unwrap());
+    println!("  prep  {}", prep.summary().unwrap());
+}
+
+/// DirectML session thread options, A/B interleaved run by run on the auto
+/// GPU so machine-wide load hits every variant the same.
+/// `cargo test -p p2c-segment --test models bench_dml_threads -- --ignored --nocapture`
+#[cfg(windows)]
+#[test]
+#[ignore = "needs scripts/fetch-models.sh; benchmark"]
+fn bench_dml_threads() {
+    use ort::session::Session;
+    use ort::value::Tensor;
+    runtime::init(&ort_dir()).unwrap();
+    let rvm = assets_dir().join("models/rvm_mobilenetv3_fp32.onnx");
+    let src = p2c_segment::tensor::to_rgb_f32_nchw(&person_frame(), 640, 360);
+    let index = auto_gpu().expect("needs a GPU") as i32;
+    let open = |threads: Option<usize>| {
+        let mut b = Session::builder(runtime::env().unwrap())
+            .unwrap()
+            .with_memory_pattern(false)
+            .unwrap()
+            .with_parallel_execution(false)
+            .unwrap();
+        if let Some(n) = threads {
+            b = b
+                .with_intra_threads(n)
+                .unwrap()
+                .with_inter_threads(1)
+                .unwrap()
+                .with_intra_op_spinning(false)
+                .unwrap()
+                .with_inter_op_spinning(false)
+                .unwrap();
+        }
+        b.with_execution_providers([ort::ep::DirectML::default()
+            .with_device_id(index)
+            .build()
+            .error_on_failure()])
+            .unwrap()
+            .commit_from_file(&rvm)
+            .unwrap()
+    };
+    type Rec = Vec<(Vec<i64>, Vec<f32>)>;
+    let mut variants: Vec<(&str, Session, Rec, p2c_core::DurationStats, f64)> = [
+        ("ORT default threads (before)", None),
+        ("1 thread, no spinning", Some(1)),
+        ("2 threads, no spinning", Some(2)),
+    ]
+    .into_iter()
+    .map(|(l, n)| {
+        let rec = (0..4).map(|_| (vec![1, 1, 1, 1], vec![0.0])).collect();
+        (l, open(n), rec, p2c_core::DurationStats::default(), 0.0)
+    })
+    .collect();
+    let step = |s: &mut Session, rec: &mut Rec| {
+        let t = |i: usize| Tensor::from_array((rec[i].0.clone(), rec[i].1.clone())).unwrap();
+        let out = s
+            .run(ort::inputs![
+                "src" => Tensor::from_array(([1usize, 3, 360, 640], src.clone())).unwrap(),
+                "r1i" => t(0), "r2i" => t(1), "r3i" => t(2), "r4i" => t(3),
+                "downsample_ratio" => Tensor::from_array(([1usize], vec![0.4f32])).unwrap(),
+            ])
+            .unwrap();
+        let next: Vec<_> = ["r1o", "r2o", "r3o", "r4o"]
+            .iter()
+            .map(|n| {
+                let (sh, d) = out[*n].try_extract_tensor::<f32>().unwrap();
+                (sh.to_vec(), d.to_vec())
+            })
+            .collect();
+        drop(out);
+        *rec = next;
+    };
+    for _ in 0..10 {
+        for (_, s, rec, _, _) in variants.iter_mut() {
+            step(s, rec);
+        }
+    }
+    for _ in 0..100 {
+        for (_, s, rec, stats, cpu) in variants.iter_mut() {
+            let c = process_cpu();
+            let t = std::time::Instant::now();
+            step(s, rec);
+            stats.record(t.elapsed());
+            *cpu += process_cpu() - c;
+        }
+    }
+    for (label, _, _, stats, cpu) in &variants {
+        println!(
+            "RVM DirectML {label:<30} {}  (CPU {:.1} ms/run)",
+            stats.summary().unwrap(),
+            cpu * 1000.0 / 100.0
+        );
+    }
+}
+
+/// The engine's recurrent-state feedback gives the same masks, frame after
+/// frame, as a plain loop that copies every state out and back in (CPU, so
+/// the runs are deterministic).
+#[test]
+#[ignore = "needs scripts/fetch-models.sh"]
+fn rvm_state_feedback_matches_reference() {
+    use ort::value::Tensor;
+    runtime::init(&ort_dir()).unwrap();
+    let models = assets_dir().join("models");
+    let frame = person_frame();
+    let mut engine =
+        p2c_segment::open_engine(&models, p2c_segment::EngineChoice::Quality, None).unwrap();
+    let (mut s, _) = runtime::session(
+        &models.join("rvm_mobilenetv3_fp32.onnx"),
+        None,
+        runtime::ModelSize::Large,
+    )
+    .unwrap();
+    let src = p2c_segment::tensor::to_rgb_f32_nchw(&frame, 640, 360);
+    let mut rec: Vec<(Vec<i64>, Vec<f32>)> =
+        (0..4).map(|_| (vec![1, 1, 1, 1], vec![0.0])).collect();
+    for round in 0..2 {
+        for i in 0..4 {
+            let (mask, _, _) = engine.infer(&frame).unwrap();
+            let t = |i: usize| Tensor::from_array((rec[i].0.clone(), rec[i].1.clone())).unwrap();
+            let out = s
+                .run(ort::inputs![
+                    "src" => Tensor::from_array(([1usize, 3, 360, 640], src.clone())).unwrap(),
+                    "r1i" => t(0), "r2i" => t(1), "r3i" => t(2), "r4i" => t(3),
+                    "downsample_ratio" => Tensor::from_array(([1usize], vec![0.4f32])).unwrap(),
+                ])
+                .unwrap();
+            let want = out["pha"].try_extract_tensor::<f32>().unwrap().1.to_vec();
+            rec = ["r1o", "r2o", "r3o", "r4o"]
+                .iter()
+                .map(|n| {
+                    let (sh, d) = out[*n].try_extract_tensor::<f32>().unwrap();
+                    (sh.to_vec(), d.to_vec())
+                })
+                .collect();
+            assert_eq!(mask, want, "round {round} frame {i}: masks differ");
+        }
+        // After a reset both start again from empty state.
+        engine.reset();
+        rec = (0..4).map(|_| (vec![1, 1, 1, 1], vec![0.0])).collect();
+    }
+}

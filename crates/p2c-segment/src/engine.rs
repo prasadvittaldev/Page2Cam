@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use ort::session::Session;
-use ort::value::Tensor;
+use ort::value::{DynValue, Tensor};
 use std::time::{Duration, Instant};
 
 use p2c_core::{Frame, Nv12Frame};
@@ -159,7 +159,9 @@ impl Engine for FastEngine {
 pub struct RvmEngine {
     session: Session,
     device: Device,
-    rec: [(Vec<i64>, Vec<f32>); 4],
+    /// The last run's `r1o`..`r4o`, fed back by reference as `r1i`..`r4i`
+    /// (no copy); `None` until the first run and after a reset.
+    rec: Option<[DynValue; 4]>,
     prep: Option<Duration>,
 }
 
@@ -169,8 +171,12 @@ const RVM_W: u32 = 640;
 const RVM_H: u32 = 360;
 const RVM_DOWNSAMPLE: f32 = 0.4;
 
-fn empty_rec() -> [(Vec<i64>, Vec<f32>); 4] {
-    std::array::from_fn(|_| (vec![1, 1, 1, 1], vec![0.0]))
+/// The empty recurrent state RVM starts from: a 1x1x1x1 zero.
+fn empty_rec() -> anyhow::Result<[DynValue; 4]> {
+    let z = || -> anyhow::Result<DynValue> {
+        Ok(Tensor::from_array(([1usize, 1, 1, 1], vec![0.0f32]))?.into_dyn())
+    };
+    Ok([z()?, z()?, z()?, z()?])
 }
 
 impl RvmEngine {
@@ -180,7 +186,7 @@ impl RvmEngine {
         Ok(RvmEngine {
             session,
             device,
-            rec: empty_rec(),
+            rec: None,
             prep: None,
         })
     }
@@ -188,31 +194,52 @@ impl RvmEngine {
     fn run(&mut self, frame: Input) -> anyhow::Result<(Vec<f32>, u32, u32)> {
         let (src, prep) = model_input(frame, RVM_W, RVM_H);
         self.prep = Some(prep);
-        let rec = |i: usize| -> anyhow::Result<Tensor<f32>> {
-            let (shape, data) = &self.rec[i];
-            Ok(Tensor::from_array((shape.clone(), data.clone()))?)
+        let rec = match self.rec.take() {
+            Some(r) => r,
+            None => empty_rec()?,
         };
+        let result = Self::step(&mut self.session, src, &rec);
+        // A failed run keeps the state it started from, as before.
+        let (mask, next) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                self.rec = Some(rec);
+                return Err(e);
+            }
+        };
+        self.rec = Some(next);
+        Ok((mask, RVM_W, RVM_H))
+    }
+
+    /// One inference: the mask and the next recurrent state, taken out of
+    /// the outputs as owned values (no copy).
+    fn step(
+        session: &mut Session,
+        src: Vec<f32>,
+        rec: &[DynValue; 4],
+    ) -> anyhow::Result<(Vec<f32>, [DynValue; 4])> {
         let inputs = ort::inputs![
             "src" => Tensor::from_array(([1usize, 3, RVM_H as usize, RVM_W as usize], src))?,
-            "r1i" => rec(0)?,
-            "r2i" => rec(1)?,
-            "r3i" => rec(2)?,
-            "r4i" => rec(3)?,
+            "r1i" => &rec[0],
+            "r2i" => &rec[1],
+            "r3i" => &rec[2],
+            "r4i" => &rec[3],
             "downsample_ratio" => Tensor::from_array(([1usize], vec![RVM_DOWNSAMPLE]))?,
         ];
-        let out = self.session.run(inputs)?;
-        let mut next = empty_rec();
-        for (i, name) in ["r1o", "r2o", "r3o", "r4o"].into_iter().enumerate() {
-            let (shape, data) = out[name].try_extract_tensor::<f32>()?;
-            next[i] = (shape.to_vec(), data.to_vec());
-        }
-        let (_, pha) = out["pha"]
+        let mut out = session.run(inputs)?;
+        let mask = out["pha"]
             .try_extract_tensor::<f32>()
-            .context("reading the RVM mask")?;
-        let mask = pha.to_vec();
-        drop(out);
-        self.rec = next;
-        Ok((mask, RVM_W, RVM_H))
+            .context("reading the RVM mask")?
+            .1
+            .to_vec();
+        let mut next = |name: &str| {
+            out.remove(name)
+                .ok_or_else(|| anyhow::anyhow!("RVM output {name} missing"))
+        };
+        Ok((
+            mask,
+            [next("r1o")?, next("r2o")?, next("r3o")?, next("r4o")?],
+        ))
     }
 }
 
@@ -230,7 +257,7 @@ impl Engine for RvmEngine {
     }
 
     fn reset(&mut self) {
-        self.rec = empty_rec();
+        self.rec = None;
     }
 
     fn device(&self) -> Device {
