@@ -16,6 +16,7 @@ p2c-stream.workspace = true
 p2c-admin.workspace = true
 p2c-segment.workspace = true
 p2c-update.workspace = true
+p2c-screen.workspace = true
 p2c-proc = { path = "../p2c-proc" }
 p2c-tray = { path = "../p2c-tray" }
 p2c-mcp = { path = "../p2c-mcp" }

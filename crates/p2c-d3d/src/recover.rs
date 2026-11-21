@@ -41,6 +41,15 @@ impl PageHolder {
         }
     }
 
+    /// A CPU page frame (see [`PageInput::upload_frame`]); dropped while the
+    /// device is being recreated.
+    pub fn upload_frame(&self, f: &p2c_core::Frame) -> Result<()> {
+        match self.current() {
+            Some(p) => p.upload_frame(f),
+            None => Ok(()),
+        }
+    }
+
     /// The current page input (`None` while the device is being recreated).
     pub fn current(&self) -> Option<PageInput> {
         self.lock().page.clone()

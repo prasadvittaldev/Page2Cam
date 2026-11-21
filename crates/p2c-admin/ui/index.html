@@ -192,6 +192,8 @@
   }
   .pv.blur::before { filter: blur(3px); }
   .pv.yt { background: #1b1b1b; }
+  .pv.mon { background: linear-gradient(#2a3a4f 0 82%, #1b2633 82%); }
+  .pv.mon::after { content: ""; position: absolute; left: 22%; right: 22%; top: 22%; height: 36%; border: 2px solid #9fb8d8; border-radius: 2px; }
   .pv.yt::after {
     content: ""; position: absolute; left: 50%; top: 50%; transform: translate(-35%, -50%);
     border-left: 10px solid #e5372b; border-top: 6px solid transparent; border-bottom: 6px solid transparent;
@@ -313,6 +315,7 @@
         <button class="tile" data-bg-full="image" aria-pressed="false" title="A picture of your own"><span class="pv"><span class="add">+</span><img id="bgFullImagePrev" alt="" hidden></span>Image</button>
         <button class="tile" data-bg-full="colour" aria-pressed="false" title="One colour"><span class="pv" id="bgFullSwatch"></span>Colour</button>
         <button class="tile" data-bg-full="youtube" aria-pressed="false" title="A YouTube video, full screen and looping"><span class="pv yt"><img id="bgYoutubeThumb" alt="" hidden></span>YouTube</button>
+        <button class="tile" data-bg-full="screen" aria-pressed="false" title="One of your monitors, live"><span class="pv mon"></span>Screen</button>
         <button class="tile" data-bg-full="blurred-room" aria-pressed="false" title="Your own room, blurred, full screen"><span class="pv blur"></span>Blurred room</button>
       </div>
       <div id="bgFullImageOpts" hidden>
@@ -325,6 +328,13 @@
       <div class="row" id="bgFullColourOpts" hidden>
         <label for="bgFullColour">Colour</label>
         <input type="color" id="bgFullColour">
+      </div>
+      <div id="bgScreenOpts" hidden>
+        <div class="row">
+          <label for="bgScreen">Monitor</label>
+          <select id="bgScreen" aria-label="Monitor to show"></select>
+        </div>
+        <p class="sub"><b>Everything on this monitor is shown</b> to your call or stream, live (notifications, other windows, the mouse pointer). Windows outlines a shared monitor in yellow.</p>
       </div>
       <div id="bgYoutubeOpts" hidden>
         <form class="row" id="bgYoutubeForm">
@@ -857,6 +867,8 @@
     $("bgFullImageOpts").hidden = bg.full !== "image";
     $("bgFullColourOpts").hidden = bg.full !== "colour";
     $("bgYoutubeOpts").hidden = !(bg.full === "youtube" || ytEditing);
+    $("bgScreenOpts").hidden = bg.full !== "screen";
+    if (bg.full === "screen") loadScreens();
     $("bgBoxImageOpts").hidden = bg.in_box !== "image";
     $("bgBoxColourOpts").hidden = bg.in_box !== "colour";
     $("refinedEdges").checked = bg.refined_edges;
@@ -868,6 +880,7 @@
     // Nothing to show yet: ask for it first (an upload selects it by itself).
     if (v === "image" && !bg.full_image) { $("bgFullImageFile").click(); return; }
     if (v === "youtube" && !bg.full_youtube) { ytEditing = true; syncBg(); $("bgYoutube").focus(); return; }
+    if (v === "screen" && screensError) { bgMessage("bgErr", screensError); return; }
     ytEditing = false;
     setBg({ full: v });
   });
@@ -895,8 +908,36 @@
     }
   });
   $("bgYoutube").addEventListener("input", () => bgMessage("bgYoutubeErr", ""));
+  // The monitors (GET /api/screens); not available (Linux): the tile says why.
+  let screensError = "", screensLoaded = false;
+  async function loadScreens() {
+    if (screensLoaded) { syncScreen(); return; }
+    try {
+      const r = await api("/api/screens");
+      if (!r.ok) {
+        screensError = await errorText(r);
+        const t = document.querySelector("[data-bg-full=screen]");
+        t.title = screensError; t.disabled = true;
+        return;
+      }
+      const list = await r.json();
+      $("bgScreen").replaceChildren(...list.map((s) => new Option(
+        s.name + " — " + s.width + "×" + s.height + (s.primary ? " (main)" : ""), s.id)));
+      screensLoaded = true; syncScreen();
+    } catch {}
+  }
+  function syncScreen() {
+    if (!bg || document.activeElement === $("bgScreen")) return;
+    const sel = $("bgScreen"), want = bg.full_screen;
+    const opts = [...sel.options];
+    const main = opts.find((o) => o.text.endsWith("(main)"));
+    if (want && opts.some((o) => o.value === want)) sel.value = want;
+    else if (main) sel.value = main.value;
+  }
+  $("bgScreen").onchange = () => setBg({ full: "screen", full_screen: $("bgScreen").value });
   $("refinedEdges").onchange = () => setBg({ refined_edges: $("refinedEdges").checked });
   loadBg();
+  loadScreens();
 
   // ---------- stream ----------
   $("rtmpUrl").value = store.get("rtmpUrl", "rtmp://a.rtmp.youtube.com/live2");
@@ -1030,7 +1071,7 @@
       // Changed elsewhere (another tab, a style switch): take the app's choices.
       if (!bg || s.background !== bg.full || s.box_background !== bg.in_box || s.refined_edges !== bg.refined_edges) loadBg();
       bgMessage("bgNote", s.background_note);
-      $("urlPaused").hidden = !["image", "colour", "youtube"].includes(s.background);
+      $("urlPaused").hidden = !["image", "colour", "youtube", "screen"].includes(s.background);
       syncGpu();
       if (Date.now() > videoErrUntil) {
         const v = $("videoState");

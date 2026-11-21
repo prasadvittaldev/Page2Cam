@@ -11,6 +11,7 @@ mod page_fps;
 mod pattern;
 mod power;
 mod restart;
+mod screen;
 mod update;
 mod video;
 
@@ -627,6 +628,11 @@ fn run() -> anyhow::Result<i32> {
         ticker_stats: ticker.stats(),
         health_window: Mutex::new(Default::default()),
         page_fps: Mutex::new(page_fps::PageFps::new(cfg.fps)),
+        screen: screen::ScreenShare::new(Box::new(screen::RealScreens {
+            max_fps: cfg.fps,
+            out: screen_out(gpu_video.as_ref()),
+        })),
+        page_paused: Arc::default(),
         output_frame: preview.clone(),
     });
 
@@ -799,6 +805,7 @@ fn run() -> anyhow::Result<i32> {
             audio: Some(page_ring),
             // Built from a LUID enumerated again just now (R7).
             gpu_page: gpu_page(gpu_video.as_ref(), &fallback),
+            paused: app.page_paused.clone(),
         };
         let watch = browser_cfg
             .gpu_page
@@ -1128,6 +1135,26 @@ fn spawn_watchdog(
     if let Err(e) = spawned {
         tracing::error!(error = %e, "could not start the GPU watchdog");
     }
+}
+
+/// Where screen-capture frames go: the CPU page slot and, in GPU mode, the
+/// page input (through the holder, so a rebuilt device gets them too).
+#[cfg(windows)]
+fn screen_out(gpu: Option<&GpuVideo>) -> screen::FrameOut {
+    let holder = gpu.map(|g| g.holder.clone());
+    Arc::new(move |f: Arc<p2c_core::Frame>| {
+        if let Some(h) = &holder {
+            if let Err(e) = h.upload_frame(&f) {
+                tracing::debug!(error = %format!("{e:#}"), "screen frame upload failed");
+            }
+        }
+        PAGE.put_arc(f);
+    })
+}
+
+#[cfg(not(windows))]
+fn screen_out(_gpu: Option<&GpuVideo>) -> screen::FrameOut {
+    Arc::new(|f: Arc<p2c_core::Frame>| PAGE.put_arc(f))
 }
 
 /// Composited page frames. A static so the browser and ticker share one slot.

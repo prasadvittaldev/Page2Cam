@@ -719,7 +719,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Allow agents"));
-        assert_eq!(out[1]["result"]["tools"].as_array().unwrap().len(), 28);
+        assert_eq!(out[1]["result"]["tools"].as_array().unwrap().len(), 29);
         assert_eq!(out[2]["result"]["isError"], true);
         assert_eq!(out[2]["result"]["content"][0]["text"], p2c_mcp::AGENTS_OFF);
         assert_eq!(f.launched.get(), 0, "no tray launch while agents are off");

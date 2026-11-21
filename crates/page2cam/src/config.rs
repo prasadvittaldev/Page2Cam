@@ -38,7 +38,7 @@ pub struct Config {
     /// Webcam crop as [x, y, width, height], fractions of the camera frame.
     /// A list of the wrong length or with NaN means no crop.
     pub webcam_crop: Vec<f32>,
-    /// Full-frame background: page | image | colour | youtube | blurred-room
+    /// Full-frame background: page | image | colour | youtube | screen | blurred-room
     pub background: String,
     /// The full-frame picture (re-encoded copy in the data folder).
     pub background_image: String,
@@ -46,6 +46,8 @@ pub struct Config {
     pub background_colour: String,
     /// Full-frame YouTube video (link or 11-character id).
     pub background_youtube: String,
+    /// Full-frame screen: a monitor id (`DISPLAY1`); empty = the primary one.
+    pub background_screen: String,
     /// In-box background (Box style): room | blur | image | colour
     pub box_background: String,
     pub box_background_image: String,
@@ -80,6 +82,7 @@ impl Default for Config {
             background_image: String::new(),
             background_colour: "#0b63f0".into(),
             background_youtube: String::new(),
+            background_screen: String::new(),
             box_background: "room".into(),
             box_background_image: String::new(),
             box_background_colour: "#0b63f0".into(),
@@ -317,6 +320,7 @@ mod tests {
             &[
                 ("background", "youtube".into()),
                 ("background_youtube", "dQw4w9WgXcQ".into()),
+                ("background_screen", "DISPLAY2".into()),
                 ("background_colour", "#0b63f0".into()),
                 ("background_image", r"C:\data\backgrounds\full.jpg".into()),
                 ("box_background", "colour".into()),
@@ -335,6 +339,7 @@ mod tests {
         assert_eq!(c.fps, 25);
         assert_eq!(c.background, "youtube");
         assert_eq!(c.background_youtube, "dQw4w9WgXcQ");
+        assert_eq!(c.background_screen, "DISPLAY2");
         assert_eq!(c.background_colour, "#0b63f0");
         assert_eq!(c.background_image, r"C:\data\backgrounds\full.jpg");
         assert_eq!(c.box_background, "colour");

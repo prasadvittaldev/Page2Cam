@@ -235,6 +235,7 @@ mod tests {
             "get_background",
             "set_background",
             "upload_background_image",
+            "list_screens",
         ];
         let mut names = tool_names();
         names.sort();
@@ -248,7 +249,7 @@ mod tests {
             )
             .unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 28);
+        assert_eq!(tools.len(), 29);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert!(
@@ -353,6 +354,12 @@ mod tests {
                     json!({ "full": "youtube", "full_youtube": "https://youtu.be/dQw4w9WgXcQ" }),
                 ),
             ),
+            (
+                "set_background",
+                json!({ "full": "screen", "screen": " DISPLAY2 " }),
+                C::SetBackground(json!({ "full": "screen", "full_screen": "DISPLAY2" })),
+            ),
+            ("list_screens", json!({}), C::ListScreens),
             (
                 "set_background",
                 json!({ "in_box": "colour", "box_colour": "#AABBCC", "refined_edges": true }),
@@ -500,6 +507,9 @@ mod tests {
             ("set_background", json!({ "box_colour": "#12345g" })),
             ("set_background", json!({ "youtube": "" })),
             ("set_background", json!({ "refined_edges": "yes" })),
+            ("set_background", json!({ "screen": "x".repeat(65) })),
+            ("set_background", json!({ "screen": 2 })),
+            ("list_screens", json!({ "id": "DISPLAY1" })),
             ("set_background", json!({})),
             (
                 "upload_background_image",

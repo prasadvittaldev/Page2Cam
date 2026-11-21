@@ -30,6 +30,10 @@ pub struct BrowserConfig {
     /// frame over as a shared texture instead of a CPU buffer. `None`: CPU
     /// paints into the `FrameSlot` (Linux, CPU mode).
     pub gpu_page: Option<GpuPage>,
+    /// While set, the page's paints are dropped (another source, e.g.
+    /// screen capture, fills the page). Shared with the caller, so it can be
+    /// set before the browser exists; [`BrowserHandle::set_paused`] sets it too.
+    pub paused: Arc<AtomicBool>,
 }
 
 /// Chromium on a chosen GPU, delivering shared textures.
@@ -281,7 +285,7 @@ pub fn run(
     );
 
     let url = Arc::new(Mutex::new(cfg.url.clone()));
-    let paused = Arc::new(AtomicBool::new(false));
+    let paused = cfg.paused.clone();
     let create = |gpu: Option<&GpuPage>, at: &str, fps: u32| {
         // Each browser has its own `closed` flag, so closing a replaced
         // browser doesn't end the pump loop.

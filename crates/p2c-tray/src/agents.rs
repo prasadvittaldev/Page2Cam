@@ -649,6 +649,11 @@ pub fn balloon_for(agent: &str, call: &BackendCall, running: bool) -> Option<Str
         C::StopStream => format!("{agent} stopped your stream"),
         C::InstallUpdate => format!("{agent} is installing a Page2Cam update"),
         C::SetGpu(_) if running => format!("{agent} changed the GPU; Page2Cam restarts"),
+        // The whole monitor goes to the call/stream: always said, also while
+        // stopped (it shows from the next start).
+        C::SetBackground(v) if v["full"] == "screen" => {
+            format!("{agent} is sharing your screen")
+        }
         C::OpenUrl(_) | C::ShowPage { .. } | C::Navigate(_) if running => {
             format!("{agent} changed the page")
         }
@@ -1072,6 +1077,12 @@ mod tests {
             Some("Agent “Claude” changed your background")
         );
         assert_eq!(balloon_for(a, &C::SetBackground(json!({})), false), None);
+        for running in [true, false] {
+            assert_eq!(
+                balloon_for(a, &C::SetBackground(json!({ "full": "screen" })), running).as_deref(),
+                Some("Agent “Claude” is sharing your screen")
+            );
+        }
         for c in [
             C::Status,
             C::GetOverlay,
@@ -1080,6 +1091,7 @@ mod tests {
             C::ListPages,
             C::GetBackground,
             C::ListGpus,
+            C::ListScreens,
         ] {
             assert_eq!(balloon_for(a, &c, true), None, "{c:?}");
         }

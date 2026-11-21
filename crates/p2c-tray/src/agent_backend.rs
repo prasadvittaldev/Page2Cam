@@ -303,6 +303,7 @@ impl TrayBackend {
                 )))
             }
             C::GetBackground => self.get("/api/background").map(BackendReply::Json),
+            C::ListScreens => self.get("/api/screens").map(BackendReply::Json),
             C::SetBackground(partial) => {
                 let cur = self.get("/api/background")?;
                 let new = Self::merged(&cur, partial);
@@ -658,6 +659,53 @@ pub(crate) mod tests {
         assert_eq!(
             posted("/api/background"),
             json!({ "full": "page", "in_box": "blur", "refined_edges": false })
+        );
+    }
+
+    #[test]
+    fn screens_are_listed_and_screen_sharing_is_announced() {
+        let (port, log) = fake_engine(|m, p, _| {
+            match (m, p) {
+            ("GET", "/api/state") => (200, state_json()),
+            ("GET", "/api/screens") => (200, br#"[{"id":"DISPLAY1","index":1,"name":"Screen 1","width":1920,"height":1200,"primary":true}]"#.to_vec()),
+            ("GET", "/api/background") => (
+                200,
+                br#"{"full":"page","full_screen":"","in_box":"room","refined_edges":false}"#.to_vec(),
+            ),
+            _ => (200, b"{}".to_vec()),
+        }
+        });
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "running".into();
+        *tray.engine.lock() = Some((port, "tok".into()));
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(tray.clone(), d.path());
+        let r = b.call("Claude", BackendCall::ListScreens).unwrap();
+        assert_eq!(
+            r,
+            BackendReply::Json(
+                json!([{"id":"DISPLAY1","index":1,"name":"Screen 1","width":1920,"height":1200,"primary":true}])
+            )
+        );
+        assert!(tray.balloons.lock().is_empty(), "listing is quiet");
+        b.call(
+            "Claude",
+            BackendCall::SetBackground(json!({ "full": "screen", "full_screen": "DISPLAY1" })),
+        )
+        .unwrap();
+        let log = log.lock();
+        let body = &log
+            .iter()
+            .find(|r| r.0 == "POST" && r.1 == "/api/background")
+            .unwrap()
+            .2;
+        assert_eq!(
+            serde_json::from_slice::<Value>(body).unwrap(),
+            json!({ "full": "screen", "full_screen": "DISPLAY1", "in_box": "room", "refined_edges": false })
+        );
+        assert_eq!(
+            tray.balloons.lock().as_slice(),
+            ["Agent “Claude” is sharing your screen"]
         );
     }
 

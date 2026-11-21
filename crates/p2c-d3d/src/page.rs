@@ -133,6 +133,25 @@ impl PageInput {
         Ok(())
     }
 
+    /// A page frame from the CPU (screen capture) instead of Chromium's
+    /// texture: uploaded into our texture (resized to the frame); bumps
+    /// [`PageInput::seq`].
+    pub fn upload_frame(&self, f: &p2c_core::Frame) -> Result<()> {
+        let inner = &*self.inner;
+        let dst = {
+            let mut st = inner.state.lock().unwrap_or_else(|p| p.into_inner());
+            if (f.width, f.height) != (st.tex.width(), st.tex.height()) {
+                st.tex = page_texture(&inner.gpu, f.width, f.height)
+                    .context("page texture for new size")?;
+            }
+            st.tex.clone()
+        };
+        // The state lock is released before the context call (lock order).
+        inner.gpu.update_bgra(&dst, f)?;
+        inner.seq.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
     /// Our device couldn't open `handle`: find out (once, until the next
     /// successful open) which adapter can, and build the error.
     fn open_failed(&self, handle: isize, e: anyhow::Error) -> anyhow::Error {

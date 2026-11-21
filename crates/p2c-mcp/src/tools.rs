@@ -64,6 +64,8 @@ pub enum BackendCall {
     ListGpus,
     SetGpu(String),
     InstallUpdate,
+    /// The monitors for the screen background.
+    ListScreens,
     GetBackground,
     /// Partial `BackgroundDto`.
     SetBackground(Value),
@@ -86,6 +88,7 @@ impl BackendCall {
                 | BackendCall::GetCrop
                 | BackendCall::ListGpus
                 | BackendCall::GetBackground
+                | BackendCall::ListScreens
         )
     }
 
@@ -203,16 +206,18 @@ Choosing box while a full-frame background other than page is on returns the bac
         t("install_update", "Download, verify and install the newer Page2Cam version on offer (status shows it). Page2Cam restarts.".into(), &none),
         t("get_background", "The background choices: full frame, in box, colours, YouTube video, refined edges, uploaded pictures.".into(), &none),
         t("set_background", "Choose what is behind the person. Give only what changes. \
-full = full-frame background: page (the web page), image (the uploaded picture), colour, youtube (a video link, plays full screen looping with sound on the stream only), blurred-room (the webcam's room, blurred). \
+full = full-frame background: page (the web page), image (the uploaded picture), colour, youtube (a video link, plays full screen looping with sound on the stream only), screen (a whole monitor, live: everything on it is shown to the call or stream; screen = an id from list_screens, default the primary monitor), blurred-room (the webcam's room, blurred). \
 Any full other than page switches the overlay style to cutout_full. \
 in_box = behind the person inside the box (box style): room, blur, image, colour. \
 refined_edges = smoother hair and shoulder edges (a little more GPU/CPU).".into(),
             &json!({ "type": "object", "additionalProperties": false, "minProperties": 1,
                 "properties": {
-                    "full": { "enum": ["page", "image", "colour", "youtube", "blurred-room"] },
+                    "full": { "enum": ["page", "image", "colour", "youtube", "screen", "blurred-room"] },
                     "full_colour": colour, "youtube": { "type": "string", "maxLength": 2048 },
+                    "screen": { "type": "string", "maxLength": 64 },
                     "in_box": { "enum": ["room", "blur", "image", "colour"] },
                     "box_colour": colour, "refined_edges": { "type": "boolean" } } })),
+        t("list_screens", "The monitors the screen background can show: id, index, name, resolution, primary. Fails where screen capture is not available (Windows only).".into(), &none),
         t("upload_background_image", "Upload the picture for a background row (full = full frame, box = in box) and show it there. \
 Give a local file path or base64 file bytes (PNG, JPEG or WebP, up to 20 MB).".into(),
             &json!({ "type": "object", "required": ["row"], "additionalProperties": false,
@@ -324,6 +329,7 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
         "list_gpus" => return simple(C::ListGpus),
         "install_update" => return simple(C::InstallUpdate),
         "get_background" => return simple(C::GetBackground),
+        "list_screens" => return simple(C::ListScreens),
         "open_url" => (|| {
             only(args, &["url"])?;
             let u = req_str(args, "url")?.trim();
@@ -463,6 +469,7 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
                     "full",
                     "full_colour",
                     "youtube",
+                    "screen",
                     "in_box",
                     "box_colour",
                     "refined_edges",
@@ -473,7 +480,14 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
                 let f = one_of(
                     "full",
                     f,
-                    &["page", "image", "colour", "youtube", "blurred-room"],
+                    &[
+                        "page",
+                        "image",
+                        "colour",
+                        "youtube",
+                        "screen",
+                        "blurred-room",
+                    ],
                 )?;
                 m.insert("full".into(), f.into());
             }
@@ -486,6 +500,13 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
                     return Err("youtube must be a YouTube link or video id".into());
                 }
                 m.insert("full_youtube".into(), y.into());
+            }
+            if let Some(s) = str_arg(args, "screen")? {
+                let s = s.trim();
+                if s.len() > 64 {
+                    return Err("screen must be an id from list_screens".into());
+                }
+                m.insert("full_screen".into(), s.into());
             }
             if let Some(b) = str_arg(args, "in_box")? {
                 let b = one_of("in_box", b, &["room", "blur", "image", "colour"])?;

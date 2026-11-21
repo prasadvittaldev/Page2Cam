@@ -2681,6 +2681,7 @@ dependencies = [
  "p2c-d3d",
  "p2c-mcp",
  "p2c-proc",
+ "p2c-screen",
  "p2c-segment",
  "p2c-stream",
  "p2c-tray",

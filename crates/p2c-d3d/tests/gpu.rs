@@ -2434,3 +2434,25 @@ fn shared_test_pages_reach_the_page_input_intact() {
         println!("page copy kept on {}", a.name);
     }
 }
+
+/// Screen capture feeds CPU frames into the page input: any size, read back
+/// exactly, `seq` bumped like a Chromium texture.
+#[test]
+#[ignore]
+fn page_input_takes_cpu_frames() {
+    for a in hardware() {
+        let gpu = Gpu::new(a.luid).unwrap();
+        let page = PageInput::new(&gpu, 1920, 1080).unwrap();
+        let src = gradient(64, 40, 5);
+        page.upload_frame(&src).unwrap();
+        assert_eq!(page.seq(), 1);
+        let t = page.texture();
+        assert_eq!((t.width(), t.height()), (64, 40), "{}", a.name);
+        assert_eq!(gpu.read_bgra(&t).unwrap().data, src.data, "{}", a.name);
+        let next = gradient(64, 40, 6);
+        page.upload_frame(&next).unwrap();
+        assert_eq!(page.seq(), 2);
+        assert_eq!(gpu.read_bgra(&page.texture()).unwrap().data, next.data);
+        println!("page input takes CPU frames on {}", a.name);
+    }
+}

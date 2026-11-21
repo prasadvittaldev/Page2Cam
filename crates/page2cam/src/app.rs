@@ -94,6 +94,11 @@ pub struct App {
     pub health_window: Mutex<crate::health::HealthWindow>,
     /// The page frame rate, lowered while the output skips ticks.
     pub page_fps: Mutex<crate::page_fps::PageFps>,
+    /// The screen background's capture.
+    pub screen: crate::screen::ScreenShare,
+    /// Chromium's paints are dropped while set (the screen fills the page);
+    /// shared with the browser (`BrowserConfig.paused`).
+    pub page_paused: Arc<std::sync::atomic::AtomicBool>,
     /// Latest output frame (shared with the preview sink); snapshots encode from it on demand.
     pub output_frame: FrameSlot,
 }
@@ -474,6 +479,27 @@ impl App {
         let b = self.bg.lock().backdrop();
         *self.backdrop.write() = b;
         self.update_segmenter();
+        self.sync_screen();
+    }
+
+    /// Capture the chosen monitor while the screen background shows, with
+    /// Chromium's paints paused (paused before the first captured frame,
+    /// resumed after the capture stopped, then repainted).
+    fn sync_screen(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let want = self.bg.lock().full.screen().map(str::to_string);
+        match want {
+            Some(id) => {
+                self.page_paused.store(true, SeqCst);
+                self.screen.sync(Some(&id));
+            }
+            None => {
+                self.screen.sync(None);
+                if self.page_paused.swap(false, SeqCst) {
+                    self.with_browser(|b| b.repaint());
+                }
+            }
+        }
     }
 
     /// The cut-out runs while the overlay or a backdrop needs the mask.
@@ -549,6 +575,7 @@ impl App {
             match &s.full {
                 FullBg::Colour(col) => s.full_colour = col.clone(),
                 FullBg::YouTube(id) => s.youtube = id.clone(),
+                FullBg::Screen(id) => s.screen = id.clone(),
                 _ => {}
             }
             if let crate::background::BoxBg::Colour(col) = &s.in_box {
@@ -563,6 +590,7 @@ impl App {
             match &s.full {
                 FullBg::Colour(col) => saves.push(("background_colour", col.as_str().into())),
                 FullBg::YouTube(id) => saves.push(("background_youtube", id.as_str().into())),
+                FullBg::Screen(id) => saves.push(("background_screen", id.as_str().into())),
                 _ => {}
             }
             if let crate::background::BoxBg::Colour(col) = &s.in_box {
@@ -620,6 +648,9 @@ impl App {
     /// The text under the Background section: a recent automatic change,
     /// else why the output doesn't show the choice.
     fn background_note(&self) -> String {
+        if let Some(e) = self.screen.error() {
+            return e;
+        }
         if let Some(n) = self.bg.lock().recent_note() {
             return n.to_string();
         }
@@ -644,9 +675,13 @@ impl App {
                 youtube_id(d.full_youtube.as_deref().unwrap_or(&s.youtube))
                     .map_err(anyhow::Error::msg)?,
             ),
+            "screen" => FullBg::Screen(
+                self.screen
+                    .resolve(d.full_screen.as_deref().unwrap_or(&s.screen))?,
+            ),
             "blurred-room" => FullBg::BlurredRoom,
             other => anyhow::bail!(
-                "unknown full-frame background {other:?} (page, image, colour, youtube or blurred-room)"
+                "unknown full-frame background {other:?} (page, image, colour, youtube, screen or blurred-room)"
             ),
         };
         let in_box = match d.in_box.as_str() {
@@ -995,6 +1030,7 @@ impl Controls for App {
             full: s.full.as_str().into(),
             full_colour: Some(s.full_colour.clone()),
             full_youtube: (!s.youtube.is_empty()).then(|| s.youtube.clone()),
+            full_screen: Some(s.screen.clone()),
             in_box: s.in_box.as_str().into(),
             box_colour: Some(s.box_colour.clone()),
             refined_edges: s.refined,
@@ -1086,6 +1122,21 @@ impl Controls for App {
             ImageRow::Box => s.box_image.as_ref(),
         }?;
         Some((img.bytes.clone(), img.content_type))
+    }
+
+    fn screens(&self) -> Result<Vec<p2c_admin::ScreenDto>, String> {
+        let list = self.screen.list().map_err(|e| format!("{e:#}"))?;
+        Ok(list
+            .into_iter()
+            .map(|s| p2c_admin::ScreenDto {
+                id: s.id,
+                index: s.index,
+                name: s.name,
+                width: s.width,
+                height: s.height,
+                primary: s.primary,
+            })
+            .collect())
     }
 
     fn youtube_thumb(&self, link: Option<String>) -> anyhow::Result<Arc<Vec<u8>>> {
@@ -1491,6 +1542,10 @@ mod tests {
             ticker_stats: Arc::default(),
             health_window: Mutex::new(Default::default()),
             page_fps: Mutex::new(crate::page_fps::PageFps::new(30)),
+            screen: crate::screen::ScreenShare::new(Box::new(
+                crate::screen::tests::FakeScreens::default(),
+            )),
+            page_paused: Arc::default(),
             output_frame: FrameSlot::new(),
         }
     }
@@ -1675,6 +1730,86 @@ mod tests {
         assert_eq!(app.bg.lock().last_page_url, "https://user.test/c");
         let text = std::fs::read_to_string(dir.path().join("page2cam.toml")).unwrap();
         assert!(!text.contains("/bg/"), "{text}");
+    }
+
+    /// The screen background: a monitor captured while Chromium's paints are
+    /// paused; a black generated page underneath; saved with its monitor.
+    #[test]
+    fn screen_background_captures_with_the_page_paused() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bg_app(dir.path());
+        let fake = crate::screen::tests::FakeScreens::default();
+        app.screen = crate::screen::ScreenShare::new(Box::new(fake.clone()));
+        app.navigate("https://user.test/a");
+        // Empty: the primary monitor, saved by its id.
+        app.set_background(bg("screen", "room")).unwrap();
+        assert_eq!(fake.live.load(SeqCst), 1);
+        assert_eq!(app.screen.running().as_deref(), Some("DISPLAY1"));
+        assert!(app.page_paused.load(SeqCst));
+        assert!(
+            shown(&app).starts_with(BG_BASE),
+            "black page under the capture"
+        );
+        assert!(app.backdrop.read().hides_room);
+        let c = settings(dir.path());
+        assert_eq!(
+            (c.background.as_str(), c.background_screen.as_str()),
+            ("screen", "DISPLAY1")
+        );
+        assert_eq!(app.background().full_screen.as_deref(), Some("DISPLAY1"));
+        // Another monitor by index: one capture, switched.
+        let two = BackgroundDto {
+            full_screen: Some("1".into()),
+            ..bg("screen", "room")
+        };
+        app.set_background(two).unwrap();
+        assert_eq!(*fake.starts.lock(), vec!["DISPLAY1", "DISPLAY2"]);
+        assert_eq!(fake.live.load(SeqCst), 1);
+        // An unknown monitor changes nothing.
+        let bad = BackgroundDto {
+            full_screen: Some("DISPLAY9".into()),
+            ..bg("screen", "room")
+        };
+        let e = app.set_background(bad).unwrap_err().to_string();
+        assert!(e.contains("DISPLAY9"), "{e}");
+        assert_eq!(app.screen.running().as_deref(), Some("DISPLAY2"));
+        // Admin navigation: back to the page, capture stopped, paints resumed.
+        app.navigate("https://user.test/b");
+        assert_eq!(fake.live.load(SeqCst), 0);
+        assert!(!app.page_paused.load(SeqCst));
+        assert_eq!(app.background().full, "page");
+        assert_eq!(shown(&app), "https://user.test/b");
+        // The last monitor is offered again.
+        app.set_background(bg("screen", "room")).unwrap();
+        assert_eq!(app.screen.running().as_deref(), Some("DISPLAY2"));
+        app.set_background(bg("page", "room")).unwrap();
+        assert_eq!(fake.live.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn screen_background_failures_are_explained() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bg_app(dir.path());
+        let fake = crate::screen::tests::FakeScreens::default();
+        app.screen = crate::screen::ScreenShare::new(Box::new(fake.clone()));
+        *fake.fail.lock() = true;
+        app.set_background(bg("screen", "room")).unwrap();
+        assert!(app.status().background_note.contains("monitor gone"));
+        app.set_background(bg("page", "room")).unwrap();
+        assert!(!app.status().background_note.contains("monitor gone"));
+        // Linux: refused with the reason, nothing changed.
+        app.screen = crate::screen::ScreenShare::new(Box::new(crate::screen::tests::FakeScreens {
+            unsupported: true,
+            ..Default::default()
+        }));
+        let e = app
+            .set_background(bg("screen", "room"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, p2c_screen::UNSUPPORTED);
+        assert_eq!(app.background().full, "page");
+        assert_eq!(app.screens().unwrap_err(), p2c_screen::UNSUPPORTED);
     }
 
     /// I1: a generated full frame tells the compositor the room is hidden,

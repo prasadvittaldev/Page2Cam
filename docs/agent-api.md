@@ -52,10 +52,13 @@ Coordinates are 0..1 of the 1920×1080 output.
 | `set_audio(mic_on, mic_gain, page_on, page_gain)` | stream sound (give only what changes) |
 | `list_gpus`, `set_gpu(choice)` | video processing; restarts Page2Cam when needed |
 | `install_update` | installs the update on offer |
-| `get_background`, `set_background(full, full_colour, youtube, in_box, box_colour, refined_edges)` | backgrounds: full frame `page\|image\|colour\|youtube\|blurred-room`, in box `room\|blur\|image\|colour`, refined edges (give only what changes) |
+| `get_background`, `set_background(full, full_colour, youtube, screen, in_box, box_colour, refined_edges)` | backgrounds: full frame `page\|image\|colour\|youtube\|screen\|blurred-room`, in box `room\|blur\|image\|colour`, refined edges (give only what changes); `screen` = a monitor id from `list_screens` (default: the main monitor) |
+| `list_screens` | the monitors the screen background can show: `id`, `index`, `name`, `width`, `height`, `primary` (Windows; elsewhere an error) |
 | `upload_background_image(row: full\|box, path \| base64)` | a PNG/JPEG/WebP picture (≤ 20 MB) for a background row, shown at once |
 
 Tools that need the running engine answer "Page2Cam is stopped — call start first" while it is stopped. No tool returns the stream key or any token.
+
+**Screen background.** `set_background(full: "screen")` shows a whole monitor, live, to the call or stream (everything on it: notifications, other windows, the pointer). The tray always shows a notification "Agent “…” is sharing your screen" for it, also while Page2Cam is stopped. While the screen shows, `snapshot` contains that monitor's picture. Choosing a page (`open_url`, the control page's address bar) or another background stops the capture. A monitor that can't be captured (unplugged) leaves a black background and says why in `status` (`background_note`).
 
 ## Local admin API (scripts)
 

@@ -19,6 +19,9 @@ pub enum FullBg {
     Colour(String),
     /// A YouTube video, by its 11-character id (a generated page).
     YouTube(String),
+    /// A monitor, by id (`DISPLAY1`; empty = primary), captured into the
+    /// page while Chromium shows a black generated page with its paints paused.
+    Screen(String),
     /// The webcam's room, blurred (drawn by the compositor).
     BlurredRoom,
 }
@@ -30,13 +33,25 @@ impl FullBg {
             FullBg::Image => "image",
             FullBg::Colour(_) => "colour",
             FullBg::YouTube(_) => "youtube",
+            FullBg::Screen(_) => "screen",
             FullBg::BlurredRoom => "blurred-room",
         }
     }
 
     /// Chromium shows a page we generate (served at `/bg/<id>/current.html`).
     pub fn is_generated(&self) -> bool {
-        matches!(self, FullBg::Image | FullBg::Colour(_) | FullBg::YouTube(_))
+        matches!(
+            self,
+            FullBg::Image | FullBg::Colour(_) | FullBg::YouTube(_) | FullBg::Screen(_)
+        )
+    }
+
+    /// The monitor to capture, for [`FullBg::Screen`].
+    pub fn screen(&self) -> Option<&str> {
+        match self {
+            FullBg::Screen(id) => Some(id),
+            _ => None,
+        }
     }
 
     /// R-Q1: generated pages are drawn by the compositor as the page.
@@ -240,7 +255,8 @@ pub fn background_html(kind: &FullBg, image_url: Option<&str>) -> String {
                 html_escape(&youtube_embed_url(id))
             ),
         ),
-        FullBg::Page | FullBg::BlurredRoom => (String::new(), String::new()),
+        // Screen: black (its paints are paused while the capture fills the page).
+        FullBg::Page | FullBg::BlurredRoom | FullBg::Screen(_) => (String::new(), String::new()),
     };
     format!(
         "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>Page2Cam background</title>\
@@ -481,6 +497,8 @@ pub struct BgState {
     pub full_colour: String,
     pub box_colour: String,
     pub youtube: String,
+    /// Last monitor chosen for the screen background (empty = primary).
+    pub screen: String,
     pub full_image: Option<StoredImage>,
     pub box_image: Option<StoredImage>,
     /// The operator's page, restored when the full frame goes back to Page.
@@ -544,6 +562,8 @@ impl BgState {
                 }
             },
             "youtube" if !youtube.is_empty() => FullBg::YouTube(youtube.clone()),
+            // A missing monitor is reported when the capture starts.
+            "screen" => FullBg::Screen(cfg.background_screen.trim().to_string()),
             "blurred-room" => FullBg::BlurredRoom,
             "page" => FullBg::Page,
             other => {
@@ -578,6 +598,7 @@ impl BgState {
             full_colour,
             box_colour,
             youtube,
+            screen: cfg.background_screen.trim().to_string(),
             full_image,
             box_image,
             last_page_url,
@@ -1067,6 +1088,7 @@ mod tests {
             (FullBg::Image, true),
             (FullBg::Colour("#000000".into()), true),
             (FullBg::YouTube("dQw4w9WgXcQ".into()), true),
+            (FullBg::Screen("DISPLAY1".into()), true),
         ] {
             let b = backdrop(&full, &BoxBg::Room, None, false);
             assert_eq!(b.hides_room, hides, "{full:?}");
@@ -1121,5 +1143,43 @@ mod tests {
         };
         assert!(cutout_for_full_background(&FullBg::Image, &mut l2, None));
         assert_eq!(l2.style, OverlayStyle::CutoutFull);
+    }
+}
+
+#[cfg(test)]
+mod screen_tests {
+    use super::*;
+
+    #[test]
+    fn screen_background_is_a_generated_black_page_saved_with_its_monitor() {
+        let s = FullBg::Screen("DISPLAY2".into());
+        assert_eq!(s.as_str(), "screen");
+        assert!(s.is_generated());
+        assert_eq!(s.screen(), Some("DISPLAY2"));
+        assert_eq!(FullBg::Page.screen(), None);
+        assert_eq!(s.backdrop(), FullBackdrop::Page);
+        let html = background_html(&s, None);
+        assert!(
+            html.contains("background:#000") && !html.contains("<img") && !html.contains("<iframe")
+        );
+
+        let cfg = crate::config::Config {
+            background: "screen".into(),
+            background_screen: " DISPLAY2 ".into(),
+            ..Default::default()
+        };
+        let (st, warn) = BgState::from_config(&cfg, String::new());
+        assert!(warn.is_empty(), "{warn:?}");
+        assert_eq!(st.full, FullBg::Screen("DISPLAY2".into()));
+        assert_eq!(st.screen, "DISPLAY2");
+        // Empty: the primary monitor.
+        let cfg = crate::config::Config {
+            background: "screen".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            BgState::from_config(&cfg, String::new()).0.full,
+            FullBg::Screen(String::new())
+        );
     }
 }

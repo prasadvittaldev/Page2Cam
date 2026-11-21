@@ -282,7 +282,7 @@ pub struct UpdateInfo {
 /// Background choices as JSON (`GET`/`POST /api/background`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundDto {
-    /// "page" | "image" | "colour" | "youtube" | "blurred-room"
+    /// "page" | "image" | "colour" | "youtube" | "screen" | "blurred-room"
     pub full: String,
     /// `#rrggbb` for "colour" (the last one chosen when reading).
     #[serde(default)]
@@ -290,6 +290,10 @@ pub struct BackgroundDto {
     /// A YouTube video link or id for "youtube" (the last video's id when reading).
     #[serde(default)]
     pub full_youtube: Option<String>,
+    /// The monitor for "screen": an id from `GET /api/screens`, a 1-based
+    /// index, or empty/"primary" (the last one chosen when reading).
+    #[serde(default)]
+    pub full_screen: Option<String>,
     /// "room" | "blur" | "image" | "colour"
     pub in_box: String,
     /// `#rrggbb` for an in-box "colour".
@@ -303,6 +307,20 @@ pub struct BackgroundDto {
     /// Reading only: an in-box image has been uploaded.
     #[serde(default)]
     pub box_image: bool,
+}
+
+/// One monitor for the screen background (`GET /api/screens`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenDto {
+    /// Stable id (`DISPLAY1`).
+    pub id: String,
+    /// 1-based position in the system's list.
+    pub index: u32,
+    /// "Screen <index>".
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub primary: bool,
 }
 
 /// Which background picture (`?row=full|box`).
@@ -373,4 +391,7 @@ pub trait Controls: Send + Sync + 'static {
     /// The JPEG thumbnail of `link` (a YouTube link or id), else of the
     /// chosen video. May block on the first fetch: call it off the runtime.
     fn youtube_thumb(&self, link: Option<String>) -> anyhow::Result<Arc<Vec<u8>>>;
+    /// The monitors the screen background can show; an error where screen
+    /// capture isn't available ("screen capture is Windows-only for now").
+    fn screens(&self) -> Result<Vec<ScreenDto>, String>;
 }

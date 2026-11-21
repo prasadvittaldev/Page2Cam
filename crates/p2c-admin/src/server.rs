@@ -17,7 +17,7 @@ use tokio::sync::watch;
 
 use crate::api::{
     AudioSettings, BackgroundDto, Controls, CropDto, GpuInfo, ImageRow, InputEvent, KeyAction,
-    MouseBtn, NavAction, PipDto, StreamRequest,
+    MouseBtn, NavAction, PipDto, ScreenDto, StreamRequest,
 };
 use crate::input::{map_preview, normalize_url};
 use crate::preview::spawn_encoder;
@@ -118,6 +118,7 @@ pub(crate) fn router(st: State) -> Router {
         .route("/api/cutout", post(cutout))
         .route("/api/update/install", post(update_install))
         .route("/api/gpus", get(gpus))
+        .route("/api/screens", get(screens))
         .route("/api/gpu", post(gpu))
         .route("/api/restart", post(restart))
         .route("/api/quit", post(quit))
@@ -345,6 +346,17 @@ async fn cutout(AxState(st): AxState<State>, Json(b): Json<CutoutBody>) -> Respo
 
 async fn gpus(AxState(st): AxState<State>) -> Json<Vec<GpuInfo>> {
     Json(st.controls.gpus())
+}
+
+/// The monitors for the screen background; 501 `{error}` where screen
+/// capture is not available.
+async fn screens(AxState(st): AxState<State>) -> Response {
+    let c = st.controls.clone();
+    match tokio::task::spawn_blocking(move || c.screens()).await {
+        Ok(Ok(v)) => Json::<Vec<ScreenDto>>(v).into_response(),
+        Ok(Err(e)) => json_error(StatusCode::NOT_IMPLEMENTED, &e),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -924,6 +936,8 @@ mod tests {
             pub events: Mutex<Vec<InputEvent>>,
             pub snap: Mutex<Option<Vec<u8>>>,
             pub background: Mutex<Option<BackgroundDto>>,
+            /// `None`: screen capture unavailable.
+            pub screens: Mutex<Option<Vec<ScreenDto>>>,
             /// (row, byte count) of every image upload that reached the app.
             pub uploads: Mutex<Vec<(ImageRow, usize)>>,
             pub page: Mutex<Option<String>>,
@@ -1043,6 +1057,13 @@ mod tests {
                     .then(|| self.full_image.lock().unwrap().clone())
                     .flatten()
                     .map(|b| (Arc::new(b), "image/jpeg"))
+            }
+            fn screens(&self) -> Result<Vec<ScreenDto>, String> {
+                self.screens
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| "screen capture is Windows-only for now".to_string())
             }
             fn youtube_thumb(&self, link: Option<String>) -> anyhow::Result<Arc<Vec<u8>>> {
                 self.thumbs.lock().unwrap().push(link.clone());
@@ -1398,6 +1419,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn screens_route_lists_monitors_or_says_why_not() {
+        let fake = Arc::new(Fake::default());
+        let get = |f: Arc<Fake>| {
+            app(f).oneshot(req(
+                "GET",
+                "/api/screens",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                None,
+            ))
+        };
+        let r = get(fake.clone()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(body_string(r).await.contains("Windows-only"));
+        let one = ScreenDto {
+            id: "DISPLAY1".into(),
+            index: 1,
+            name: "Screen 1".into(),
+            width: 1920,
+            height: 1200,
+            primary: true,
+        };
+        *fake.screens.lock().unwrap() = Some(vec![one.clone()]);
+        let r = get(fake.clone()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let v: Vec<ScreenDto> = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v, vec![one]);
+    }
+
+    #[tokio::test]
     async fn gpus_route_lists_auto_first_cpu_last() {
         let r = app(Arc::new(Fake::default()))
             .oneshot(req("GET", "/api/gpus", "127.0.0.1:8765", Some(TOKEN), None))
@@ -1542,6 +1593,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         for (method, uri, body) in [
             ("GET", "/api/gpus", None),
+            ("GET", "/api/screens", None),
             ("POST", "/api/gpu", Some(r#"{"choice":"cpu"}"#)),
             ("POST", "/api/restart", Some("{}")),
         ] {
