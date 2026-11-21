@@ -20,7 +20,7 @@ Switching on registers `page2cam.exe --mcp` (stdio) with:
 
 | Agent | Where | Entry |
 |---|---|---|
-| Claude Desktop | `%APPDATA%\Claude\claude_desktop_config.json`; the packaged (MSIX/Store) app: `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json`, first created from the `%APPDATA%` file so other servers stay | `mcpServers.page2cam = { "command": "<exe>", "args": ["--mcp"] }` — restart Claude Desktop afterwards |
+| Claude Desktop | newest layout first: `%LOCALAPPDATA%\Claude-Data\claude_*\claude_desktop_config.json` (Claude Desktop 6+), the packaged app's `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\…`, then `%APPDATA%\Claude\…`. A new file starts from the newest older one (other servers stay); switching off also removes our entry from the older files | `mcpServers.page2cam = { "command": "<exe>", "args": ["--mcp"] }` — restart Claude Desktop afterwards |
 | Claude Code | its CLI: `claude mcp add --scope user page2cam -- "<exe>" --mcp` | only when `claude` is on PATH |
 | OpenAI Codex (app, CLI, IDE) | `%USERPROFILE%\.codex\config.toml` | `[mcp_servers.page2cam]` `command = "<exe>"`, `args = ["--mcp"]` (comments in the file are kept) |
 | Cursor | `%USERPROFILE%\.cursor\mcp.json` | `mcpServers.page2cam` as Claude Desktop |

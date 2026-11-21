@@ -300,59 +300,86 @@ pub struct Target {
     /// Desktop sees the real `%APPDATA%` file until it has its own copy, so
     /// its copy starts from that file (the user's other servers stay).
     pub seed: Option<PathBuf>,
+    /// Older config files of the same agent that may hold an entry of ours
+    /// (written before its newer layout was known): cleaned when switching
+    /// off.
+    pub stale: Vec<PathBuf>,
+}
+
+/// The first subfolder of `dir` whose name starts with `prefix` (any case),
+/// by name, keeping only those `keep` accepts.
+fn first_dir_with_prefix(
+    dir: &Path,
+    prefix: &str,
+    keep: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.to_ascii_lowercase().starts_with(prefix))
+        })
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && keep(p))
+        .collect();
+    v.sort();
+    v.into_iter().next()
+}
+
+/// Claude Desktop 6+'s data folder: `%LOCALAPPDATA%\Claude-Data\claude_<id>`
+/// (its config file lives there, next to its other data).
+fn claude_data_dir(localappdata: &Path) -> Option<PathBuf> {
+    first_dir_with_prefix(&localappdata.join("Claude-Data"), "claude", |_| true)
 }
 
 /// The packaged (MSIX) Claude Desktop's config folder:
 /// `%LOCALAPPDATA%\Packages\Claude_<publisher id>\LocalCache\Roaming\Claude`
 /// (its writes to `%APPDATA%` are redirected there).
 fn packaged_claude_dir(localappdata: &Path) -> Option<PathBuf> {
-    let mut pkgs: Vec<PathBuf> = std::fs::read_dir(localappdata.join("Packages"))
-        .ok()?
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.to_ascii_lowercase().starts_with("claude_"))
-        })
-        .map(|e| e.path())
-        .filter(|p| p.join("LocalCache").join("Roaming").is_dir())
-        .collect();
-    pkgs.sort();
-    Some(
-        pkgs.first()?
-            .join("LocalCache")
-            .join("Roaming")
-            .join("Claude"),
-    )
+    let pkg = first_dir_with_prefix(&localappdata.join("Packages"), "claude_", |p| {
+        p.join("LocalCache").join("Roaming").is_dir()
+    })?;
+    Some(pkg.join("LocalCache").join("Roaming").join("Claude"))
+}
+
+/// Claude Desktop's config file, newest layout first: the `Claude-Data`
+/// folder (6+), the packaged app's redirected `%APPDATA%`, then the real
+/// `%APPDATA%\Claude`. Older files seed a new one and are cleaned when off.
+fn claude_desktop_target(env: &RegEnv) -> Option<Target> {
+    const FILE: &str = "claude_desktop_config.json";
+    let local = env.localappdata.as_deref();
+    let data = local.and_then(claude_data_dir).map(|d| d.join(FILE));
+    let packaged = local.and_then(packaged_claude_dir).map(|d| d.join(FILE));
+    let real_dir = env.appdata.as_ref().map(|a| a.join("Claude"));
+    let real = real_dir
+        .as_ref()
+        .filter(|d| d.is_dir())
+        .map(|d| d.join(FILE));
+    let mut layouts: Vec<PathBuf> = [data, packaged, real].into_iter().flatten().collect();
+    if layouts.is_empty() {
+        return None;
+    }
+    let path = layouts.remove(0);
+    Some(Target {
+        app: AgentApp::ClaudeDesktop,
+        path,
+        seed: layouts.iter().find(|p| p.is_file()).cloned(),
+        stale: layouts,
+    })
 }
 
 /// Each installed agent's config file (only when its folder exists).
 pub fn registration_targets(env: &RegEnv) -> Vec<Target> {
-    let mut v = Vec::new();
-    const CLAUDE_FILE: &str = "claude_desktop_config.json";
-    let real_claude = env.appdata.as_ref().map(|a| a.join("Claude"));
-    match env.localappdata.as_deref().and_then(packaged_claude_dir) {
-        Some(dir) => v.push(Target {
-            app: AgentApp::ClaudeDesktop,
-            path: dir.join(CLAUDE_FILE),
-            seed: real_claude.map(|d| d.join(CLAUDE_FILE)),
-        }),
-        None => {
-            if let Some(d) = real_claude.filter(|d| d.is_dir()) {
-                v.push(Target {
-                    app: AgentApp::ClaudeDesktop,
-                    path: d.join(CLAUDE_FILE),
-                    seed: None,
-                });
-            }
-        }
-    }
+    let mut v: Vec<Target> = claude_desktop_target(env).into_iter().collect();
     let mut add = |app, dir: Option<PathBuf>, file: &str| {
         if let Some(d) = dir.filter(|d| d.is_dir()) {
             v.push(Target {
                 app,
                 path: d.join(file),
                 seed: None,
+                stale: Vec::new(),
             });
         }
     };
@@ -381,6 +408,7 @@ pub fn apply_one(app: AgentApp, path: &Path, on: bool, exe: &str) -> Result<(), 
             app,
             path: path.to_path_buf(),
             seed: None,
+            stale: Vec::new(),
         },
         on,
         exe,
@@ -390,6 +418,14 @@ pub fn apply_one(app: AgentApp, path: &Path, on: bool, exe: &str) -> Result<(), 
 /// [`apply_one`] for a [`Target`]: a missing file starts from its seed.
 pub fn apply_target(t: &Target, on: bool, exe: &str) -> Result<(), String> {
     let (app, path) = (t.app, t.path.as_path());
+    if !on {
+        // Best effort: the agent no longer reads these files.
+        for s in t.stale.iter().filter(|s| s.is_file()) {
+            if let Err(e) = apply_one(app, s, false, exe) {
+                tracing::warn!(error = %e, "could not clean an older agent config");
+            }
+        }
+    }
     let read = |p: &Path| match std::fs::read_to_string(p) {
         Ok(t) => Ok(Some(t)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -855,6 +891,49 @@ mod tests {
             !text.contains("page2cam") && text.contains("other"),
             "{text}"
         );
+    }
+
+    /// Claude Desktop 6+ keeps its config in
+    /// `%LOCALAPPDATA%\Claude-Data\claude_<id>`; older copies of ours are
+    /// cleaned up when switching off.
+    #[test]
+    fn claude_data_folder_wins_and_old_copies_are_cleaned_when_off() {
+        let d = tempfile::tempdir().unwrap();
+        let data = d.path().join("Local/Claude-Data/claude_abc123");
+        std::fs::create_dir_all(&data).unwrap();
+        let new = data.join("claude_desktop_config.json");
+        let prefs = r#"{"coworkUserFilesPath":"x","preferences":{"a":1}}"#;
+        std::fs::write(&new, prefs).unwrap();
+        std::fs::write(d.path().join("Local/Claude-Data/README.txt"), "r").unwrap();
+        let pkg = d
+            .path()
+            .join("Local/Packages/Claude_abc123/LocalCache/Roaming/Claude");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let old = pkg.join("claude_desktop_config.json");
+        let env = RegEnv {
+            appdata: Some(d.path().join("Roaming")),
+            home: Some(d.path().join("home")),
+            localappdata: Some(d.path().join("Local")),
+        };
+        // An older copy of ours from before this layout was known.
+        apply_one(AgentApp::ClaudeDesktop, &old, true, EXE).unwrap();
+        let t = registration_targets(&env);
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert_eq!(t[0].path, new);
+        apply_registration(true, EXE, &env, &|_: &[&str]| None);
+        let text = std::fs::read_to_string(&new).unwrap();
+        assert!(
+            text.contains("page2cam") && text.contains("coworkUserFilesPath"),
+            "{text}"
+        );
+        apply_registration(false, EXE, &env, &|_: &[&str]| None);
+        let text = std::fs::read_to_string(&new).unwrap();
+        assert!(
+            !text.contains("page2cam") && text.contains("preferences"),
+            "{text}"
+        );
+        let text = std::fs::read_to_string(&old).unwrap();
+        assert!(!text.contains("page2cam"), "old copy left: {text}");
     }
 
     #[test]
