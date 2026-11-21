@@ -115,6 +115,7 @@ enum Cmd {
     Key(KeyInput),
     Repaint,
     RecreateCpu,
+    SetFrameRate(u32),
     Shutdown,
 }
 
@@ -200,6 +201,12 @@ impl BrowserHandle {
     pub fn recreate_cpu(&self) {
         self.send(Cmd::RecreateCpu);
     }
+
+    /// Change how often Chromium paints the page (frames per second, at
+    /// least 1); also kept for a browser recreated later.
+    pub fn set_frame_rate(&self, fps: u32) {
+        self.send(Cmd::SetFrameRate(fps.max(1)));
+    }
 }
 
 /// If this process is a CEF helper subprocess (renderer, GPU, ...), run it and
@@ -265,7 +272,7 @@ pub fn run(
     );
 
     let url = Arc::new(Mutex::new(cfg.url.clone()));
-    let create = |gpu: Option<&GpuPage>, at: &str| {
+    let create = |gpu: Option<&GpuPage>, at: &str, fps: u32| {
         // Each browser has its own `closed` flag, so closing a replaced
         // browser doesn't end the pump loop.
         let closed = Arc::new(AtomicBool::new(false));
@@ -284,7 +291,7 @@ pub fn run(
             ..Default::default()
         };
         let browser_settings = cef::BrowserSettings {
-            windowless_frame_rate: cfg.fps as _,
+            windowless_frame_rate: fps as _,
             ..Default::default()
         };
         cef::browser_host_create_browser_sync(
@@ -297,11 +304,12 @@ pub fn run(
         )
         .map(|b| (b, closed))
     };
-    let Some((mut browser, mut closed)) = create(gpu_page.as_ref(), &cfg.url) else {
+    let Some((mut browser, mut closed)) = create(gpu_page.as_ref(), &cfg.url, cfg.fps) else {
         cef::shutdown();
         anyhow::bail!("CEF failed to create the browser");
     };
     let mut on_gpu = gpu_page.is_some();
+    let mut fps = cfg.fps;
 
     let (tx, rx): (Sender<Cmd>, Receiver<Cmd>) = mpsc::channel();
     ready(BrowserHandle {
@@ -369,7 +377,7 @@ pub fn run(
                 Cmd::RecreateCpu if on_gpu && closing_since.is_none() => {
                     // New browser first: if it can't be made, keep the old one.
                     let at = url.lock().clone();
-                    match create(None, &at) {
+                    match create(None, &at, fps) {
                         Some((b, c)) => {
                             if let Some(host) = browser.host() {
                                 host.close_browser(1);
@@ -383,6 +391,12 @@ pub fn run(
                     }
                 }
                 Cmd::RecreateCpu => {}
+                Cmd::SetFrameRate(f) => {
+                    fps = f;
+                    if let Some(host) = browser.host() {
+                        host.set_windowless_frame_rate(f as _);
+                    }
+                }
                 Cmd::Shutdown if closing_since.is_none() => {
                     if let Some(host) = browser.host() {
                         host.close_browser(1);

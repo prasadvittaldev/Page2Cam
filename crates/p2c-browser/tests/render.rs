@@ -241,6 +241,23 @@ fn scenario(h: &BrowserHandle, slot: &FrameSlot, audio: &AudioRing) -> Result<()
     }
     println!("test page_audio_captured ... ok");
 
+    // The rAF square repaints every frame: paints follow the frame rate.
+    let paints_per_s = || {
+        let a = slot.seq();
+        std::thread::sleep(Duration::from_secs(2));
+        (slot.seq() - a) as f64 / 2.0
+    };
+    let fast = paints_per_s();
+    h.set_frame_rate(10);
+    std::thread::sleep(Duration::from_millis(500));
+    let slow = paints_per_s();
+    h.set_frame_rate(30);
+    println!("paints/s at 30 fps: {fast:.1}, at 10 fps: {slow:.1}");
+    if !(fast > 20.0 && slow < 13.0) {
+        return Err(format!("set_frame_rate: {fast:.1} -> {slow:.1} paints/s"));
+    }
+    println!("test set_frame_rate_slows_paints ... ok");
+
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) && !h.current_url().starts_with("data:") {
         std::thread::sleep(Duration::from_millis(50));

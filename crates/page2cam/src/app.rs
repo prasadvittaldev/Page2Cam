@@ -92,6 +92,8 @@ pub struct App {
     pub ticker_stats: Arc<p2c_compositor::TickerStats>,
     /// Recent samples for the health rates.
     pub health_window: Mutex<crate::health::HealthWindow>,
+    /// The page frame rate, lowered while the output skips ticks.
+    pub page_fps: Mutex<crate::page_fps::PageFps>,
     /// Latest output frame (shared with the preview sink); snapshots encode from it on demand.
     pub output_frame: FrameSlot,
 }
@@ -263,6 +265,25 @@ impl App {
             webcam_frames: self.webcam_slot.as_ref().map_or(0, |s| s.seq()),
         };
         self.health_window.lock().push(s);
+    }
+
+    /// Slow the page down while the output skips ticks (a page that takes
+    /// the whole GPU starves the compositor), and back up once it keeps up.
+    /// Call after [`App::sample_health`].
+    pub fn govern_page_fps(&self) {
+        if !self.ticker_stats.output_ready() {
+            return;
+        }
+        let skipped = lock(&self.health_window, "health_window").skipped_pct();
+        let changed = lock(&self.page_fps, "page_fps").update(std::time::Instant::now(), skipped);
+        if let Some(fps) = changed {
+            tracing::info!(
+                fps,
+                skipped_pct = skipped,
+                "page frame rate changed (output skipping ticks)"
+            );
+            self.with_browser(|b| b.set_frame_rate(fps));
+        }
     }
 
     /// The health block of the status (rates over the last ~10 s).
@@ -1469,6 +1490,7 @@ mod tests {
             quit_main: Mutex::new(None),
             ticker_stats: Arc::default(),
             health_window: Mutex::new(Default::default()),
+            page_fps: Mutex::new(crate::page_fps::PageFps::new(30)),
             output_frame: FrameSlot::new(),
         }
     }

@@ -7,6 +7,7 @@ mod engine;
 mod health;
 mod logging;
 mod mcp_bridge;
+mod page_fps;
 mod pattern;
 mod power;
 mod restart;
@@ -625,6 +626,7 @@ fn run() -> anyhow::Result<i32> {
         quit_main: Mutex::new(None),
         ticker_stats: ticker.stats(),
         health_window: Mutex::new(Default::default()),
+        page_fps: Mutex::new(page_fps::PageFps::new(cfg.fps)),
         output_frame: preview.clone(),
     });
 
@@ -701,6 +703,7 @@ fn run() -> anyhow::Result<i32> {
                     app.keep_page_off_background();
                     if round.is_multiple_of(4) {
                         app.sample_health();
+                        app.govern_page_fps();
                     }
                     if round % 120 == 20 {
                         helpers.sweep();
