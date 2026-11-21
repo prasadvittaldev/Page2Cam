@@ -125,6 +125,7 @@ enum Cmd {
 pub struct BrowserHandle {
     tx: Sender<Cmd>,
     url: Arc<Mutex<String>>,
+    paused: Arc<AtomicBool>,
 }
 
 impl BrowserHandle {
@@ -202,6 +203,14 @@ impl BrowserHandle {
         self.send(Cmd::RecreateCpu);
     }
 
+    /// Drop the page's paints while another source fills the page slot or
+    /// texture (screen capture); `false` resumes and asks for a full repaint.
+    pub fn set_paused(&self, paused: bool) {
+        if self.paused.swap(paused, Ordering::SeqCst) && !paused {
+            self.repaint();
+        }
+    }
+
     /// Change how often Chromium paints the page (frames per second, at
     /// least 1); also kept for a browser recreated later.
     pub fn set_frame_rate(&self, fps: u32) {
@@ -272,6 +281,7 @@ pub fn run(
     );
 
     let url = Arc::new(Mutex::new(cfg.url.clone()));
+    let paused = Arc::new(AtomicBool::new(false));
     let create = |gpu: Option<&GpuPage>, at: &str, fps: u32| {
         // Each browser has its own `closed` flag, so closing a replaced
         // browser doesn't end the pump loop.
@@ -284,6 +294,7 @@ pub fn run(
             url: url.clone(),
             audio: cfg.audio.clone(),
             on_texture: gpu.map(|g| g.on_texture.clone()),
+            paused: paused.clone(),
         });
         let window_info = cef::WindowInfo {
             windowless_rendering_enabled: 1,
@@ -315,6 +326,7 @@ pub fn run(
     ready(BrowserHandle {
         tx,
         url: url.clone(),
+        paused: paused.clone(),
     });
 
     // Pump CEF from this thread; poll commands between pumps.

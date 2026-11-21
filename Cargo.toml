@@ -26,3 +26,4 @@ p2c-admin = { path = "crates/p2c-admin" }
 p2c-segment = { path = "crates/p2c-segment" }
 p2c-d3d = { path = "crates/p2c-d3d" }
 p2c-update = { path = "crates/p2c-update" }
+p2c-screen = { path = "crates/p2c-screen" }

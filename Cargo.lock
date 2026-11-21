@@ -2544,6 +2544,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2c-screen"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "p2c-core",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "p2c-segment"
 version = "0.4.0"
 dependencies = [

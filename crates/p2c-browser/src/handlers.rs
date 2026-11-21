@@ -53,6 +53,9 @@ wrap_render_handler! {
         height: u32,
         // GPU path: receives `on_accelerated_paint` textures.
         on_texture: Option<TextureFn>,
+        // Set while another source (screen capture) fills the page: paints
+        // are dropped.
+        paused: Arc<AtomicBool>,
     }
 
     impl RenderHandler {
@@ -90,7 +93,12 @@ wrap_render_handler! {
             height: ::std::os::raw::c_int,
         ) {
             // Popups (e.g. <select> dropdowns) are not composited yet.
-            if type_ != PaintElementType::default() || buffer.is_null() || width <= 0 || height <= 0 {
+            if self.paused.load(Ordering::Relaxed)
+                || type_ != PaintElementType::default()
+                || buffer.is_null()
+                || width <= 0
+                || height <= 0
+            {
                 return;
             }
             let len = width as usize * height as usize * 4;
@@ -110,7 +118,7 @@ wrap_render_handler! {
             info: Option<&AcceleratedPaintInfo>,
         ) {
             // Popups are not composited (as in on_paint).
-            if type_ != PaintElementType::default() {
+            if type_ != PaintElementType::default() || self.paused.load(Ordering::Relaxed) {
                 return;
             }
             if let (Some(f), Some((handle, w, h))) =
@@ -233,11 +241,12 @@ pub(crate) struct ClientParts {
     pub url: Arc<Mutex<String>>,
     pub audio: Option<AudioRing>,
     pub on_texture: Option<TextureFn>,
+    pub paused: Arc<AtomicBool>,
 }
 
 pub(crate) fn client(p: ClientParts) -> Client {
     P2cClient::new(
-        P2cRenderHandler::new(p.slot, p.width, p.height, p.on_texture),
+        P2cRenderHandler::new(p.slot, p.width, p.height, p.on_texture, p.paused),
         P2cLifeSpan::new(p.closed),
         P2cDisplay::new(p.url),
         p.audio
