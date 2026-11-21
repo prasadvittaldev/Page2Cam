@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Page2Cam local admin API",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "description": "The engine's control routes on http://127.0.0.1:<port>. Every request needs Host: 127.0.0.1:<port> (or localhost:<port>) and the per-launch token in X-P2C-Token (or ?t=). Bodies are JSON unless stated; at most 2 MB (pictures 20 MB). Errors: 4xx/5xx with {\"error\": \"…\"} or plain text."
   },
   "servers": [{ "url": "http://127.0.0.1:{port}", "variables": { "port": { "default": "8765" } } }],

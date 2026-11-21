@@ -100,8 +100,9 @@ Branding: `assets/logo-source.png` (transparent) → `scripts/make-brand-assets.
 
 ## Known open risks
 
-- Refined-edges cost is unmeasured on the user's laptop: the CPU compositor logs it in the 30 s output stats line ("refined edges …"), the GPU path has no timing, the admin UI shows no number, and the spec's "status line shows the cost when over budget" rule is not implemented yet.
+- Refined-edges GPU cost (`gpu_refined_and_blur_within_budget`: the cut-out layer pass with refined edges on minus off, spec budget ≤ 2 ms) on the user's laptop, 2026-11-21: NVIDIA RTX 2000 Ada 0.05–0.12 ms; Intel UHD 0.3–0.9 ms, but 2.0–3.1 ms for the full-size cut-out (over budget; Intel only matters on machines without a faster GPU). The CPU compositor logs its cost in the 30 s output stats line ("refined edges …"); the admin UI shows no number, and the spec's "status line shows the cost when over budget" rule is not implemented yet.
+- The user's laptop sometimes holds its NVIDIA GPU at P8 (210 of 3105 MHz, nvidia-smi "SW Power Cap" + "SW Thermal Slowdown"). Whole GPU frames then take 6–8 ms instead of ~2 ms, and a heavy WebGL page (e.g. Vanta clouds) saturates it: Chromium's GPU work starves the compositor and the output fell to ~1 fps. Nothing yet slows the page down when the GPU is saturated.
 - The Windows camera DLL **works on the user's PC** (seen in Teams/Meet after running install-camera.cmd). Teams remote viewing (others in the call seeing it) is not yet confirmed.
-- DirectML (GPU) for the Quality cut-out is compile-checked only. On this dev box (Ryzen 5 8600G, CPU, release) Quality takes ~31 ms/frame (20–23 masks/s end to end), Fast ~1 ms.
+- DirectML (GPU) for the Quality cut-out runs on the user's laptop (NVIDIA, ~13 masks/s with a 20 fps webcam), but stalls for seconds when the GPU is saturated (see above), and the fallback then switches to Fast. On the Linux dev box (Ryzen 5 8600G, CPU, release) Quality takes ~31 ms/frame (20–23 masks/s end to end), Fast ~1 ms.
 - The webcam-mode choice (`choose_format`, aiming at ~30 fps) has never run against a real camera; the user's integrated webcam was reported as "1280x720@1".
 - Linux v4l2loopback writing and webcam capture have never run against real devices on the dev box (no module loaded, no webcam).

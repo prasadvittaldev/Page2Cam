@@ -2110,61 +2110,79 @@ fn gpu_refined_and_blur_within_budget() {
             BoxBackdrop::Room,
         ),
     ];
+    // The spec's budget is for refined edges: ≤ 2 ms GPU per frame, i.e. the
+    // cut-out layer pass with refined edges on minus the same pass with them
+    // off. Whole frames (upload, blur, readback…) are printed, not limited.
     let mut over = Vec::new();
     for a in adapters_or_skip("gpu_refined_and_blur_within_budget") {
         for (name, l, full, in_box) in &configs {
-            let gpu = Gpu::new(a.luid).unwrap();
-            let input = PageInput::new(&gpu, 1920, 1080).unwrap();
-            let shared = gpu.create_shared_bgra(&page).unwrap();
-            let mut p = GpuProducer::new(gpu.clone(), input.clone(), spec(1920, 1080)).unwrap();
-            p.set_profiling(true);
-            let mut totals = Vec::new();
-            let mut passes: Vec<(&'static str, Vec<f64>)> = Vec::new();
-            for i in 0..120usize {
-                input.on_shared_texture(shared.handle()).unwrap();
-                let inputs = TickInputs {
-                    page: None,
-                    cam: Some(Arc::new((*cams[i % 4]).clone())),
-                    mask: Some(masks[i % 4].clone()),
-                    layout: *l,
-                    backdrop: backdrop(*full, in_box.clone(), true),
-                };
-                p.produce(&inputs, false).unwrap();
-                let Some(prof) = p.take_profile() else {
-                    continue;
-                };
-                if i < 20 {
-                    continue;
-                }
-                totals.push(prof.iter().map(|(_, ms)| ms).sum::<f64>());
-                for (n, ms) in prof {
-                    match passes.iter_mut().find(|(k, _)| *k == n) {
-                        Some((_, v)) => v.push(ms),
-                        None => passes.push((n, vec![ms])),
+            let mut layer = [0.0f64; 2];
+            for refined in [false, true] {
+                let gpu = Gpu::new(a.luid).unwrap();
+                let input = PageInput::new(&gpu, 1920, 1080).unwrap();
+                let shared = gpu.create_shared_bgra(&page).unwrap();
+                let mut p = GpuProducer::new(gpu.clone(), input.clone(), spec(1920, 1080)).unwrap();
+                p.set_profiling(true);
+                let mut totals = Vec::new();
+                let mut passes: Vec<(&'static str, Vec<f64>)> = Vec::new();
+                for i in 0..120usize {
+                    input.on_shared_texture(shared.handle()).unwrap();
+                    let inputs = TickInputs {
+                        page: None,
+                        cam: Some(Arc::new((*cams[i % 4]).clone())),
+                        mask: Some(masks[i % 4].clone()),
+                        layout: *l,
+                        backdrop: backdrop(*full, in_box.clone(), refined),
+                    };
+                    p.produce(&inputs, false).unwrap();
+                    let Some(prof) = p.take_profile() else {
+                        continue;
+                    };
+                    if i < 20 {
+                        continue;
                     }
+                    totals.push(prof.iter().map(|(_, ms)| ms).sum::<f64>());
+                    for (n, ms) in prof {
+                        match passes.iter_mut().find(|(k, _)| *k == n) {
+                            Some((_, v)) => v.push(ms),
+                            None => passes.push((n, vec![ms])),
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
                 }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let med = |v: &mut Vec<f64>| {
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                v[v.len() / 2]
-            };
-            let mut line = String::new();
-            for (n, v) in &mut passes {
-                line += &format!(" {n} {:.3}", med(v));
-            }
-            let total = med(&mut totals);
-            let p95 = totals[((totals.len() - 1) as f64 * 0.95) as usize];
-            println!(
-                "budget | {name} | {} | GPU median {total:.3} ms, p95 {p95:.3} ms per frame |{line}",
+                let med = |v: &mut Vec<f64>| {
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    v[v.len() / 2]
+                };
+                let mut line = String::new();
+                for (n, v) in &mut passes {
+                    let m = med(v);
+                    if *n == "layer" {
+                        layer[refined as usize] = m;
+                    }
+                    line += &format!(" {n} {m:.3}");
+                }
+                let total = med(&mut totals);
+                let p95 = totals[((totals.len() - 1) as f64 * 0.95) as usize];
+                println!(
+                "budget | {name} | refined {refined} | {} | GPU median {total:.3} ms, p95 {p95:.3} ms per frame |{line}",
                 a.name
             );
-            if total > 2.0 {
-                over.push(format!("{name} on {}: {total:.3} ms", a.name));
+            }
+            let cost = layer[1] - layer[0];
+            println!(
+                "budget | {name} | {} | refined edges cost {cost:.3} ms",
+                a.name
+            );
+            if cost > 2.0 {
+                over.push(format!("{name} on {}: {cost:.3} ms", a.name));
             }
         }
     }
-    assert!(over.is_empty(), "over the 2 ms budget: {over:?}");
+    assert!(
+        over.is_empty(),
+        "refined edges over the 2 ms budget: {over:?}"
+    );
 }
 
 /// If the backdrop shaders can't be compiled, Page/Room keeps working on

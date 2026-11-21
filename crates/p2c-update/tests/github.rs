@@ -31,10 +31,20 @@ fn packaged_checksums_verify() {
 #[test]
 #[ignore = "network"]
 fn live_release_verifies() {
-    let r = p2c_update::fetch_latest().unwrap().expect("latest release has an installer");
+    let r = p2c_update::fetch_latest()
+        .unwrap()
+        .expect("latest release has an installer");
     let get = |u: &str| {
         let out = std::process::Command::new("curl")
-            .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--url", u])
+            .args([
+                "-fsSL",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "--url",
+                u,
+            ])
             .output()
             .unwrap();
         String::from_utf8(out.stdout).unwrap()
