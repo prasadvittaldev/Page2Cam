@@ -34,6 +34,36 @@ pub struct BrowserConfig {
     /// screen capture, fills the page). Shared with the caller, so it can be
     /// set before the browser exists; [`BrowserHandle::set_paused`] sets it too.
     pub paused: Arc<AtomicBool>,
+    /// A second, transparent browser in the same CEF instance (overlay
+    /// layers). Reached through [`BrowserHandle::overlay`].
+    pub overlay: Option<OverlayBrowser>,
+}
+
+/// The transparent overlay browser: its background is fully transparent, so
+/// its frames carry premultiplied alpha (0 where nothing is drawn). It
+/// renders at the page's configured size (never resized) on the same GPU.
+#[derive(Clone)]
+pub struct OverlayBrowser {
+    pub url: String,
+    /// CPU paints go here (CPU path, and after a CPU fallback).
+    pub slot: FrameSlot,
+    pub fps: u32,
+    /// Where its sound goes (48 kHz stereo); `None` plays to the speakers.
+    pub audio: Option<AudioRing>,
+    /// GPU path: shared textures (only used when the page is on the GPU).
+    pub on_texture: Option<Arc<dyn Fn(isize, u32, u32) -> bool + Send + Sync>>,
+    /// Paints are dropped while set (nothing visible: no overlay pass).
+    pub paused: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for OverlayBrowser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OverlayBrowser")
+            .field("url", &self.url)
+            .field("fps", &self.fps)
+            .field("gpu", &self.on_texture.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Chromium on a chosen GPU, delivering shared textures.
@@ -120,21 +150,40 @@ enum Cmd {
     Repaint,
     RecreateCpu,
     SetFrameRate(u32),
+    /// The new size is already in the shared size cell.
+    SetSize,
     Shutdown,
+}
+
+/// Which browser a command is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    Page,
+    Overlay,
 }
 
 /// Thread-safe control handle; commands run on the CEF main thread.
 /// Coordinates are page pixels.
 #[derive(Clone)]
 pub struct BrowserHandle {
-    tx: Sender<Cmd>,
+    tx: Sender<(Target, Cmd)>,
+    target: Target,
     url: Arc<Mutex<String>>,
     paused: Arc<AtomicBool>,
+    size: Arc<Mutex<(u32, u32)>>,
+    overlay: Option<Arc<BrowserHandle>>,
 }
 
 impl BrowserHandle {
     fn send(&self, c: Cmd) {
-        let _ = self.tx.send(c);
+        let _ = self.tx.send((self.target, c));
+    }
+
+    /// The transparent overlay browser's handle (`None` unless
+    /// [`BrowserConfig::overlay`] was set). Its `shutdown` and
+    /// `recreate_cpu` act on both browsers.
+    pub fn overlay(&self) -> Option<BrowserHandle> {
+        self.overlay.as_deref().cloned()
     }
 
     pub fn navigate(&self, url: &str) {
@@ -189,13 +238,11 @@ impl BrowserHandle {
         self.url.lock().clone()
     }
 
+    /// Close the browser(s) and leave [`run`].
     pub fn shutdown(&self) {
         self.send(Cmd::Shutdown);
     }
 
-    /// CPU fallback without re-initialising CEF: replace the browser with one
-    /// that paints into the `FrameSlot` (`shared_texture_enabled = 0`), on the
-    /// current URL. Does nothing if the browser already paints on the CPU.
     /// Make Chromium paint the whole page again, even if nothing changed
     /// (e.g. a static page whose frames went to a device that couldn't
     /// open them).
@@ -203,6 +250,10 @@ impl BrowserHandle {
         self.send(Cmd::Repaint);
     }
 
+    /// CPU fallback without re-initialising CEF: replace every browser that
+    /// hands over shared textures with one that paints into its `FrameSlot`
+    /// (`shared_texture_enabled = 0`), on its current URL, frame rate and
+    /// size. Does nothing for a browser that already paints on the CPU.
     pub fn recreate_cpu(&self) {
         self.send(Cmd::RecreateCpu);
     }
@@ -215,10 +266,29 @@ impl BrowserHandle {
         }
     }
 
+    /// Whether paints are being dropped ([`BrowserHandle::set_paused`]).
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
     /// Change how often Chromium paints the page (frames per second, at
     /// least 1); also kept for a browser recreated later.
     pub fn set_frame_rate(&self, fps: u32) {
         self.send(Cmd::SetFrameRate(fps.max(1)));
+    }
+
+    /// Render the page at `w` x `h` view pixels (at least 16 x 16; the
+    /// compositors scale it to the output). Also kept for a browser
+    /// recreated later. Input coordinates are in this size from then on.
+    pub fn set_size(&self, w: u32, h: u32) {
+        let s = (w.max(16), h.max(16));
+        *self.size.lock() = s;
+        self.send(Cmd::SetSize);
+    }
+
+    /// The view size the page renders at (see [`BrowserHandle::set_size`]).
+    pub fn size(&self) -> (u32, u32) {
+        *self.size.lock()
     }
 }
 
@@ -242,9 +312,165 @@ pub fn maybe_run_subprocess() -> Option<i32> {
     ))
 }
 
-/// Start CEF, create one off-screen browser and pump its message loop on the
-/// calling thread until [`BrowserHandle::shutdown`]. Every painted view frame
-/// (always the full buffer) is put into `slot`.
+/// What one browser is made from (kept to recreate it).
+struct Spec {
+    slot: FrameSlot,
+    audio: Option<AudioRing>,
+    on_texture: Option<handlers::TextureFn>,
+    paused: Arc<AtomicBool>,
+    url: Arc<Mutex<String>>,
+    size: Arc<Mutex<(u32, u32)>>,
+    /// Transparent background (the overlay browser).
+    transparent: bool,
+}
+
+/// A live browser and its state.
+struct Live {
+    spec: Spec,
+    browser: cef::Browser,
+    closed: Arc<AtomicBool>,
+    on_gpu: bool,
+    fps: u32,
+}
+
+/// Create a windowless browser for `spec` at `at` (shared textures when
+/// `gpu` and the spec has a texture callback).
+fn create(spec: &Spec, gpu: bool, at: &str, fps: u32) -> Option<(cef::Browser, Arc<AtomicBool>)> {
+    let gpu = gpu && spec.on_texture.is_some();
+    // Each browser has its own `closed` flag, so closing a replaced
+    // browser doesn't end the pump loop.
+    let closed = Arc::new(AtomicBool::new(false));
+    let mut client = handlers::client(handlers::ClientParts {
+        slot: spec.slot.clone(),
+        size: spec.size.clone(),
+        closed: closed.clone(),
+        url: spec.url.clone(),
+        audio: spec.audio.clone(),
+        on_texture: if gpu { spec.on_texture.clone() } else { None },
+        paused: spec.paused.clone(),
+    });
+    let window_info = cef::WindowInfo {
+        windowless_rendering_enabled: 1,
+        shared_texture_enabled: gpu as _,
+        ..Default::default()
+    };
+    let mut browser_settings = cef::BrowserSettings {
+        windowless_frame_rate: fps as _,
+        ..Default::default()
+    };
+    if spec.transparent {
+        // ARGB 0: a fully transparent background (frames carry alpha).
+        browser_settings.background_color = 0;
+    }
+    cef::browser_host_create_browser_sync(
+        Some(&window_info),
+        Some(&mut client),
+        Some(&CefString::from(at)),
+        Some(&browser_settings),
+        None,
+        None,
+    )
+    .map(|b| (b, closed))
+}
+
+impl Live {
+    fn host(&self) -> Option<cef::BrowserHost> {
+        self.browser.host()
+    }
+
+    /// Replace a shared-texture browser with a CPU-painting one (same URL,
+    /// frame rate and size). New browser first: if it can't be made, keep
+    /// the old one.
+    fn recreate_cpu(&mut self, what: &str) {
+        if !self.on_gpu {
+            return;
+        }
+        let at = self.spec.url.lock().clone();
+        match create(&self.spec, false, &at, self.fps) {
+            Some((b, c)) => {
+                if let Some(host) = self.host() {
+                    host.close_browser(1);
+                }
+                self.browser = b;
+                self.closed = c;
+                self.on_gpu = false;
+                tracing::info!(url = %at, "{what} browser recreated with CPU paints");
+            }
+            None => tracing::error!("could not recreate the {what} browser with CPU paints"),
+        }
+    }
+
+    fn apply(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Navigate(url) => {
+                if let Some(frame) = self.browser.main_frame() {
+                    frame.load_url(Some(&CefString::from(url.as_str())));
+                }
+            }
+            Cmd::Back => self.browser.go_back(),
+            Cmd::Forward => self.browser.go_forward(),
+            Cmd::Reload => self.browser.reload(),
+            Cmd::MouseMove { x, y, mods } => {
+                if let Some(host) = self.host() {
+                    host.send_mouse_move_event(Some(&mouse(x, y, mods)), 0);
+                }
+            }
+            Cmd::MouseButton {
+                x,
+                y,
+                button,
+                down,
+                clicks,
+                mods,
+            } => {
+                if let Some(host) = self.host() {
+                    host.set_focus(1);
+                    let b = match button {
+                        MouseButton::Left => cef::MouseButtonType::LEFT,
+                        MouseButton::Middle => cef::MouseButtonType::MIDDLE,
+                        MouseButton::Right => cef::MouseButtonType::RIGHT,
+                    };
+                    host.send_mouse_click_event(Some(&mouse(x, y, mods)), b, (!down) as _, clicks);
+                }
+            }
+            Cmd::Wheel { x, y, dx, dy, mods } => {
+                if let Some(host) = self.host() {
+                    host.send_mouse_wheel_event(Some(&mouse(x, y, mods)), dx, dy);
+                }
+            }
+            Cmd::Key(k) => {
+                if let Some(host) = self.host() {
+                    host.send_key_event(Some(&key_event(k)));
+                }
+            }
+            Cmd::Repaint => {
+                if let Some(host) = self.host() {
+                    host.invalidate(cef::PaintElementType::default()); // the view
+                }
+            }
+            Cmd::SetFrameRate(f) => {
+                self.fps = f;
+                if let Some(host) = self.host() {
+                    host.set_windowless_frame_rate(f as _);
+                }
+            }
+            Cmd::SetSize => {
+                // The size is already in `spec.size` (view_rect reads it).
+                if let Some(host) = self.host() {
+                    host.was_resized();
+                    host.invalidate(cef::PaintElementType::default());
+                }
+            }
+            // Handled by the pump loop.
+            Cmd::RecreateCpu | Cmd::Shutdown => {}
+        }
+    }
+}
+
+/// Start CEF, create the off-screen browser (and the overlay browser, if
+/// configured) and pump the message loop on the calling thread until
+/// [`BrowserHandle::shutdown`]. Every painted view frame (always the full
+/// buffer) is put into `slot`.
 pub fn run(
     cfg: BrowserConfig,
     slot: FrameSlot,
@@ -284,154 +510,134 @@ pub fn run(
         "CEF failed to initialize (is CEF_PATH/LD_LIBRARY_PATH set and the CEF version matching?)"
     );
 
-    let url = Arc::new(Mutex::new(cfg.url.clone()));
-    let paused = cfg.paused.clone();
-    let create = |gpu: Option<&GpuPage>, at: &str, fps: u32| {
-        // Each browser has its own `closed` flag, so closing a replaced
-        // browser doesn't end the pump loop.
-        let closed = Arc::new(AtomicBool::new(false));
-        let mut client = handlers::client(handlers::ClientParts {
-            slot: slot.clone(),
-            width: cfg.width,
-            height: cfg.height,
-            closed: closed.clone(),
-            url: url.clone(),
-            audio: cfg.audio.clone(),
-            on_texture: gpu.map(|g| g.on_texture.clone()),
-            paused: paused.clone(),
-        });
-        let window_info = cef::WindowInfo {
-            windowless_rendering_enabled: 1,
-            shared_texture_enabled: gpu.is_some() as _,
-            ..Default::default()
-        };
-        let browser_settings = cef::BrowserSettings {
-            windowless_frame_rate: fps as _,
-            ..Default::default()
-        };
-        cef::browser_host_create_browser_sync(
-            Some(&window_info),
-            Some(&mut client),
-            Some(&CefString::from(at)),
-            Some(&browser_settings),
-            None,
-            None,
-        )
-        .map(|b| (b, closed))
+    let on_gpu = gpu_page.is_some();
+    let page_spec = Spec {
+        slot: slot.clone(),
+        audio: cfg.audio.clone(),
+        on_texture: gpu_page.as_ref().map(|g| g.on_texture.clone()),
+        paused: cfg.paused.clone(),
+        url: Arc::new(Mutex::new(cfg.url.clone())),
+        size: Arc::new(Mutex::new((cfg.width, cfg.height))),
+        transparent: false,
     };
-    let Some((mut browser, mut closed)) = create(gpu_page.as_ref(), &cfg.url, cfg.fps) else {
+    let Some((browser, closed)) = create(&page_spec, on_gpu, &cfg.url, cfg.fps) else {
         cef::shutdown();
         anyhow::bail!("CEF failed to create the browser");
     };
-    let mut on_gpu = gpu_page.is_some();
-    let mut fps = cfg.fps;
+    let mut page = Live {
+        spec: page_spec,
+        browser,
+        closed,
+        on_gpu,
+        fps: cfg.fps,
+    };
+    // The overlay browser: same size, transparent; a failure leaves the
+    // page running without overlays.
+    let mut overlay = cfg.overlay.as_ref().and_then(|o| {
+        let spec = Spec {
+            slot: o.slot.clone(),
+            audio: o.audio.clone(),
+            on_texture: o.on_texture.clone(),
+            paused: o.paused.clone(),
+            url: Arc::new(Mutex::new(o.url.clone())),
+            size: Arc::new(Mutex::new((cfg.width, cfg.height))),
+            transparent: true,
+        };
+        let gpu = on_gpu && spec.on_texture.is_some();
+        match create(&spec, gpu, &o.url, o.fps) {
+            Some((browser, closed)) => Some(Live {
+                spec,
+                browser,
+                closed,
+                on_gpu: gpu,
+                fps: o.fps,
+            }),
+            None => {
+                tracing::error!("CEF failed to create the overlay browser; no overlay layers");
+                None
+            }
+        }
+    });
 
-    let (tx, rx): (Sender<Cmd>, Receiver<Cmd>) = mpsc::channel();
+    let (tx, rx): (Sender<(Target, Cmd)>, Receiver<(Target, Cmd)>) = mpsc::channel();
+    let overlay_handle = overlay.as_ref().map(|o| {
+        Arc::new(BrowserHandle {
+            tx: tx.clone(),
+            target: Target::Overlay,
+            url: o.spec.url.clone(),
+            paused: o.spec.paused.clone(),
+            size: o.spec.size.clone(),
+            overlay: None,
+        })
+    });
     ready(BrowserHandle {
         tx,
-        url: url.clone(),
-        paused: paused.clone(),
+        target: Target::Page,
+        url: page.spec.url.clone(),
+        paused: page.spec.paused.clone(),
+        size: page.spec.size.clone(),
+        overlay: overlay_handle,
     });
 
     // Pump CEF from this thread; poll commands between pumps.
     let mut closing_since: Option<Instant> = None;
     loop {
         cef::do_message_loop_work();
-        while let Ok(cmd) = rx.try_recv() {
+        while let Ok((target, cmd)) = rx.try_recv() {
             match cmd {
-                Cmd::Navigate(url) => {
-                    if let Some(frame) = browser.main_frame() {
-                        frame.load_url(Some(&CefString::from(url.as_str())));
-                    }
-                }
-                Cmd::Back => browser.go_back(),
-                Cmd::Forward => browser.go_forward(),
-                Cmd::Reload => browser.reload(),
-                Cmd::MouseMove { x, y, mods } => {
-                    if let Some(host) = browser.host() {
-                        host.send_mouse_move_event(Some(&mouse(x, y, mods)), 0);
-                    }
-                }
-                Cmd::MouseButton {
-                    x,
-                    y,
-                    button,
-                    down,
-                    clicks,
-                    mods,
-                } => {
-                    if let Some(host) = browser.host() {
-                        host.set_focus(1);
-                        let b = match button {
-                            MouseButton::Left => cef::MouseButtonType::LEFT,
-                            MouseButton::Middle => cef::MouseButtonType::MIDDLE,
-                            MouseButton::Right => cef::MouseButtonType::RIGHT,
-                        };
-                        host.send_mouse_click_event(
-                            Some(&mouse(x, y, mods)),
-                            b,
-                            (!down) as _,
-                            clicks,
-                        );
-                    }
-                }
-                Cmd::Wheel { x, y, dx, dy, mods } => {
-                    if let Some(host) = browser.host() {
-                        host.send_mouse_wheel_event(Some(&mouse(x, y, mods)), dx, dy);
-                    }
-                }
-                Cmd::Key(k) => {
-                    if let Some(host) = browser.host() {
-                        host.send_key_event(Some(&key_event(k)));
-                    }
-                }
-                Cmd::Repaint => {
-                    if let Some(host) = browser.host() {
-                        host.invalidate(cef::PaintElementType::default()); // the view
-                    }
-                }
-                Cmd::RecreateCpu if on_gpu && closing_since.is_none() => {
-                    // New browser first: if it can't be made, keep the old one.
-                    let at = url.lock().clone();
-                    match create(None, &at, fps) {
-                        Some((b, c)) => {
-                            if let Some(host) = browser.host() {
-                                host.close_browser(1);
-                            }
-                            browser = b;
-                            closed = c;
-                            on_gpu = false;
-                            tracing::info!(url = %at, "browser recreated with CPU paints");
-                        }
-                        None => tracing::error!("could not recreate the browser with CPU paints"),
+                Cmd::RecreateCpu if closing_since.is_none() => {
+                    page.recreate_cpu("page");
+                    if let Some(o) = &mut overlay {
+                        o.recreate_cpu("overlay");
                     }
                 }
                 Cmd::RecreateCpu => {}
-                Cmd::SetFrameRate(f) => {
-                    fps = f;
-                    if let Some(host) = browser.host() {
-                        host.set_windowless_frame_rate(f as _);
-                    }
-                }
                 Cmd::Shutdown if closing_since.is_none() => {
-                    if let Some(host) = browser.host() {
-                        host.close_browser(1);
+                    for l in std::iter::once(&page).chain(overlay.as_ref()) {
+                        if let Some(host) = l.host() {
+                            host.close_browser(1);
+                        }
                     }
                     closing_since = Some(Instant::now());
                 }
                 Cmd::Shutdown => {}
+                cmd => match (target, &mut overlay) {
+                    (Target::Page, _) => page.apply(cmd),
+                    (Target::Overlay, Some(o)) => o.apply(cmd),
+                    (Target::Overlay, None) => {}
+                },
             }
         }
-        if should_exit(closed.load(Ordering::SeqCst), closing_since, Instant::now()) {
-            if !closed.load(Ordering::SeqCst) {
+        if should_exit(
+            page.closed.load(Ordering::SeqCst),
+            closing_since,
+            Instant::now(),
+        ) {
+            if !page.closed.load(Ordering::SeqCst) {
                 tracing::warn!("browser did not close within 3 s; shutting down anyway");
             }
             break;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    drop(browser);
-    // Let CEF release the closed browser before shutting down.
+    // The page closed by itself: close the overlay too, and give it up to 1 s.
+    if let Some(o) = &overlay {
+        if !o.closed.load(Ordering::SeqCst) {
+            if closing_since.is_none() {
+                if let Some(host) = o.host() {
+                    host.close_browser(1);
+                }
+            }
+            let t = Instant::now();
+            while !o.closed.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(1) {
+                cef::do_message_loop_work();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+    drop(page);
+    drop(overlay);
+    // Let CEF release the closed browsers before shutting down.
     for _ in 0..10 {
         cef::do_message_loop_work();
     }

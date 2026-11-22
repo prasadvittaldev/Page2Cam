@@ -49,8 +49,8 @@ fn shared_texture(_info: &AcceleratedPaintInfo) -> Option<(isize, u32, u32)> {
 wrap_render_handler! {
     struct P2cRenderHandler {
         slot: FrameSlot,
-        width: u32,
-        height: u32,
+        // The view size (changed by `BrowserHandle::set_size`).
+        size: Arc<Mutex<(u32, u32)>>,
         // GPU path: receives `on_accelerated_paint` textures.
         on_texture: Option<TextureFn>,
         // Set while another source (screen capture) fills the page: paints
@@ -63,8 +63,9 @@ wrap_render_handler! {
             if let Some(rect) = rect {
                 rect.x = 0;
                 rect.y = 0;
-                rect.width = self.width as _;
-                rect.height = self.height as _;
+                let (w, h) = *self.size.lock();
+                rect.width = w as _;
+                rect.height = h as _;
             }
         }
 
@@ -235,8 +236,7 @@ wrap_client! {
 
 pub(crate) struct ClientParts {
     pub slot: FrameSlot,
-    pub width: u32,
-    pub height: u32,
+    pub size: Arc<Mutex<(u32, u32)>>,
     pub closed: Arc<AtomicBool>,
     pub url: Arc<Mutex<String>>,
     pub audio: Option<AudioRing>,
@@ -246,7 +246,7 @@ pub(crate) struct ClientParts {
 
 pub(crate) fn client(p: ClientParts) -> Client {
     P2cClient::new(
-        P2cRenderHandler::new(p.slot, p.width, p.height, p.on_texture, p.paused),
+        P2cRenderHandler::new(p.slot, p.size, p.on_texture, p.paused),
         P2cLifeSpan::new(p.closed),
         P2cDisplay::new(p.url),
         p.audio

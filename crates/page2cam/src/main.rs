@@ -807,6 +807,7 @@ fn run() -> anyhow::Result<i32> {
             // Built from a LUID enumerated again just now (R7).
             gpu_page: gpu_page(gpu_video.as_ref(), &fallback),
             paused: app.page_paused.clone(),
+            overlay: None,
         };
         let watch = browser_cfg
             .gpu_page
