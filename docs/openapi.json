@@ -3,7 +3,7 @@
   "info": {
     "title": "Page2Cam local admin API",
     "version": "0.5.0",
-    "description": "The engine's control routes on http://127.0.0.1:<port>. Every request needs Host: 127.0.0.1:<port> (or localhost:<port>) and the per-launch token in X-P2C-Token (or ?t=). Bodies are JSON unless stated; at most 2 MB (pictures 20 MB). Errors: 4xx/5xx with {\"error\": \"…\"} or plain text."
+    "description": "The engine's control routes on http://127.0.0.1:<port>. Every request needs Host: 127.0.0.1:<port> (or localhost:<port>) and the per-launch token in X-P2C-Token (or ?t=). Bodies are JSON unless stated; at most 2 MB (pictures 20 MB, overlay files 200 MB). Errors: 4xx/5xx with {\"error\": \"…\"} or plain text."
   },
   "servers": [{ "url": "http://127.0.0.1:{port}", "variables": { "port": { "default": "8765" } } }],
   "security": [{ "token": [] }],
@@ -55,6 +55,33 @@
           "box_image": { "type": "boolean", "readOnly": true }
         }
       },
+      "Layer": {
+        "type": "object",
+        "description": "One overlay layer, drawn over everything. Flat: the common fields plus those of its kind. Geometry is 0..1 of the output (x, y = top-left corner). In POST bodies every field except kind (when adding) is optional; image and video take path (a local file, copied once) or data_base64 (pictures); youtube takes link.",
+        "properties": {
+          "id": { "type": "string", "maxLength": 40, "description": "a-z0-9- (a given id is sanitised; else made from name or kind, e.g. title-1)" },
+          "kind": { "type": "string", "enum": ["title", "ticker", "html", "image", "video", "youtube"] },
+          "name": { "type": "string", "maxLength": 80 },
+          "x": { "type": "number", "minimum": 0, "maximum": 1 }, "y": { "type": "number", "minimum": 0, "maximum": 1 },
+          "w": { "type": "number", "minimum": 0.01, "maximum": 1 }, "h": { "type": "number", "minimum": 0.01, "maximum": 1 },
+          "z": { "type": "integer", "minimum": -1000, "maximum": 1000, "description": "Stacking order, higher in front" },
+          "visible": { "type": "boolean" }, "opacity": { "type": "number", "minimum": 0, "maximum": 1 },
+          "enter": { "type": "string", "enum": ["none", "fade", "slide-left", "slide-right", "slide-up", "slide-down"] },
+          "exit": { "type": "string", "enum": ["none", "fade", "slide-left", "slide-right", "slide-up", "slide-down"] },
+          "hide_after_s": { "type": "integer", "minimum": 1, "maximum": 3600, "nullable": true },
+          "text": { "type": "string", "maxLength": 500, "description": "title" }, "subtitle": { "type": "string", "maxLength": 500, "description": "title" },
+          "style": { "type": "string", "enum": ["news", "minimal", "brand"], "description": "title, ticker" },
+          "colour": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$", "nullable": true }, "background": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$", "nullable": true },
+          "items": { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 500 }, "description": "ticker" },
+          "speed": { "type": "integer", "minimum": 10, "maximum": 1000, "description": "ticker: px/s at 1920 wide" },
+          "html": { "type": "string", "maxLength": 262144, "description": "html: a fragment run in a sandboxed frame" },
+          "asset": { "type": "string", "readOnly": true, "description": "image, video: the stored copy" },
+          "url": { "type": "string", "description": "video: an http(s) address" },
+          "video": { "type": "string", "readOnly": true, "description": "youtube: the video id (give link)" },
+          "link": { "type": "string", "writeOnly": true }, "path": { "type": "string", "writeOnly": true }, "data_base64": { "type": "string", "writeOnly": true },
+          "start_s": { "type": "integer", "minimum": 0 }, "loop": { "type": "boolean" }, "muted": { "type": "boolean" }
+        }
+      },
       "Input": {
         "type": "object",
         "required": ["kind"],
@@ -101,6 +128,17 @@
     "/api/agents": {
       "get": { "summary": "Agents panel data (from the tray)", "responses": { "200": { "description": "{allowed, url, registered, activity, snippets}" }, "503": { "description": "No tray (standalone)" } } },
       "post": { "summary": "Switch agents on/off or reset their token", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "allowed": { "type": "boolean" }, "reset_token": { "type": "boolean" } } } } } }, "responses": { "200": { "description": "As GET" } } }
-    }
+    },
+    "/api/layers": {
+      "get": { "summary": "Overlay layers, back to front, and the choices", "responses": { "200": { "description": "{layers: [Layer], kinds, presets, anims}" } } },
+      "post": { "summary": "Add an overlay layer (shown at once unless visible is false)", "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Layer" } } } }, "responses": { "200": { "description": "The new Layer, with its id" }, "400": { "description": "{error}: why (nothing changed)" } } }
+    },
+    "/api/layers/{id}": {
+      "post": { "summary": "Change some fields of a layer (partial; visible: true shows it and restarts its auto-hide; null clears hide_after_s, colour, background)", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Layer" } } } }, "responses": { "200": { "description": "The Layer as changed" }, "400": { "description": "{error}: why (nothing changed)" } } },
+      "delete": { "summary": "Delete a layer and its stored file", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "{removed}" }, "400": { "description": "{error}: no such layer" } } }
+    },
+    "/api/layers/{id}/asset": { "post": { "summary": "Upload a new picture (PNG/JPEG/WebP/GIF) or video (MP4/WebM) for an image or video layer (raw body, at most 200 MB)", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "requestBody": { "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } }, "responses": { "200": { "description": "The Layer" }, "400": { "description": "{error}" }, "413": { "description": "Larger than 200 MB" }, "415": { "description": "Not a supported picture or video" } } } },
+    "/api/layers/clear": { "post": { "summary": "Hide every overlay layer", "responses": { "200": { "description": "{hidden: n}" } } } },
+    "/api/layers/order": { "post": { "summary": "Restack layers: ids back to front (unlisted ones stay behind)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "required": ["ids"], "properties": { "ids": { "type": "array", "items": { "type": "string" } } } } } } }, "responses": { "200": { "description": "{layers}" }, "400": { "description": "{error}: unknown or repeated id" } } } }
   }
 }
