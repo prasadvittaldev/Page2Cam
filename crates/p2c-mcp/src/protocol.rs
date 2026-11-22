@@ -236,7 +236,16 @@ mod tests {
             "set_background",
             "upload_background_image",
             "list_screens",
+            "list_layers",
+            "add_layer",
+            "update_layer",
+            "show_layer",
+            "hide_layer",
+            "remove_layer",
+            "clear_layers",
+            "reorder_layers",
         ];
+        assert_eq!(want.len(), 37);
         let mut names = tool_names();
         names.sort();
         let mut w: Vec<String> = want.iter().map(|s| s.to_string()).collect();
@@ -249,7 +258,7 @@ mod tests {
             )
             .unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 29);
+        assert_eq!(tools.len(), 37);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert!(
@@ -539,6 +548,96 @@ mod tests {
             assert_eq!(r["result"]["isError"], true, "{name}: {r}");
             assert!(s.backend().calls.borrow().is_empty(), "{name}");
         }
+    }
+
+    #[test]
+    fn layer_tools_validate() {
+        let cases: Vec<(&str, Value)> = vec![
+            ("add_layer", json!({ "text": "x" })),
+            ("add_layer", json!({ "kind": "clock" })),
+            ("add_layer", json!({ "kind": "title", "text": "x", "x": 1.5 })),
+            ("add_layer", json!({ "kind": "title", "text": "x", "w": 0 })),
+            ("add_layer", json!({ "kind": "title", "text": "x", "z": 0.5 })),
+            ("add_layer", json!({ "kind": "title", "text": "x", "style": "fancy" })),
+            ("add_layer", json!({ "kind": "title", "text": "x", "enter": "spin" })),
+            ("add_layer", json!({ "kind": "title", "text": "x", "colour": "red" })),
+            ("add_layer", json!({ "kind": "title", "text": "x".repeat(501) })),
+            ("add_layer", json!({ "kind": "title", "text": "x", "hide_after_s": 0 })),
+            ("add_layer", json!({ "kind": "title", "text": "x", "font": "Arial" })),
+            ("add_layer", json!({ "kind": "ticker", "items": [] })),
+            ("add_layer", json!({ "kind": "ticker", "items": [1, 2] })),
+            ("add_layer", json!({ "kind": "html", "html": "x".repeat(256 * 1024 + 1) })),
+            ("add_layer", json!({ "kind": "html", "html": " " })),
+            ("add_layer", json!({ "kind": "image", "path": "\\\\evil\\s\\a.png" })),
+            ("add_layer", json!({ "kind": "image", "path": "C:/a.png", "data_base64": "AAAA" })),
+            ("add_layer", json!({ "kind": "image", "data_base64": "!!!" })),
+            ("add_layer", json!({ "kind": "video", "url": "file:///C:/a.mp4" })),
+            ("add_layer", json!({ "kind": "youtube", "link": " " })),
+            ("update_layer", json!({ "id": "t" })),
+            ("update_layer", json!({ "x": 0.1 })),
+            ("update_layer", json!({ "id": "t", "kind": "ticker" })),
+            ("show_layer", json!({})),
+            ("hide_layer", json!({ "id": "" })),
+            ("show_layer", json!({ "id": "../quit" })),
+            ("remove_layer", json!({ "id": "t", "x": 1 })),
+            ("reorder_layers", json!({ "ids": [] })),
+            ("reorder_layers", json!({ "ids": "a,b" })),
+            ("clear_layers", json!({ "all": true })),
+        ];
+        for (name, args) in cases {
+            let s = server();
+            let r = call(&s, name, args.clone());
+            assert_eq!(r["result"]["isError"], true, "{name} {args}: {r}");
+            assert!(s.backend().calls.borrow().is_empty(), "{name} {args}");
+        }
+    }
+
+    #[test]
+    fn layer_tools_build_engine_calls() {
+        let s = server();
+        let r = call(
+            &s,
+            "add_layer",
+            json!({ "kind": "title", "text": "Guest", "subtitle": "CTO", "style": "brand",
+                "colour": "#FFFFFF", "enter": "slide-left", "hide_after_s": 10 }),
+        );
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let r = call(
+            &s,
+            "update_layer",
+            json!({ "id": "title-1", "x": 0.1, "colour": null, "hide_after_s": null }),
+        );
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        call(&s, "show_layer", json!({ "id": "title-1" }));
+        call(&s, "reorder_layers", json!({ "ids": ["a", "title-1"] }));
+        call(&s, "list_layers", json!({}));
+        let calls = s.backend().calls.borrow();
+        let (agent_calls, reqs): (Vec<_>, Vec<_>) = calls.iter().cloned().unzip();
+        assert_eq!(agent_calls.len(), 5);
+        match &reqs[0] {
+            BackendCall::AddLayer(v) => {
+                assert_eq!(v["kind"], "title");
+                assert_eq!(v["colour"], "#ffffff");
+                assert_eq!(v["enter"], "slide-left");
+                assert_eq!(v["hide_after_s"], 10);
+                assert!(reqs[0].changes());
+                assert_eq!(reqs[0].summary(), "add title layer");
+            }
+            c => panic!("{c:?}"),
+        }
+        match &reqs[1] {
+            BackendCall::UpdateLayer { id, patch } => {
+                assert_eq!(id, "title-1");
+                assert_eq!(patch, &json!({ "x": 0.1, "colour": null, "hide_after_s": null }));
+            }
+            c => panic!("{c:?}"),
+        }
+        assert_eq!(reqs[2], BackendCall::ShowLayer("title-1".into()));
+        assert_eq!(
+            reqs[3],
+            BackendCall::ReorderLayers(vec!["a".into(), "title-1".into()])
+        );
+        assert!(!reqs[4].changes());
     }
 
     #[test]

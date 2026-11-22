@@ -324,8 +324,64 @@ impl TrayBackend {
                     serde_json::from_slice(&out).unwrap_or(Value::Null),
                 ))
             }
+            C::ListLayers => {
+                let v = self.get("/api/layers")?;
+                Ok(BackendReply::Json(layers_out(&v["layers"])))
+            }
+            // Media may be copied (videos up to 200 MB): the slow timeout.
+            C::AddLayer(body) => self
+                .json("POST", "/api/layers", Some(body), SLOW_TIMEOUT)
+                .map(|l| BackendReply::Json(layer_out(&l))),
+            // Partial: the engine merges it into the layer.
+            C::UpdateLayer { id, patch } => self
+                .json("POST", &format!("/api/layers/{id}"), Some(patch), SLOW_TIMEOUT)
+                .map(|l| BackendReply::Json(layer_out(&l))),
+            C::ShowLayer(id) | C::HideLayer(id) => {
+                let visible = matches!(call, C::ShowLayer(_));
+                self.post(&format!("/api/layers/{id}"), &json!({ "visible": visible }))?;
+                Ok(BackendReply::Done(format!(
+                    "layer {id} {}",
+                    if visible { "shown" } else { "hidden" }
+                )))
+            }
+            C::RemoveLayer(id) => {
+                self.json("DELETE", &format!("/api/layers/{id}"), None, ENGINE_TIMEOUT)?;
+                Ok(BackendReply::Done(format!("layer {id} removed")))
+            }
+            C::ClearLayers => {
+                let v = self.post("/api/layers/clear", &json!({}))?;
+                Ok(BackendReply::Done(format!(
+                    "{} layer(s) hidden",
+                    v["hidden"].as_u64().unwrap_or(0)
+                )))
+            }
+            C::ReorderLayers(ids) => {
+                let v = self.post("/api/layers/order", &json!({ "ids": ids }))?;
+                Ok(BackendReply::Json(layers_out(&v["layers"])))
+            }
         }
     }
+}
+
+/// One layer as agents see it: its fields without the bulky HTML, with a
+/// short summary of the content.
+fn layer_out(l: &Value) -> Value {
+    let mut v = l.clone();
+    if let Some(m) = v.as_object_mut() {
+        if let Some(h) = m.remove("html") {
+            let n = h.as_str().map_or(0, str::len);
+            m.insert("html_bytes".into(), n.into());
+        }
+    }
+    v
+}
+
+fn layers_out(list: &Value) -> Value {
+    let layers: Vec<Value> = list
+        .as_array()
+        .map(|a| a.iter().map(layer_out).collect())
+        .unwrap_or_default();
+    json!({ "layers": layers })
 }
 
 /// The overlay as agents see it (style names with `_`).
@@ -787,5 +843,84 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(e, "only PNG, JPEG and WebP images are accepted");
         assert_eq!(b.activity.lock().list()[0].result, e);
+    }
+
+    #[test]
+    fn layer_calls_reach_the_engine_without_balloons() {
+        let (port, log) = fake_engine(|m, p, _| match (m, p) {
+            ("GET", "/api/layers") => (
+                200,
+                br#"{"layers":[{"id":"chart","kind":"html","html":"<b>x</b>"}],"presets":[]}"#
+                    .to_vec(),
+            ),
+            ("POST", "/api/layers") => (200, br#"{"id":"title-1","kind":"title"}"#.to_vec()),
+            ("POST", "/api/layers/clear") => (200, br#"{"hidden":2}"#.to_vec()),
+            ("POST", "/api/layers/nope") => (400, br#"{"error":"no layer \"nope\""}"#.to_vec()),
+            _ => (200, br#"{"layers":[]}"#.to_vec()),
+        });
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "running".into();
+        *tray.engine.lock() = Some((port, "tok".into()));
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(tray.clone(), d.path());
+        match b.call("Claude", BackendCall::ListLayers).unwrap() {
+            BackendReply::Json(v) => {
+                assert!(v["layers"][0].get("html").is_none(), "{v}");
+                assert_eq!(v["layers"][0]["html_bytes"], 8);
+            }
+            r => panic!("{r:?}"),
+        }
+        b.call(
+            "Claude",
+            BackendCall::AddLayer(json!({ "kind": "title", "text": "Hi" })),
+        )
+        .unwrap();
+        b.call(
+            "Claude",
+            BackendCall::UpdateLayer {
+                id: "title-1".into(),
+                patch: json!({ "x": 0.2 }),
+            },
+        )
+        .unwrap();
+        b.call("Claude", BackendCall::HideLayer("title-1".into()))
+            .unwrap();
+        b.call("Claude", BackendCall::RemoveLayer("title-1".into()))
+            .unwrap();
+        match b.call("Claude", BackendCall::ClearLayers).unwrap() {
+            BackendReply::Done(t) => assert_eq!(t, "2 layer(s) hidden"),
+            r => panic!("{r:?}"),
+        }
+        b.call("Claude", BackendCall::ReorderLayers(vec!["a".into()]))
+            .unwrap();
+        let e = b
+            .call("Claude", BackendCall::ShowLayer("nope".into()))
+            .unwrap_err();
+        assert_eq!(e, "no layer \"nope\"");
+        let log = log.lock();
+        let seen: Vec<(String, String)> =
+            log.iter().map(|(m, p, _)| (m.clone(), p.clone())).collect();
+        let want = [
+            ("GET", "/api/layers"),
+            ("POST", "/api/layers"),
+            ("POST", "/api/layers/title-1"),
+            ("POST", "/api/layers/title-1"),
+            ("DELETE", "/api/layers/title-1"),
+            ("POST", "/api/layers/clear"),
+            ("POST", "/api/layers/order"),
+            ("POST", "/api/layers/nope"),
+        ];
+        let want: Vec<(String, String)> =
+            want.iter().map(|(m, p)| (m.to_string(), p.to_string())).collect();
+        assert_eq!(seen, want);
+        let body = |i: usize| -> Value { serde_json::from_slice(&log[i].2).unwrap() };
+        // The partial change goes as it is (the engine merges it).
+        assert_eq!(body(2), json!({ "x": 0.2 }));
+        assert_eq!(body(3), json!({ "visible": false }));
+        assert_eq!(body(6), json!({ "ids": ["a"] }));
+        assert_eq!(body(7), json!({ "visible": true }));
+        assert!(tray.balloons.lock().is_empty(), "no balloons for layers");
+        let acts = b.activity.lock().list();
+        assert_eq!(acts.len(), 7, "every change is listed, the list call is not");
     }
 }
