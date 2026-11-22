@@ -432,6 +432,8 @@ fn parity_case_tol(
             mask: mask.clone(),
             layout,
             backdrop: p2c_compositor::Backdrop::default(),
+            overlay_on: false,
+            overlay: None,
         };
         let got = p.render_bgra_for_test(&inputs).unwrap();
         let (d, x, y) = bgra_diff(&cpu, &got);
@@ -568,6 +570,8 @@ fn gpu_pip_layer_rebuilt_only_on_change() {
             mask: Some(mask.clone()),
             layout: layout(OverlayStyle::CutoutSmall, 0.3, 0.0, 0.4),
             backdrop: p2c_compositor::Backdrop::default(),
+            overlay_on: false,
+            overlay: None,
         };
         // The page changes every tick (animated page): one layer build.
         for _ in 0..5 {
@@ -616,6 +620,8 @@ fn gpu_pip_layer_rebuilt_only_on_change() {
                 mask: m.cloned(),
                 layout: l,
                 backdrop: p2c_compositor::Backdrop::default(),
+                overlay_on: false,
+                overlay: None,
             };
             let got = p.render_bgra_for_test(&inputs).unwrap();
             let mut cpu = Frame::new_black(640, 360);
@@ -693,6 +699,8 @@ fn gpu_no_page_yet_is_black_with_webcam() {
                 mask: None,
                 layout: l,
                 backdrop: p2c_compositor::Backdrop::default(),
+                overlay_on: false,
+                overlay: None,
             })
             .unwrap();
         let mut cpu = Frame::new_black(640, 360);
@@ -726,6 +734,8 @@ fn gpu_output_4k_camera_downscaled() {
             mask: None,
             layout: PipLayout::default(),
             backdrop: p2c_compositor::Backdrop::default(),
+            overlay_on: false,
+            overlay: None,
         };
         // The readback ring lags two frames; unchanged inputs drain it.
         let mut out = None;
@@ -764,6 +774,8 @@ fn gpu_producer_skips_unchanged_and_drains() {
             mask: None,
             layout: PipLayout::default(),
             backdrop: p2c_compositor::Backdrop::default(),
+            overlay_on: false,
+            overlay: None,
         };
         let outs: Vec<_> = (0..6).map(|_| p.produce(&inputs, false).unwrap()).collect();
         // Tick 0 renders (ring not filled yet), ticks 1-2 drain it, then nothing.
@@ -840,6 +852,8 @@ fn gpu_hidden_pip_skips_new_inputs_then_shows_them() {
             mask: Some(mask.clone()),
             layout,
             backdrop: p2c_compositor::Backdrop::default(),
+            overlay_on: false,
+            overlay: None,
         };
         // Hidden: one composite, drained out of the ring.
         let first = inputs(&cam_a, &mask_a, hidden);
@@ -928,6 +942,8 @@ fn bench_compose_1080p_cutout_full() {
                 mask: Some(masks[i % 4].clone()),
                 layout: l,
                 backdrop: p2c_compositor::Backdrop::default(),
+                overlay_on: false,
+                overlay: None,
             };
             let t = Instant::now();
             let out = p.produce(&inputs, false).unwrap();
@@ -1001,6 +1017,8 @@ fn bench_compose_gpu_passes_1080p() {
                     mask: Some(mask.clone()),
                     layout: l,
                     backdrop: p2c_compositor::Backdrop::default(),
+                    overlay_on: false,
+                    overlay: None,
                 };
                 p.produce(&inputs, i % 2 == 0).unwrap();
                 let Some(prof) = p.take_profile() else {
@@ -1065,6 +1083,8 @@ fn no_inputs() -> TickInputs {
         mask: None,
         layout: PipLayout::default(),
         backdrop: p2c_compositor::Backdrop::default(),
+        overlay_on: false,
+        overlay: None,
     }
 }
 
@@ -1171,6 +1191,7 @@ fn ticker_falls_back_to_cpu_after_second_device_loss() {
         None,
         Arc::new(parking_lot::RwLock::new(PipLayout::default())),
         Arc::default(),
+        None,
         Box::new(p),
         vec![Box::new(Rec(seen.clone()))],
         tx,
@@ -1260,6 +1281,7 @@ fn hung_rebuild_errors_within_a_second_and_ticker_falls_back() {
         None,
         Arc::new(parking_lot::RwLock::new(PipLayout::default())),
         Arc::default(),
+        None,
         Box::new(p),
         vec![Box::new(Count(n.clone()))],
         tx,
@@ -1389,6 +1411,8 @@ fn today_cases() -> Vec<TodayCase> {
         mask,
         layout: l,
         backdrop: Backdrop::default(),
+        overlay_on: false,
+        overlay: None,
     };
     let mut edge100 = Mask::new(40, 30, vec![100; 40 * 30]).unwrap();
     edge100.edge = EdgeRange { lo: 64, hi: 192 };
@@ -1754,6 +1778,8 @@ fn ti(cam: &Arc<Frame>, mask: Option<&Arc<Mask>>, l: PipLayout, b: Backdrop) -> 
         mask: mask.cloned(),
         layout: l,
         backdrop: b,
+        overlay_on: false,
+        overlay: None,
     }
 }
 
@@ -1839,6 +1865,8 @@ fn gpu_backdrop_matches_cpu() {
             mask: None,
             layout: small,
             backdrop: backdrop(FullBackdrop::BlurredRoom, BoxBackdrop::Blur, false),
+            overlay_on: false,
+            overlay: None,
         },
     ));
     // Cut-out styles ignore the box backdrop.
@@ -2133,6 +2161,8 @@ fn gpu_refined_and_blur_within_budget() {
                         mask: Some(masks[i % 4].clone()),
                         layout: *l,
                         backdrop: backdrop(*full, in_box.clone(), refined),
+                        overlay_on: false,
+                        overlay: None,
                     };
                     p.produce(&inputs, false).unwrap();
                     let Some(prof) = p.take_profile() else {
@@ -2270,6 +2300,7 @@ fn gpu_backdrop_shader_failure_hands_backdrops_to_cpu() {
                 Some(mask_slot),
                 Arc::new(parking_lot::RwLock::new(inputs.layout)),
                 Arc::new(parking_lot::RwLock::new(inputs.backdrop.clone())),
+                None,
                 Box::new(p),
                 vec![Box::new(Rec(seen.clone()))],
                 tx,
@@ -2454,5 +2485,120 @@ fn page_input_takes_cpu_frames() {
         assert_eq!(page.seq(), 2);
         assert_eq!(gpu.read_bgra(&page.texture()).unwrap().data, next.data);
         println!("page input takes CPU frames on {}", a.name);
+    }
+}
+
+/// A premultiplied overlay: transparent left half, a translucent band and
+/// an opaque block (like a lower third over a page).
+fn overlay_frame(w: u32, h: u32) -> Frame {
+    let mut data = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let px: [u8; 4] = if x < w / 2 {
+                [0, 0, 0, 0]
+            } else if y < h / 2 {
+                // 50 % white, premultiplied.
+                [128, 128, 128, 128]
+            } else {
+                [200, 30, 10, 255]
+            };
+            data[i..i + 4].copy_from_slice(&px);
+        }
+    }
+    Frame::from_bgra(w, h, data).unwrap()
+}
+
+fn overlay_inputs(on: bool, overlay: Option<Arc<Frame>>) -> TickInputs {
+    TickInputs {
+        page: None,
+        cam: None,
+        mask: None,
+        layout: PipLayout::default(),
+        backdrop: Backdrop::default(),
+        overlay_on: on,
+        overlay,
+    }
+}
+
+#[test]
+#[ignore]
+fn gpu_overlay_matches_cpu_and_follows_overlay_on() {
+    let (ow, oh) = (64, 36);
+    let page = gradient(ow, oh, 7);
+    let page_arc = Arc::new(page.clone());
+    for (label, ov, tol) in [
+        ("same size", overlay_frame(ow, oh), STRICT),
+        ("scaled up", overlay_frame(32, 18), SCALED_PIP),
+    ] {
+        let ov = Arc::new(ov);
+        let mut cpu = Frame::new_black(ow, oh);
+        Compositor::new().compose_with(
+            Some(&page_arc),
+            None,
+            &Backdrop::default(),
+            Some(&ov),
+            &mut cpu,
+        );
+        for a in adapters_or_skip("gpu_overlay_matches_cpu") {
+            let gpu = Gpu::new(a.luid).unwrap();
+            let overlay = PageInput::new(&gpu, ow, oh).unwrap();
+            overlay.upload_frame(&ov).unwrap();
+            let mut p = producer_with_page(&gpu, &page, spec(ow, oh)).with_overlay(overlay);
+            let got = p
+                .render_bgra_for_test(&overlay_inputs(true, Some(ov.clone())))
+                .unwrap();
+            let (d, x, y) = bgra_diff(&cpu, &got);
+            println!("overlay {label} on {}: max diff {d} at ({x},{y})", a.name);
+            assert!(d <= tol.max, "{label} on {}: diff {d} at ({x},{y})", a.name);
+            assert_opaque(&got, label);
+            // Off: exactly the page.
+            let off = p.render_bgra_for_test(&overlay_inputs(false, None)).unwrap();
+            let (d, _, _) = bgra_diff(&page, &off);
+            assert!(d <= STRICT.max, "{label} on {}: overlay off diff {d}", a.name);
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn gpu_overlay_pass_within_budget() {
+    let page = noise(1920, 1080, 5);
+    let ov = overlay_frame(1920, 1080);
+    for a in adapters_or_skip("gpu_overlay_pass_within_budget") {
+        let gpu = Gpu::new(a.luid).unwrap();
+        let input = PageInput::new(&gpu, 1920, 1080).unwrap();
+        let shared = gpu.create_shared_bgra(&page).unwrap();
+        let overlay = PageInput::new(&gpu, 1920, 1080).unwrap();
+        let mut p = GpuProducer::new(gpu.clone(), input.clone(), spec(1920, 1080))
+            .unwrap()
+            .with_overlay(overlay.clone());
+        p.set_profiling(true);
+        let mut ms = Vec::new();
+        for i in 0..90usize {
+            // A new page and overlay frame every tick (worst case).
+            input.on_shared_texture(shared.handle()).unwrap();
+            overlay.upload_frame(&ov).unwrap();
+            p.produce(&overlay_inputs(true, None), false).unwrap();
+            let Some(prof) = p.take_profile() else {
+                continue;
+            };
+            if i >= 10 {
+                if let Some((_, t)) = prof.iter().find(|(n, _)| *n == "overlay") {
+                    ms.push(*t);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = ms[ms.len() / 2];
+        println!(
+            "overlay pass 1920x1080 on {}: median {med:.3} ms, max {:.3} ms",
+            a.name,
+            ms[ms.len() - 1]
+        );
+        if a.name.contains("NVIDIA") {
+            assert!(med <= 1.0, "overlay pass {med:.3} ms > 1 ms on {}", a.name);
+        }
     }
 }

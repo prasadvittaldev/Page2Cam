@@ -90,6 +90,20 @@ pub struct TickInputs {
     pub layout: PipLayout,
     /// Backgrounds and edge quality (`Backdrop::default()`: page, room, LUT edges).
     pub backdrop: Backdrop,
+    /// Overlay layers are shown (drawn over everything). A GPU producer
+    /// reads its own overlay texture while this is set.
+    pub overlay_on: bool,
+    /// The overlay layers as a CPU frame (premultiplied BGRA), only while
+    /// `overlay_on` (`None` before the first paint).
+    pub overlay: Option<Arc<Frame>>,
+}
+
+/// Where the ticker gets the overlay layers: their CPU frames and whether
+/// any layer is visible (no overlay pass while `active` is false).
+#[derive(Clone, Default)]
+pub struct OverlayFeed {
+    pub slot: FrameSlot,
+    pub active: Arc<AtomicBool>,
 }
 
 /// Turns the tick's inputs into an `Output` (the CPU compositor now, D3D11 later).
@@ -290,7 +304,14 @@ impl OutputProducer for CpuProducer {
         // Check before taking a target: that may allocate a whole frame.
         if self
             .compositor
-            .is_unchanged(inputs.page.as_ref(), pip, &inputs.backdrop, w, h)
+            .is_unchanged_with(
+            inputs.page.as_ref(),
+            pip,
+            &inputs.backdrop,
+            inputs.overlay.as_ref(),
+            w,
+            h,
+        )
         {
             // Unchanged, but the preview may still lack the latest frame.
             if preview_due && self.preview_pending {
@@ -307,7 +328,13 @@ impl OutputProducer for CpuProducer {
         let i = self.free_frame();
         let target = Arc::get_mut(&mut self.pool[i]).expect("free pool frame");
         self.compositor
-            .compose(inputs.page.as_ref(), pip, &inputs.backdrop, target);
+            .compose_with(
+            inputs.page.as_ref(),
+            pip,
+            &inputs.backdrop,
+            inputs.overlay.as_ref(),
+            target,
+        );
         let frame = self.pool[i].clone();
         let mut out = match self.spec.format {
             OutputFormat::Bgra => Output {
@@ -597,6 +624,7 @@ impl Ticker {
         mask: Option<MaskSlot>,
         layout: Arc<RwLock<PipLayout>>,
         backdrop: Arc<RwLock<Backdrop>>,
+        overlay: Option<OverlayFeed>,
         producer: Box<dyn OutputProducer>,
         mut sinks: Vec<Box<dyn FrameSink>>,
         events: Sender<ProducerEvent>,
@@ -642,12 +670,20 @@ impl Ticker {
                 while !stop2.load(Ordering::Relaxed) {
                     let t0 = Instant::now();
                     tick_no += 1;
+                    let overlay_on = overlay
+                        .as_ref()
+                        .is_some_and(|o| o.active.load(Ordering::Relaxed));
                     let inputs = TickInputs {
                         page: page.as_ref().and_then(|p| p.latest()),
                         cam: webcam.as_ref().and_then(|s| cam_fresh.latest(s)),
                         mask: mask.as_ref().and_then(|s| mask_fresh.latest(s)),
                         layout: *layout.read(),
                         backdrop: backdrop.read().clone(),
+                        overlay_on,
+                        overlay: overlay
+                            .as_ref()
+                            .filter(|_| overlay_on)
+                            .and_then(|o| o.slot.latest()),
                     };
                     let note = ComposeNote::of(
                         &inputs.backdrop,
@@ -867,6 +903,7 @@ mod tests {
             mask,
             layout,
             Arc::default(),
+            None,
             Box::new(CpuProducer::new(spec)),
             sinks,
             std::sync::mpsc::channel().0,
@@ -1085,6 +1122,7 @@ mod tests {
             Some(MaskSlot::new()),
             cutout_layout(),
             backdrop.clone(),
+            None,
             Box::new(CpuProducer::new(small_spec())),
             vec![Box::new(Sampler(samples.clone(), 5, 5))],
             std::sync::mpsc::channel().0,
@@ -1241,6 +1279,8 @@ mod tests {
             mask: None,
             layout: crate::PipLayout::default(),
             backdrop: crate::Backdrop::default(),
+            overlay_on: false,
+            overlay: None,
         };
         let out = p.produce(&inputs, false).unwrap().unwrap();
         let n = out.nv12.unwrap();
@@ -1388,6 +1428,7 @@ mod tests {
             None,
             layout(),
             Arc::default(),
+            None,
             producer,
             vec![Box::new(Sampler(samples.clone(), 10, 10))],
             tx,
@@ -1559,6 +1600,7 @@ mod tests {
                 0.25,
             ))),
             Arc::default(),
+            None,
             Box::new(Fake::new(|n| n > 3)),
             // PIP centre (the 16x9 PIP sits at (47, 26)).
             vec![Box::new(Sampler(samples.clone(), 55, 30))],
@@ -1653,6 +1695,7 @@ mod tests {
                 0.25,
             ))),
             Arc::default(),
+            None,
             Box::new(Holding {
                 n: 0,
                 since: since.clone(),
@@ -1709,6 +1752,8 @@ mod tests {
                 mask: None,
                 layout: crate::PipLayout::default(),
                 backdrop: crate::Backdrop::default(),
+                overlay_on: false,
+                overlay: None,
             };
             held.push(p.produce(&inputs, false).unwrap().unwrap());
             last = Some(inputs);

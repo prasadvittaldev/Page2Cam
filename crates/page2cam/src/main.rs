@@ -558,6 +558,7 @@ fn run() -> anyhow::Result<i32> {
         segmenter.as_ref().map(|_| matte.clone()),
         layout.clone(),
         backdrop.clone(),
+        None,
         video_start.producer,
         sinks,
         events_tx,
