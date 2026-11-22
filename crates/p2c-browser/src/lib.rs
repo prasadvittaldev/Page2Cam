@@ -285,8 +285,9 @@ impl BrowserHandle {
     /// recreated later. Input coordinates are in this size from then on.
     pub fn set_size(&self, w: u32, h: u32) {
         let s = (w.max(16), h.max(16));
-        *self.size.lock() = s;
-        self.send(Cmd::SetSize);
+        if std::mem::replace(&mut *self.size.lock(), s) != s {
+            self.send(Cmd::SetSize);
+        }
     }
 
     /// The view size the page renders at (see [`BrowserHandle::set_size`]).

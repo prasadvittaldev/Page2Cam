@@ -635,7 +635,7 @@ fn run() -> anyhow::Result<i32> {
         quit_main: Mutex::new(None),
         ticker_stats: ticker.stats(),
         health_window: Mutex::new(Default::default()),
-        page_fps: Mutex::new(page_fps::PageFps::new(cfg.fps)),
+        page_fps: Mutex::new(page_fps::PageQuality::new(cfg.fps)),
         screen: screen::ScreenShare::new(Box::new(screen::RealScreens {
             max_fps: cfg.fps,
             out: screen_out(gpu_video.as_ref()),

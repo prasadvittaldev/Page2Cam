@@ -92,8 +92,8 @@ pub struct App {
     pub ticker_stats: Arc<p2c_compositor::TickerStats>,
     /// Recent samples for the health rates.
     pub health_window: Mutex<crate::health::HealthWindow>,
-    /// The page frame rate, lowered while the output skips ticks.
-    pub page_fps: Mutex<crate::page_fps::PageFps>,
+    /// The page frame rate and render size, lowered while the output skips ticks.
+    pub page_fps: Mutex<crate::page_fps::PageQuality>,
     /// The screen background's capture.
     pub screen: crate::screen::ScreenShare,
     /// Chromium's paints are dropped while set (the screen fills the page);
@@ -103,6 +103,48 @@ pub struct App {
     pub output_frame: FrameSlot,
     /// Overlay layers (titles, tickers, HTML…) and the overlay browser's on/off.
     pub overlay: crate::overlay::OverlayLayers,
+}
+
+/// `ev` (page pixels at the configured `from` size, as the admin maps them)
+/// in the pixels of the page as it renders now (`to`: lowered by the quality
+/// throttle). Wheel distances scale too, so a scroll moves the same share
+/// of the page.
+pub fn scale_input(ev: InputEvent, from: (u32, u32), to: (u32, u32)) -> InputEvent {
+    if from == to || from.0 == 0 || from.1 == 0 {
+        return ev;
+    }
+    let sx = |v: i32| (v as i64 * to.0 as i64 / from.0 as i64) as i32;
+    let sy = |v: i32| (v as i64 * to.1 as i64 / from.1 as i64) as i32;
+    match ev {
+        InputEvent::Move { x, y, mods } => InputEvent::Move {
+            x: sx(x),
+            y: sy(y),
+            mods,
+        },
+        InputEvent::Button {
+            x,
+            y,
+            button,
+            down,
+            clicks,
+            mods,
+        } => InputEvent::Button {
+            x: sx(x),
+            y: sy(y),
+            button,
+            down,
+            clicks,
+            mods,
+        },
+        InputEvent::Wheel { x, y, dx, dy, mods } => InputEvent::Wheel {
+            x: sx(x),
+            y: sy(y),
+            dx: sx(dx),
+            dy: sy(dy),
+            mods,
+        },
+        k @ InputEvent::Key { .. } => k,
+    }
 }
 
 /// Lock `m` for the status/health readers. Debug builds panic if it stays
@@ -274,23 +316,29 @@ impl App {
         self.health_window.lock().push(s);
     }
 
-    /// Slow the page down while the output skips ticks (a page that takes
-    /// the whole GPU starves the compositor), and back up once it keeps up.
-    /// Call after [`App::sample_health`].
+    /// Make the page cheaper while the output skips ticks (a page that takes
+    /// the whole GPU starves the compositor): lower frame rate, then lower
+    /// render size; back up once it keeps up. The overlay browser follows the
+    /// frame rate only. Call after [`App::sample_health`].
     pub fn govern_page_fps(&self) {
         if !self.ticker_stats.output_ready() {
             return;
         }
         let skipped = lock(&self.health_window, "health_window").skipped_pct();
         let changed = lock(&self.page_fps, "page_fps").update(std::time::Instant::now(), skipped);
-        if let Some(fps) = changed {
+        if let Some(level) = changed {
+            let (w, h) = level.res.size(self.width, self.height);
             tracing::info!(
-                fps,
+                fps = level.fps,
+                size = %format_args!("{w}x{h}"),
                 skipped_pct = skipped,
-                "page frame rate changed (output skipping ticks)"
+                "page quality changed (output skipping ticks)"
             );
-            self.with_browser(|b| b.set_frame_rate(fps));
-            self.overlay.set_fps(fps);
+            self.with_browser(|b| {
+                b.set_frame_rate(level.fps);
+                b.set_size(w, h);
+            });
+            self.overlay.set_fps(level.fps);
         }
     }
 
@@ -784,7 +832,7 @@ impl Controls for App {
     }
 
     fn input(&self, ev: InputEvent) {
-        self.with_browser(|b| match ev {
+        self.with_browser(|b| match scale_input(ev, (self.width, self.height), b.size()) {
             InputEvent::Move { x, y, mods } => b.mouse_move(x, y, mods),
             InputEvent::Button {
                 x,
@@ -1583,7 +1631,7 @@ mod tests {
             quit_main: Mutex::new(None),
             ticker_stats: Arc::default(),
             health_window: Mutex::new(Default::default()),
-            page_fps: Mutex::new(crate::page_fps::PageFps::new(30)),
+            page_fps: Mutex::new(crate::page_fps::PageQuality::new(30)),
             screen: crate::screen::ScreenShare::new(Box::new(
                 crate::screen::tests::FakeScreens::default(),
             )),
@@ -2250,6 +2298,50 @@ mod tests {
         *app.fallback_url.lock() = other_bg;
         app.keep_page_off_background();
         assert_eq!(shown(&app), "https://user.test/b", "page-driven history 2");
+    }
+
+    #[test]
+    fn input_follows_a_lowered_page_size() {
+        use p2c_admin::{InputEvent as E, MouseBtn};
+        let (full, half) = ((1920, 1080), (960, 540));
+        let click = E::Button {
+            x: 1919,
+            y: 540,
+            button: MouseBtn::Left,
+            down: true,
+            clicks: 1,
+            mods: 0,
+        };
+        assert_eq!(scale_input(click, full, full), click);
+        match scale_input(click, full, half) {
+            E::Button { x, y, .. } => assert_eq!((x, y), (959, 270)),
+            e => panic!("{e:?}"),
+        }
+        match scale_input(E::Move { x: 960, y: 1079, mods: 0 }, full, (1280, 720)) {
+            E::Move { x, y, .. } => assert_eq!((x, y), (640, 719)),
+            e => panic!("{e:?}"),
+        }
+        match scale_input(
+            E::Wheel {
+                x: 100,
+                y: 100,
+                dx: 0,
+                dy: -120,
+                mods: 0,
+            },
+            full,
+            half,
+        ) {
+            E::Wheel { x, y, dy, .. } => assert_eq!((x, y, dy), (50, 50, -60)),
+            e => panic!("{e:?}"),
+        }
+        let key = E::Key {
+            action: p2c_admin::KeyAction::Char,
+            code: 65,
+            ch: 97,
+            mods: 0,
+        };
+        assert_eq!(scale_input(key, full, half), key);
     }
 
     #[test]
