@@ -192,7 +192,12 @@ impl OverlayLayers {
     }
 
     pub fn layers(&self) -> Vec<Value> {
-        self.set.lock().layers().iter().map(|l| l.to_json()).collect()
+        self.set
+            .lock()
+            .layers()
+            .iter()
+            .map(|l| l.to_json())
+            .collect()
     }
 
     pub fn add(&self, spec: Value) -> Result<Value> {
@@ -234,7 +239,12 @@ impl OverlayLayers {
 
     /// How many layers are visible (status line).
     pub fn visible_count(&self) -> usize {
-        self.set.lock().layers().iter().filter(|l| l.visible).count()
+        self.set
+            .lock()
+            .layers()
+            .iter()
+            .filter(|l| l.visible)
+            .count()
     }
 
     /// Whether the overlay pass is on.
@@ -266,7 +276,12 @@ mod tests {
         assert_eq!(decide(true, Some(true), &mut hs, soon), None);
         assert_eq!(decide(false, Some(true), &mut hs, soon), None);
         assert_eq!(
-            decide(false, Some(true), &mut hs, soon + Duration::from_millis(1100)),
+            decide(
+                false,
+                Some(true),
+                &mut hs,
+                soon + Duration::from_millis(1100)
+            ),
             None
         );
         assert_eq!(
@@ -281,7 +296,10 @@ mod tests {
         let o = OverlayLayers::new(Some(d.path()), 30);
         o.tick(Instant::now());
         assert!(!o.is_active());
-        assert!(o.paused.load(Ordering::SeqCst), "paused while nothing shows");
+        assert!(
+            o.paused.load(Ordering::SeqCst),
+            "paused while nothing shows"
+        );
         let l = o
             .add(json!({"kind": "title", "text": "Live", "id": "t", "hide_after_s": 1}))
             .unwrap();

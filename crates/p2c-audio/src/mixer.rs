@@ -257,7 +257,11 @@ mod tests {
 
     #[test]
     fn overlay_sound_follows_page_settings() {
-        let (page, mic, ov) = (AudioRing::new(1000), AudioRing::new(1000), AudioRing::new(1000));
+        let (page, mic, ov) = (
+            AudioRing::new(1000),
+            AudioRing::new(1000),
+            AudioRing::new(1000),
+        );
         let m = Mixer::new(page.clone(), mic, MixSettings::default()).with_overlay(ov.clone());
         page.push(&[0.25, 0.25]);
         ov.push(&[0.5, 0.5]);

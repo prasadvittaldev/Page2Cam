@@ -298,7 +298,8 @@ fn layer_schema(add: bool) -> Value {
     let unit = json!({ "type": "number", "minimum": 0, "maximum": 1 });
     let size = json!({ "type": "number", "minimum": 0.01, "maximum": 1 });
     let colour = json!({ "type": ["string", "null"], "pattern": "^#[0-9a-fA-F]{6}$" });
-    let anim = json!({ "enum": ["none", "fade", "slide-left", "slide-right", "slide-up", "slide-down"] });
+    let anim =
+        json!({ "enum": ["none", "fade", "slide-left", "slide-right", "slide-up", "slide-down"] });
     let text = json!({ "type": "string", "maxLength": MAX_LAYER_TEXT });
     let mut props = json!({
         "id": { "type": "string", "maxLength": 40 },
@@ -396,7 +397,13 @@ fn layer_body(args: &Args) -> Result<Map<String, Value>, String> {
     if let Some(n) = text_arg(args, "name", 80)? {
         m.insert("name".into(), n.into());
     }
-    for (k, lo) in [("x", 0.0), ("y", 0.0), ("w", 0.01), ("h", 0.01), ("opacity", 0.0)] {
+    for (k, lo) in [
+        ("x", 0.0),
+        ("y", 0.0),
+        ("w", 0.01),
+        ("h", 0.01),
+        ("opacity", 0.0),
+    ] {
         if let Some(v) = num_arg(args, k, lo, 1.0)? {
             m.insert(k.into(), v.into());
         }
@@ -414,7 +421,14 @@ fn layer_body(args: &Args) -> Result<Map<String, Value>, String> {
             let a = one_of(
                 k,
                 a,
-                &["none", "fade", "slide-left", "slide-right", "slide-up", "slide-down"],
+                &[
+                    "none",
+                    "fade",
+                    "slide-left",
+                    "slide-right",
+                    "slide-up",
+                    "slide-down",
+                ],
             )?;
             m.insert(k.into(), a.into());
         }
@@ -460,7 +474,11 @@ fn layer_body(args: &Args) -> Result<Map<String, Value>, String> {
         for i in items {
             match i.as_str() {
                 Some(s) if s.chars().count() <= MAX_LAYER_TEXT => {}
-                _ => return Err(format!("each item must be text of at most {MAX_LAYER_TEXT} characters")),
+                _ => {
+                    return Err(format!(
+                        "each item must be text of at most {MAX_LAYER_TEXT} characters"
+                    ))
+                }
             }
         }
         m.insert("items".into(), v.clone());
@@ -473,7 +491,9 @@ fn layer_body(args: &Args) -> Result<Map<String, Value>, String> {
             return Err("html is empty".into());
         }
         if h.len() > MAX_LAYER_HTML {
-            return Err("html is larger than 256 KB; link big assets instead of inlining them".into());
+            return Err(
+                "html is larger than 256 KB; link big assets instead of inlining them".into(),
+            );
         }
         m.insert("html".into(), h.into());
     }

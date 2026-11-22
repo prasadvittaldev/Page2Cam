@@ -832,40 +832,42 @@ impl Controls for App {
     }
 
     fn input(&self, ev: InputEvent) {
-        self.with_browser(|b| match scale_input(ev, (self.width, self.height), b.size()) {
-            InputEvent::Move { x, y, mods } => b.mouse_move(x, y, mods),
-            InputEvent::Button {
-                x,
-                y,
-                button,
-                down,
-                clicks,
-                mods,
-            } => {
-                let button = match button {
-                    MouseBtn::Left => MouseButton::Left,
-                    MouseBtn::Middle => MouseButton::Middle,
-                    MouseBtn::Right => MouseButton::Right,
-                };
-                b.mouse_button(x, y, button, down, clicks, mods)
-            }
-            InputEvent::Wheel { x, y, dx, dy, mods } => b.wheel(x, y, dx, dy, mods),
-            InputEvent::Key {
-                action,
-                code,
-                ch,
-                mods,
-            } => b.key(KeyInput {
-                kind: match action {
-                    KeyAction::Down => KeyKind::Down,
-                    KeyAction::Up => KeyKind::Up,
-                    KeyAction::Char => KeyKind::Char,
-                },
-                windows_key_code: code,
-                character: ch,
-                modifiers: mods,
-            }),
-        });
+        self.with_browser(
+            |b| match scale_input(ev, (self.width, self.height), b.size()) {
+                InputEvent::Move { x, y, mods } => b.mouse_move(x, y, mods),
+                InputEvent::Button {
+                    x,
+                    y,
+                    button,
+                    down,
+                    clicks,
+                    mods,
+                } => {
+                    let button = match button {
+                        MouseBtn::Left => MouseButton::Left,
+                        MouseBtn::Middle => MouseButton::Middle,
+                        MouseBtn::Right => MouseButton::Right,
+                    };
+                    b.mouse_button(x, y, button, down, clicks, mods)
+                }
+                InputEvent::Wheel { x, y, dx, dy, mods } => b.wheel(x, y, dx, dy, mods),
+                InputEvent::Key {
+                    action,
+                    code,
+                    ch,
+                    mods,
+                } => b.key(KeyInput {
+                    kind: match action {
+                        KeyAction::Down => KeyKind::Down,
+                        KeyAction::Up => KeyKind::Up,
+                        KeyAction::Char => KeyKind::Char,
+                    },
+                    windows_key_code: code,
+                    character: ch,
+                    modifiers: mods,
+                }),
+            },
+        );
     }
 
     fn pip(&self) -> PipLayout {
@@ -2317,7 +2319,15 @@ mod tests {
             E::Button { x, y, .. } => assert_eq!((x, y), (959, 270)),
             e => panic!("{e:?}"),
         }
-        match scale_input(E::Move { x: 960, y: 1079, mods: 0 }, full, (1280, 720)) {
+        match scale_input(
+            E::Move {
+                x: 960,
+                y: 1079,
+                mods: 0,
+            },
+            full,
+            (1280, 720),
+        ) {
             E::Move { x, y, .. } => assert_eq!((x, y), (640, 719)),
             e => panic!("{e:?}"),
         }

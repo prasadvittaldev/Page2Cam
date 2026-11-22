@@ -334,7 +334,12 @@ impl TrayBackend {
                 .map(|l| BackendReply::Json(layer_out(&l))),
             // Partial: the engine merges it into the layer.
             C::UpdateLayer { id, patch } => self
-                .json("POST", &format!("/api/layers/{id}"), Some(patch), SLOW_TIMEOUT)
+                .json(
+                    "POST",
+                    &format!("/api/layers/{id}"),
+                    Some(patch),
+                    SLOW_TIMEOUT,
+                )
                 .map(|l| BackendReply::Json(layer_out(&l))),
             C::ShowLayer(id) | C::HideLayer(id) => {
                 let visible = matches!(call, C::ShowLayer(_));
@@ -910,8 +915,10 @@ pub(crate) mod tests {
             ("POST", "/api/layers/order"),
             ("POST", "/api/layers/nope"),
         ];
-        let want: Vec<(String, String)> =
-            want.iter().map(|(m, p)| (m.to_string(), p.to_string())).collect();
+        let want: Vec<(String, String)> = want
+            .iter()
+            .map(|(m, p)| (m.to_string(), p.to_string()))
+            .collect();
         assert_eq!(seen, want);
         let body = |i: usize| -> Value { serde_json::from_slice(&log[i].2).unwrap() };
         // The partial change goes as it is (the engine merges it).
@@ -921,6 +928,10 @@ pub(crate) mod tests {
         assert_eq!(body(7), json!({ "visible": true }));
         assert!(tray.balloons.lock().is_empty(), "no balloons for layers");
         let acts = b.activity.lock().list();
-        assert_eq!(acts.len(), 7, "every change is listed, the list call is not");
+        assert_eq!(
+            acts.len(),
+            7,
+            "every change is listed, the list call is not"
+        );
     }
 }

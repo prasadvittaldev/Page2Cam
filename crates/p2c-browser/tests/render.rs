@@ -142,7 +142,11 @@ fn serve_scene() -> String {
                     p2c_overlay::scene::SCENE_CSP,
                     p2c_overlay::scene::SCENE_HTML.to_string(),
                 ),
-                "/ov/x/scene.js" => ("text/javascript", "", p2c_overlay::scene::SCENE_JS.to_string()),
+                "/ov/x/scene.js" => (
+                    "text/javascript",
+                    "",
+                    p2c_overlay::scene::SCENE_JS.to_string(),
+                ),
                 "/ov/x/state" => ("application/json", "", state.clone()),
                 "/ov/x/layer/chart" => ("text/html", p2c_overlay::scene::LAYER_CSP, html.clone()),
                 _ => ("text/plain", "", String::new()),
@@ -185,7 +189,11 @@ fn scene_draws_layers(overlay: &BrowserHandle, slot: &FrameSlot) -> Result<(), S
 
 /// The page renders at a new view size (the quality throttle's resolution
 /// lever), and back; the overlay keeps its size.
-fn set_size_resizes_page(h: &BrowserHandle, slot: &FrameSlot, overlay: &FrameSlot) -> Result<(), String> {
+fn set_size_resizes_page(
+    h: &BrowserHandle,
+    slot: &FrameSlot,
+    overlay: &FrameSlot,
+) -> Result<(), String> {
     h.set_size(960, 540);
     wait_for_size(slot, (960, 540), "960x540 page after set_size", |f| {
         close(f.pixel(150, 270), GREEN)
@@ -196,7 +204,9 @@ fn set_size_resizes_page(h: &BrowserHandle, slot: &FrameSlot, overlay: &FrameSlo
         }
     }
     h.set_size(W, H);
-    wait_for(slot, "page back at its size", |f| close(f.pixel(100, 180), GREEN))?;
+    wait_for(slot, "page back at its size", |f| {
+        close(f.pixel(100, 180), GREEN)
+    })?;
     println!("test set_size_resizes_page ... ok");
     Ok(())
 }

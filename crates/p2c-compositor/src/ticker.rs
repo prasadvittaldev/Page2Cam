@@ -302,17 +302,14 @@ impl OutputProducer for CpuProducer {
         });
         let (w, h) = (self.spec.width, self.spec.height);
         // Check before taking a target: that may allocate a whole frame.
-        if self
-            .compositor
-            .is_unchanged_with(
+        if self.compositor.is_unchanged_with(
             inputs.page.as_ref(),
             pip,
             &inputs.backdrop,
             inputs.overlay.as_ref(),
             w,
             h,
-        )
-        {
+        ) {
             // Unchanged, but the preview may still lack the latest frame.
             if preview_due && self.preview_pending {
                 if let Some((out, frame)) = &self.last {
@@ -327,8 +324,7 @@ impl OutputProducer for CpuProducer {
         }
         let i = self.free_frame();
         let target = Arc::get_mut(&mut self.pool[i]).expect("free pool frame");
-        self.compositor
-            .compose_with(
+        self.compositor.compose_with(
             inputs.page.as_ref(),
             pip,
             &inputs.backdrop,

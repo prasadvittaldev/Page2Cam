@@ -555,7 +555,8 @@ fn run() -> anyhow::Result<i32> {
     }
     // Overlay layers (saved ones come back hidden); the ticker draws them
     // over everything while one is visible.
-    let data_dir = directories::ProjectDirs::from("", "", "page2cam").map(|d| d.data_dir().to_path_buf());
+    let data_dir =
+        directories::ProjectDirs::from("", "", "page2cam").map(|d| d.data_dir().to_path_buf());
     let overlays = overlay::OverlayLayers::new(data_dir.as_deref(), cfg.fps);
     let (events_tx, events) = mpsc::channel();
     let ticker = Ticker::spawn(

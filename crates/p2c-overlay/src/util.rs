@@ -91,4 +91,3 @@ pub fn youtube_id(input: &str) -> Result<String, String> {
         _ => not_video(),
     }
 }
-

@@ -804,8 +804,7 @@ fn ov_file_ok(file: &str) -> bool {
     let simple = |s: &str| {
         !s.is_empty()
             && s.len() <= 80
-            && s
-                .bytes()
+            && s.bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
             && !s.contains("..")
     };
@@ -871,7 +870,10 @@ async fn layer_delete(
 
 /// `POST /api/layers/clear`: hide every layer.
 async fn layers_clear(AxState(st): AxState<State>) -> Response {
-    overlay_call(&st, |c| Ok(serde_json::json!({ "hidden": c.clear_layers() }))).await
+    overlay_call(&st, |c| {
+        Ok(serde_json::json!({ "hidden": c.clear_layers() }))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -2777,7 +2779,10 @@ mod tests {
             .unwrap();
         let code = r.status();
         let s = body_string(r).await;
-        (code, serde_json::from_str(&s).unwrap_or(serde_json::Value::Null))
+        (
+            code,
+            serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+        )
     }
 
     #[tokio::test]
@@ -2803,7 +2808,11 @@ mod tests {
         for (uri, body, msg) in [
             ("/api/layers", r#"{"kind":"title"}"#, "needs text"),
             ("/api/layers", r#"{"kind":"nope"}"#, "unknown kind"),
-            ("/api/layers/title-1", r#"{"style":"fancy"}"#, "unknown style"),
+            (
+                "/api/layers/title-1",
+                r#"{"style":"fancy"}"#,
+                "unknown style",
+            ),
             ("/api/layers/nope", r#"{"x":0.1}"#, "no layer"),
         ] {
             let (c, v) = call_json(&a, "POST", uri, Some(body)).await;
@@ -2865,7 +2874,10 @@ mod tests {
         assert_eq!(c, StatusCode::OK, "{v}");
         let r = a
             .clone()
-            .oneshot(upload("/api/layers/logo/asset?t=abc123", b"<html>".to_vec()))
+            .oneshot(upload(
+                "/api/layers/logo/asset?t=abc123",
+                b"<html>".to_vec(),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
@@ -2934,15 +2946,39 @@ mod tests {
         let wrong = "0".repeat(32);
         let local = "127.0.0.1:8765";
         for (uri, host, want) in [
-            (format!("/ov/{wrong}/scene.html"), local, StatusCode::NOT_FOUND),
+            (
+                format!("/ov/{wrong}/scene.html"),
+                local,
+                StatusCode::NOT_FOUND,
+            ),
             (format!("/ov/{bg}/scene.html"), local, StatusCode::NOT_FOUND),
-            (format!("/bg/{id}/current.html"), local, StatusCode::NOT_FOUND),
+            (
+                format!("/bg/{id}/current.html"),
+                local,
+                StatusCode::NOT_FOUND,
+            ),
             (format!("/ov/{id}/other"), local, StatusCode::NOT_FOUND),
             (format!("/ov/{id}/layer/nope"), local, StatusCode::NOT_FOUND),
-            (format!("/ov/{id}/asset/../x.png"), local, StatusCode::NOT_FOUND),
-            (format!("/ov/{id}/asset/x.png"), local, StatusCode::NOT_FOUND),
-            (format!("/ov/{id}/scene.html"), "evil.test:8765", StatusCode::FORBIDDEN),
-            (format!("/ov/{id}/../api/layers"), local, StatusCode::NOT_FOUND),
+            (
+                format!("/ov/{id}/asset/../x.png"),
+                local,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                format!("/ov/{id}/asset/x.png"),
+                local,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                format!("/ov/{id}/scene.html"),
+                "evil.test:8765",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                format!("/ov/{id}/../api/layers"),
+                local,
+                StatusCode::NOT_FOUND,
+            ),
         ] {
             let r = get(uri.clone(), host).await;
             assert_eq!(r.status(), want, "{uri} {host}");

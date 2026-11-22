@@ -2553,9 +2553,15 @@ fn gpu_overlay_matches_cpu_and_follows_overlay_on() {
             assert!(d <= tol.max, "{label} on {}: diff {d} at ({x},{y})", a.name);
             assert_opaque(&got, label);
             // Off: exactly the page.
-            let off = p.render_bgra_for_test(&overlay_inputs(false, None)).unwrap();
+            let off = p
+                .render_bgra_for_test(&overlay_inputs(false, None))
+                .unwrap();
             let (d, _, _) = bgra_diff(&page, &off);
-            assert!(d <= STRICT.max, "{label} on {}: overlay off diff {d}", a.name);
+            assert!(
+                d <= STRICT.max,
+                "{label} on {}: overlay off diff {d}",
+                a.name
+            );
         }
     }
 }

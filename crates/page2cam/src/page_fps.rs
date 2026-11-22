@@ -177,7 +177,13 @@ mod tests {
         let (mut g, mut t) = (PageQuality::new(30), Instant::now());
         assert_eq!(run(&mut g, &mut t, 120, 0.0), vec![]);
         assert_eq!(run(&mut g, &mut t, 120, 5.0), vec![]);
-        assert_eq!(g.level(), Level { fps: 30, res: Res::Full });
+        assert_eq!(
+            g.level(),
+            Level {
+                fps: 30,
+                res: Res::Full
+            }
+        );
     }
 
     #[test]
@@ -191,7 +197,14 @@ mod tests {
             run(&mut g, &mut t, 60, 90.0),
             vec![(15, P720), (10, P720), (10, P540)]
         );
-        assert_eq!(g.level(), Level { fps: 10, res: Res::Half }, "never below the last step");
+        assert_eq!(
+            g.level(),
+            Level {
+                fps: 10,
+                res: Res::Half
+            },
+            "never below the last step"
+        );
     }
 
     #[test]
@@ -208,7 +221,13 @@ mod tests {
     fn steps_back_up_one_level_per_30_s() {
         let (mut g, mut t) = (PageQuality::new(30), Instant::now());
         run(&mut g, &mut t, 24, 90.0);
-        assert_eq!(g.level(), Level { fps: 15, res: Res::TwoThirds });
+        assert_eq!(
+            g.level(),
+            Level {
+                fps: 15,
+                res: Res::TwoThirds
+            }
+        );
         assert_eq!(run(&mut g, &mut t, 30, 0.0), vec![]);
         assert_eq!(run(&mut g, &mut t, 1, 0.0), vec![(15, FULL)]);
         assert_eq!(run(&mut g, &mut t, 31, 1.0), vec![(20, FULL)]);
@@ -227,12 +246,23 @@ mod tests {
     #[test]
     fn rungs_above_the_configured_rate_are_dropped() {
         let ladder = |max| -> Vec<(u32, Res)> {
-            PageQuality::new(max).levels.iter().map(|l| (l.fps, l.res)).collect()
+            PageQuality::new(max)
+                .levels
+                .iter()
+                .map(|l| (l.fps, l.res))
+                .collect()
         };
         use Res::*;
         assert_eq!(
             ladder(30),
-            [(30, Full), (20, Full), (15, Full), (15, TwoThirds), (10, TwoThirds), (10, Half)]
+            [
+                (30, Full),
+                (20, Full),
+                (15, Full),
+                (15, TwoThirds),
+                (10, TwoThirds),
+                (10, Half)
+            ]
         );
         assert_eq!(
             ladder(60),
@@ -246,7 +276,10 @@ mod tests {
                 (10, Half)
             ]
         );
-        assert_eq!(ladder(15), [(15, Full), (15, TwoThirds), (10, TwoThirds), (10, Half)]);
+        assert_eq!(
+            ladder(15),
+            [(15, Full), (15, TwoThirds), (10, TwoThirds), (10, Half)]
+        );
         assert_eq!(ladder(10), [(10, Full), (10, TwoThirds), (10, Half)]);
         assert_eq!(ladder(5), [(5, Full)]);
         let (mut g, mut t) = (PageQuality::new(5), Instant::now());

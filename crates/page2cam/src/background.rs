@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use p2c_compositor::{Backdrop, BoxBackdrop, FullBackdrop};
 use p2c_core::Frame;
-pub use p2c_overlay::util::{normalize_colour, parse_colour, youtube_id};
 use p2c_overlay::util::is_video_id;
+pub use p2c_overlay::util::{normalize_colour, parse_colour, youtube_id};
 
 /// What fills the whole output (setting `background`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

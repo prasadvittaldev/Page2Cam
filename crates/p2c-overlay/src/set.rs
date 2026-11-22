@@ -60,7 +60,9 @@ fn take_media(m: &mut Map<String, Value>) -> Result<Option<Media>> {
             Ok(Some(Media::Path(PathBuf::from(p.trim()))))
         }
         (None, Some(d)) => {
-            let d = d.as_str().ok_or_else(|| anyhow!("data_base64 must be text"))?;
+            let d = d
+                .as_str()
+                .ok_or_else(|| anyhow!("data_base64 must be text"))?;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(d.trim())
                 .map_err(|e| anyhow!("data_base64 is not valid base64: {e}"))?;
@@ -185,7 +187,10 @@ impl LayerSet {
 
     /// The stored files every layer uses.
     pub fn assets_in_use(&self) -> Vec<&str> {
-        self.layers.iter().filter_map(|l| l.content.asset()).collect()
+        self.layers
+            .iter()
+            .filter_map(|l| l.content.asset())
+            .collect()
     }
 
     fn touch(&mut self) {
@@ -334,7 +339,11 @@ impl LayerSet {
         };
         let media = take_media(&mut m)?;
         let old = self.layers[i].clone();
-        let mut base = old.to_json().as_object().cloned().expect("layer is an object");
+        let mut base = old
+            .to_json()
+            .as_object()
+            .cloned()
+            .expect("layer is an object");
         merge(&mut base, &m)?;
         // Check the rest first, then store the file.
         let mut layer = from_json(Value::Object(base.clone()))?;
@@ -377,7 +386,11 @@ impl LayerSet {
             k => bail!("a {k} layer takes no file"),
         };
         let name = assets.store(id, bytes, want)?;
-        let mut base = old.to_json().as_object().cloned().expect("layer is an object");
+        let mut base = old
+            .to_json()
+            .as_object()
+            .cloned()
+            .expect("layer is an object");
         base.insert("asset".into(), json!(name));
         let layer = match from_json(Value::Object(base)) {
             Ok(l) => l,
@@ -524,7 +537,10 @@ mod tests {
 
     #[test]
     fn ids_are_sanitised_and_unique() {
-        assert_eq!(sanitize_id(" Lower Third #1 ").as_deref(), Some("lower-third-1"));
+        assert_eq!(
+            sanitize_id(" Lower Third #1 ").as_deref(),
+            Some("lower-third-1")
+        );
         assert_eq!(sanitize_id("!!!"), None);
         assert_eq!(sanitize_id(&"a".repeat(99)).unwrap().len(), MAX_ID);
         let (_d, a, mut s, now) = setup();
@@ -537,15 +553,27 @@ mod tests {
             .unwrap();
         assert_eq!(t2.id, "title-2");
         let n = s
-            .add(json!({"kind": "title", "text": "x", "name": "Guest Name"}), &a, now)
+            .add(
+                json!({"kind": "title", "text": "x", "name": "Guest Name"}),
+                &a,
+                now,
+            )
             .unwrap();
         assert_eq!(n.id, "guest-name");
         let n2 = s
-            .add(json!({"kind": "title", "text": "x", "name": "Guest Name"}), &a, now)
+            .add(
+                json!({"kind": "title", "text": "x", "name": "Guest Name"}),
+                &a,
+                now,
+            )
             .unwrap();
         assert_eq!(n2.id, "guest-name-1");
         let e = s
-            .add(json!({"kind": "title", "text": "x", "id": "Guest-Name"}), &a, now)
+            .add(
+                json!({"kind": "title", "text": "x", "id": "Guest-Name"}),
+                &a,
+                now,
+            )
             .unwrap_err();
         assert!(e.to_string().contains("exists already"), "{e}");
     }
@@ -559,7 +587,11 @@ mod tests {
         assert_eq!((t.x, t.y, t.w, t.h, t.z), (0.0, 0.92, 1.0, 0.08, 0));
         assert!(t.visible);
         let h = s
-            .add(json!({"kind": "html", "html": "<p>x</p>", "visible": false}), &a, now)
+            .add(
+                json!({"kind": "html", "html": "<p>x</p>", "visible": false}),
+                &a,
+                now,
+            )
             .unwrap();
         assert_eq!(h.z, 1);
         assert!(!h.visible);
@@ -572,7 +604,10 @@ mod tests {
             (json!({"kind": "image"}), "needs path"),
             (json!({"kind": "video"}), "needs path"),
             (json!({"kind": "youtube"}), "needs a link"),
-            (json!({"kind": "title", "text": "x", "html": "y"}), "unknown field"),
+            (
+                json!({"kind": "title", "text": "x", "html": "y"}),
+                "unknown field",
+            ),
             (json!(["x"]), "JSON object"),
         ] {
             let e = s.add(spec.clone(), &a, now).unwrap_err().to_string();
@@ -600,16 +635,27 @@ mod tests {
         assert!(a.read(&first).is_none(), "replaced file deleted");
         // A failed change leaves the layer and its file alone.
         assert!(s
-            .update(&img.id, json!({"path": d.path().join("none.png").to_string_lossy()}), &a, now)
+            .update(
+                &img.id,
+                json!({"path": d.path().join("none.png").to_string_lossy()}),
+                &a,
+                now
+            )
             .is_err());
         assert!(s.update(&img.id, json!({"x": "a"}), &a, now).is_err());
-        assert_eq!(s.get(&img.id).unwrap().content.asset(), Some(second.as_str()));
+        assert_eq!(
+            s.get(&img.id).unwrap().content.asset(),
+            Some(second.as_str())
+        );
         assert!(a.read(&second).is_some());
         let e = s
             .add(json!({"kind": "video", "data_base64": "AAAA"}), &a, now)
             .unwrap_err()
             .to_string();
-        assert!(e.contains("not a supported file") || e.contains("by path"), "{e}");
+        assert!(
+            e.contains("not a supported file") || e.contains("by path"),
+            "{e}"
+        );
         s.remove(&img.id, &a).unwrap();
         assert!(a.read(&second).is_none());
     }
@@ -618,8 +664,12 @@ mod tests {
     fn show_hide_clear_reorder() {
         let (_d, a, mut s, now) = setup();
         for i in 0..3 {
-            s.add(json!({"kind": "title", "text": "t", "id": format!("l{i}")}), &a, now)
-                .unwrap();
+            s.add(
+                json!({"kind": "title", "text": "t", "id": format!("l{i}")}),
+                &a,
+                now,
+            )
+            .unwrap();
         }
         let r = s.rev();
         s.hide("l0").unwrap();
@@ -634,14 +684,22 @@ mod tests {
         assert_eq!(order, ["l1", "l2", "l0"]);
         assert!(s.reorder(&["nope".into()]).is_err());
         assert!(s.reorder(&["l1".into(), "l1".into()]).is_err());
-        assert!(s.hide("nope").unwrap_err().to_string().contains("list_layers"));
+        assert!(s
+            .hide("nope")
+            .unwrap_err()
+            .to_string()
+            .contains("list_layers"));
     }
 
     #[test]
     fn auto_hide_counts_from_showing() {
         let (_d, a, mut s, now) = setup();
-        s.add(json!({"kind": "title", "text": "t", "id": "t", "hide_after_s": 5}), &a, now)
-            .unwrap();
+        s.add(
+            json!({"kind": "title", "text": "t", "id": "t", "hide_after_s": 5}),
+            &a,
+            now,
+        )
+        .unwrap();
         assert!(!s.tick(now + Duration::from_secs(4)));
         assert!(s.tick(now + Duration::from_secs(5)));
         assert!(!s.get("t").unwrap().visible);
@@ -657,15 +715,22 @@ mod tests {
         let (d, a, mut s, now) = setup();
         s.add(json!({"kind": "title", "text": "t", "id": "t"}), &a, now)
             .unwrap();
-        s.add(json!({"kind": "html", "html": "<i>x</i>", "id": "h"}), &a, now)
-            .unwrap();
+        s.add(
+            json!({"kind": "html", "html": "<i>x</i>", "id": "h"}),
+            &a,
+            now,
+        )
+        .unwrap();
         let p = d.path().join("overlays").join("layers.json");
         s.save(&p).unwrap();
         let (back, bad) = LayerSet::load(&p).unwrap();
         assert!(bad.is_empty());
         assert_eq!(back.layers().len(), 2);
         assert!(!back.any_visible());
-        assert!(matches!(back.get("h").unwrap().content, Content::Html { .. }));
+        assert!(matches!(
+            back.get("h").unwrap().content,
+            Content::Html { .. }
+        ));
         let (empty, _) = LayerSet::load(&d.path().join("missing.json")).unwrap();
         assert!(empty.layers().is_empty());
         std::fs::write(&p, r#"{"layers":[{"id":"x","kind":"title"}]}"#).unwrap();
@@ -677,14 +742,22 @@ mod tests {
     #[test]
     fn state_leaves_html_out_and_versions_content() {
         let (_d, a, mut s, now) = setup();
-        s.add(json!({"kind": "html", "html": "<i>x</i>", "id": "h"}), &a, now)
-            .unwrap();
+        s.add(
+            json!({"kind": "html", "html": "<i>x</i>", "id": "h"}),
+            &a,
+            now,
+        )
+        .unwrap();
         let st = s.state_json();
         let l = &st["layers"][0];
         assert!(l.get("html").is_none());
         let v1 = l["v"].as_str().unwrap().to_string();
         s.update("h", json!({"x": 0.1}), &a, now).unwrap();
-        assert_eq!(s.state_json()["layers"][0]["v"], v1.as_str(), "moving keeps v");
+        assert_eq!(
+            s.state_json()["layers"][0]["v"],
+            v1.as_str(),
+            "moving keeps v"
+        );
         s.update("h", json!({"html": "<b>y</b>"}), &a, now).unwrap();
         assert_ne!(s.state_json()["layers"][0]["v"], v1.as_str());
         assert_eq!(s.html_of("h"), Some("<b>y</b>"));
@@ -695,7 +768,8 @@ mod tests {
     fn layer_count_is_limited() {
         let (_d, a, mut s, now) = setup();
         for _ in 0..MAX_LAYERS {
-            s.add(json!({"kind": "title", "text": "t"}), &a, now).unwrap();
+            s.add(json!({"kind": "title", "text": "t"}), &a, now)
+                .unwrap();
         }
         let e = s.add(json!({"kind": "title", "text": "t"}), &a, now);
         assert!(e.unwrap_err().to_string().contains("at most"));

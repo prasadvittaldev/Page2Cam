@@ -91,7 +91,9 @@ impl Assets {
             describe(want)
         );
         match kind {
-            MediaKind::Image => ensure!(bytes.len() <= MAX_IMAGE_BYTES, "picture larger than 20 MB"),
+            MediaKind::Image => {
+                ensure!(bytes.len() <= MAX_IMAGE_BYTES, "picture larger than 20 MB")
+            }
             MediaKind::Video => ensure!(
                 bytes.len() as u64 <= MAX_VIDEO_BYTES,
                 "video larger than 200 MB"
@@ -182,7 +184,10 @@ mod tests {
     fn sniffs_by_content_only() {
         assert_eq!(sniff(PNG).unwrap().1, "png");
         assert_eq!(sniff(b"GIF89a....").unwrap().1, "gif");
-        assert_eq!(sniff(b"\0\0\0\x20ftypisom0000").unwrap().0, MediaKind::Video);
+        assert_eq!(
+            sniff(b"\0\0\0\x20ftypisom0000").unwrap().0,
+            MediaKind::Video
+        );
         assert_eq!(sniff(&[0x1a, 0x45, 0xdf, 0xa3, 0]).unwrap().1, "webm");
         assert!(sniff(b"<html>").is_none());
     }
@@ -190,7 +195,15 @@ mod tests {
     #[test]
     fn names_are_ours_only() {
         assert!(is_asset_name("title-1-0a1b2c3d.png"));
-        for bad in ["../x.png", "a/b.png", "x.exe", "X.png", ".png", "a.png.part", "a"] {
+        for bad in [
+            "../x.png",
+            "a/b.png",
+            "x.exe",
+            "X.png",
+            ".png",
+            "a.png.part",
+            "a",
+        ] {
             assert!(!is_asset_name(bad), "{bad}");
         }
     }

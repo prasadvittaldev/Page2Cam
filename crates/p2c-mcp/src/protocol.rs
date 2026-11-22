@@ -555,23 +555,62 @@ mod tests {
         let cases: Vec<(&str, Value)> = vec![
             ("add_layer", json!({ "text": "x" })),
             ("add_layer", json!({ "kind": "clock" })),
-            ("add_layer", json!({ "kind": "title", "text": "x", "x": 1.5 })),
+            (
+                "add_layer",
+                json!({ "kind": "title", "text": "x", "x": 1.5 }),
+            ),
             ("add_layer", json!({ "kind": "title", "text": "x", "w": 0 })),
-            ("add_layer", json!({ "kind": "title", "text": "x", "z": 0.5 })),
-            ("add_layer", json!({ "kind": "title", "text": "x", "style": "fancy" })),
-            ("add_layer", json!({ "kind": "title", "text": "x", "enter": "spin" })),
-            ("add_layer", json!({ "kind": "title", "text": "x", "colour": "red" })),
-            ("add_layer", json!({ "kind": "title", "text": "x".repeat(501) })),
-            ("add_layer", json!({ "kind": "title", "text": "x", "hide_after_s": 0 })),
-            ("add_layer", json!({ "kind": "title", "text": "x", "font": "Arial" })),
+            (
+                "add_layer",
+                json!({ "kind": "title", "text": "x", "z": 0.5 }),
+            ),
+            (
+                "add_layer",
+                json!({ "kind": "title", "text": "x", "style": "fancy" }),
+            ),
+            (
+                "add_layer",
+                json!({ "kind": "title", "text": "x", "enter": "spin" }),
+            ),
+            (
+                "add_layer",
+                json!({ "kind": "title", "text": "x", "colour": "red" }),
+            ),
+            (
+                "add_layer",
+                json!({ "kind": "title", "text": "x".repeat(501) }),
+            ),
+            (
+                "add_layer",
+                json!({ "kind": "title", "text": "x", "hide_after_s": 0 }),
+            ),
+            (
+                "add_layer",
+                json!({ "kind": "title", "text": "x", "font": "Arial" }),
+            ),
             ("add_layer", json!({ "kind": "ticker", "items": [] })),
             ("add_layer", json!({ "kind": "ticker", "items": [1, 2] })),
-            ("add_layer", json!({ "kind": "html", "html": "x".repeat(256 * 1024 + 1) })),
+            (
+                "add_layer",
+                json!({ "kind": "html", "html": "x".repeat(256 * 1024 + 1) }),
+            ),
             ("add_layer", json!({ "kind": "html", "html": " " })),
-            ("add_layer", json!({ "kind": "image", "path": "\\\\evil\\s\\a.png" })),
-            ("add_layer", json!({ "kind": "image", "path": "C:/a.png", "data_base64": "AAAA" })),
-            ("add_layer", json!({ "kind": "image", "data_base64": "!!!" })),
-            ("add_layer", json!({ "kind": "video", "url": "file:///C:/a.mp4" })),
+            (
+                "add_layer",
+                json!({ "kind": "image", "path": "\\\\evil\\s\\a.png" }),
+            ),
+            (
+                "add_layer",
+                json!({ "kind": "image", "path": "C:/a.png", "data_base64": "AAAA" }),
+            ),
+            (
+                "add_layer",
+                json!({ "kind": "image", "data_base64": "!!!" }),
+            ),
+            (
+                "add_layer",
+                json!({ "kind": "video", "url": "file:///C:/a.mp4" }),
+            ),
             ("add_layer", json!({ "kind": "youtube", "link": " " })),
             ("update_layer", json!({ "id": "t" })),
             ("update_layer", json!({ "x": 0.1 })),
@@ -628,7 +667,10 @@ mod tests {
         match &reqs[1] {
             BackendCall::UpdateLayer { id, patch } => {
                 assert_eq!(id, "title-1");
-                assert_eq!(patch, &json!({ "x": 0.1, "colour": null, "hide_after_s": null }));
+                assert_eq!(
+                    patch,
+                    &json!({ "x": 0.1, "colour": null, "hide_after_s": null })
+                );
             }
             c => panic!("{c:?}"),
         }

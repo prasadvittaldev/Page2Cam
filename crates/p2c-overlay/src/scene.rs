@@ -230,7 +230,8 @@ pub const SCENE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'u
 /// An HTML layer's page: sandboxed (opaque origin, scripts only) even when
 /// opened directly; it may load from the web (live data), never reach our API
 /// (no token, no same-origin reads).
-pub const LAYER_CSP: &str = "sandbox allow-scripts; default-src * data: blob: 'unsafe-inline' 'unsafe-eval'";
+pub const LAYER_CSP: &str =
+    "sandbox allow-scripts; default-src * data: blob: 'unsafe-inline' 'unsafe-eval'";
 
 #[cfg(test)]
 mod tests {
