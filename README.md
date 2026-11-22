@@ -32,6 +32,8 @@ You control everything from a simple control page on your own computer. You can 
   If your computer can't keep up with Quality, Page2Cam switches to Fast by itself so your video stays smooth.
 - **Choose the sound for YouTube**: the website's sound, your microphone, or both, each with its own volume.
 - **Use the website live**: click, scroll and type on it from the control page while people are watching.
+- **Change the background**: a picture, a colour, a YouTube video, your blurred room, or **one of your screens**, live.
+- **Let an AI agent run it**: Claude Desktop, Claude Code, Codex, Cursor or VS Code can start Page2Cam, change the page or background, share a screen and go live, from a prompt.
 
 ### What you need
 
@@ -58,11 +60,30 @@ You control everything from a simple control page on your own computer. You can 
    Click **Next** through the pages. The installer sets up everything, including the Page2Cam camera.
    At the end, leave **Start Page2Cam now** ticked and click **Finish**.
 
-4. **Start Page2Cam any time** from the **Start menu** or the **desktop shortcut**.
-   A black window opens. Leave it open, because closing it closes Page2Cam. Your web browser then opens the **Page2Cam control page**.
+4. **Page2Cam waits in the tray** (the icons next to the clock), stopped, so it uses nothing until you need it.
+   Click its icon and choose **Start**, then **Open control page**. You can also start it from the **Start menu** or the **desktop shortcut**.
 
 **Updates are automatic.**
-When a new version is out, the control page shows a blue bar saying **"Page2Cam x.y.z is available"**. Click **Install update**: Page2Cam downloads it, checks that it really comes from Page2Cam, closes, installs it and starts again. Windows asks for permission once.
+When a new version is out, Page2Cam offers it (in the tray and on the control page). Click **Install update**: Page2Cam downloads it, checks that it really comes from Page2Cam, installs it and starts again. Windows asks for permission once.
+
+### The one-line way (PowerShell, or ask an AI agent)
+
+Open **PowerShell** and paste:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/prasadvittaldev/Page2Cam/main/scripts/install-windows.ps1)))"
+```
+
+It downloads the latest installer from the Releases page, checks its checksum, and installs it. Click **Yes** when Windows asks for permission.
+Add **`-AllowAgents`** at the end (inside the last bracket) to also let AI agents control Page2Cam (see below).
+
+**Or just ask your agent.** In Claude Code, Codex, or any agent that can run commands on your PC, type:
+
+> Install Page2Cam on this Windows PC with agent control on: run
+> `powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/prasadvittaldev/Page2Cam/main/scripts/install-windows.ps1))) -AllowAgents"`
+> then tell me to restart my agent apps.
+
+Accept the Windows permission prompt when it appears. After restarting Claude Desktop (or your other agent app), Page2Cam shows up as a tool.
 
 ### The portable way: the zip file
 
@@ -109,8 +130,19 @@ Page2Cam remembers your choices for next time.
 In the **Stream sound** panel, turn **Page sound** and **Microphone** on or off, and set their volumes.
 *The website's sound only goes to YouTube. It is not sent into Teams or Zoom calls.*
 
+### Share a screen
+In the **Background** panel, choose **Screen** in the full-frame row and pick a monitor.
+Everything on that monitor is shown live (Windows draws a yellow border around it while it is shared), with you on top. Choose **Page** again to go back to your website.
+
+### Let AI agents control Page2Cam
+1. Click the Page2Cam tray icon and tick **Allow agents** (or use the installer's `-AllowAgents`).
+2. Restart Claude Desktop, Codex, Cursor or VS Code. Page2Cam registers itself with the ones it finds; Claude Code is registered too when `claude` is installed.
+3. Ask, for example: *"Start Page2Cam, open my dashboard at https://example.com, put me in the bottom-right corner, and share my second screen."*
+
+Agents act without asking, so the tray shows a notification when one starts or stops Page2Cam or your stream, or shares your screen, and the **Agents** panel on the control page lists every change. Untick **Allow agents** to switch it off. Details for developers: [`docs/agent-api.md`](docs/agent-api.md).
+
 ### Close Page2Cam
-Close the black Page2Cam window, or press **Ctrl + C** inside it.
+Click the tray icon and choose **Stop** (Page2Cam stays in the tray) or **Quit**.
 
 ---
 
@@ -122,7 +154,7 @@ The coloured dots at the bottom of the control page show the state of each part:
 |---|---|
 | "The Page2Cam camera is not installed" | Run the installer again. With the zip, run `install-camera.cmd` **as administrator**. Then start Page2Cam again. |
 | Page2Cam doesn't appear as a camera in Teams or Meet | Start Page2Cam first, then fully close and reopen the call app, or reload the Meet page. |
-| The camera shows a dark picture with a moving light band | The camera is installed but Page2Cam isn't running. Start `page2cam.exe`. |
+| The camera shows a dark picture with a moving light band | The camera is installed but Page2Cam isn't running. Click the tray icon and choose **Start**. |
 | "cut-out unavailable" | Run the installer again (with the zip: run `install-camera.cmd` as administrator again). |
 | "Quality was too slow on this PC, switched to Fast" | This is normal on slower computers. Page2Cam switched to keep your video smooth. You can click **Quality** to try again. |
 | "ffmpeg was not found" | Keep `ffmpeg.exe` in the Page2Cam folder. |

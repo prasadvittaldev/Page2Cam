@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
-# Build the Windows 11 test package from Linux: dist/Page2Cam-windows-x64.zip
-# Needs: cargo-xwin, clang-cl + lld-link on PATH, Windows CEF in $CEF_WIN,
+# Build the Windows 11 package: dist/Page2Cam-windows-x64.zip, the installer
+# and SHA256SUMS(.sig). Runs on Linux (cargo-xwin cross-build) or natively on
+# Windows in Git Bash: MSVC toolchain, CMake/Ninja/rc.exe on PATH, CEF in
+# %LOCALAPPDATA%\cef-win, and NSIS 3 with the amd64-unicode stubs/plugins
+# (official Windows NSIS + Debian's nsis-common files) at $MAKENSIS.
+# Linux needs: cargo-xwin, clang-cl + lld-link on PATH, Windows CEF in $CEF_WIN,
 # (export-cef-dir --target x86_64-pc-windows-msvc), llvm-rc, curl, zip, unzip.
 # Cut-out models and ONNX Runtime come from scripts/fetch-models.sh.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CEF_WIN="${CEF_WIN:-$HOME/.local/share/cef-win}"
+case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) NATIVE=1 ;; *) NATIVE= ;; esac
+if [ -n "$NATIVE" ]; then
+  CEF_WIN="${CEF_WIN:-$LOCALAPPDATA/cef-win}"
+  MAKENSIS="${MAKENSIS:-$LOCALAPPDATA/page2cam-build/nsis/makensis.exe}"
+else
+  CEF_WIN="${CEF_WIN:-$HOME/.local/share/cef-win}"
+fi
 TARGET=x86_64-pc-windows-msvc
 OUT="$ROOT/dist/Page2Cam-windows-x64"
 ZIP="$ROOT/dist/Page2Cam-windows-x64.zip"
@@ -27,8 +37,13 @@ export CEF_PATH="$CEF_WIN"
 
 echo "==> Building release binaries for $TARGET"
 cd "$ROOT"
-cargo xwin build --release -p page2cam -p p2c-vcam-win-source --target "$TARGET"
-BIN="$ROOT/target/$TARGET/release"
+if [ -n "$NATIVE" ]; then
+  cargo build --release -p page2cam -p p2c-vcam-win-source
+  BIN="$ROOT/target/release"
+else
+  cargo xwin build --release -p page2cam -p p2c-vcam-win-source --target "$TARGET"
+  BIN="$ROOT/target/$TARGET/release"
+fi
 
 echo "==> Assembling $OUT"
 rm -rf "$OUT" "$ZIP" "$STAGE" "$ROOT"/dist/Page2Cam-Setup-*.exe "$ROOT"/dist/SHA256SUMS*
@@ -79,12 +94,19 @@ for f in page2cam.exe onnxruntime.dll DirectML.dll vc_redist.x64.exe models/rvm_
   [ -s "$OUT/$f" ] || { echo "missing from package: $f" >&2; exit 1; }
 done
 # onnxruntime.dll is loaded at run time, never linked.
-if llvm-readobj --coff-imports "$OUT/page2cam.exe" | grep -qi onnxruntime; then
+if ! command -v llvm-readobj >/dev/null; then
+  echo "(llvm-readobj not found: import check skipped)"
+elif llvm-readobj --coff-imports "$OUT/page2cam.exe" | grep -qi onnxruntime; then
   echo "page2cam.exe must not import onnxruntime.dll" >&2; exit 1
 fi
 
 echo "==> Zipping"
-(cd "$ROOT/dist" && zip -qr -9 "$(basename "$ZIP")" "$(basename "$OUT")")
+if [ -n "$NATIVE" ]; then
+  # Windows' own tar (bsdtar) writes zip files.
+  (cd "$ROOT/dist" && "$SYSTEMROOT/System32/tar.exe" -a -c -f "$(basename "$ZIP")" "$(basename "$OUT")")
+else
+  (cd "$ROOT/dist" && zip -qr -9 "$(basename "$ZIP")" "$(basename "$OUT")")
+fi
 ls -lh "$ZIP"
 
 echo "==> Installer"
@@ -97,11 +119,20 @@ cp "$ROOT/crates/page2cam/windows/page2cam.ico" "$ROOT"/packaging/windows/instal
 cp -r "$OUT"/. "$STAGE"/
 rm -f "$STAGE"/install-camera.cmd "$STAGE"/uninstall-camera.cmd "$STAGE"/page2cam.toml \
       "$STAGE"/README.txt "$STAGE"/vc_redist.x64.exe
-NSISDIR="$NSIS_HOME/usr/share/nsis" "$NSIS_HOME/usr/bin/makensis" -V2 -WX \
-  -DVERSION="$VERSION" -DSRC="$STAGE" -DOUT="$SETUP" \
-  -DVCREDIST="$ROOT/third_party/onnxruntime/windows/vc_redist.x64.exe" \
-  -DBRAND="$BRAND" \
-  "$ROOT/packaging/windows/installer.nsi"
+if [ -n "$NATIVE" ]; then
+  w() { cygpath -w "$1"; }
+  "$MAKENSIS" -V2 -WX \
+    -DVERSION="$VERSION" -DSRC="$(w "$STAGE")" -DOUT="$(w "$SETUP")" \
+    -DVCREDIST="$(w "$ROOT/third_party/onnxruntime/windows/vc_redist.x64.exe")" \
+    -DBRAND="$(w "$BRAND")" \
+    "$(w "$ROOT/packaging/windows/installer.nsi")"
+else
+  NSISDIR="$NSIS_HOME/usr/share/nsis" "$NSIS_HOME/usr/bin/makensis" -V2 -WX \
+    -DVERSION="$VERSION" -DSRC="$STAGE" -DOUT="$SETUP" \
+    -DVCREDIST="$ROOT/third_party/onnxruntime/windows/vc_redist.x64.exe" \
+    -DBRAND="$BRAND" \
+    "$ROOT/packaging/windows/installer.nsi"
+fi
 rm -rf "$STAGE" "$BRAND"
 ls -lh "$SETUP"
 
