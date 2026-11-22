@@ -7,6 +7,7 @@ mod engine;
 mod health;
 mod logging;
 mod mcp_bridge;
+mod overlay;
 mod page_fps;
 mod pattern;
 mod power;
@@ -427,6 +428,8 @@ fn run() -> anyhow::Result<i32> {
 
     let page_ring = AudioRing::new(500);
     let mic_ring = AudioRing::new(500);
+    // Overlay-layer sound (videos, YouTube): part of page sound.
+    let overlay_ring = AudioRing::new(500);
     let mixer = Mixer::new(
         page_ring.clone(),
         mic_ring.clone(),
@@ -434,7 +437,8 @@ fn run() -> anyhow::Result<i32> {
             mic_on: false,
             ..MixSettings::default()
         },
-    );
+    )
+    .with_overlay(overlay_ring.clone());
     let stream = StreamController::new(mixer.clone());
     sinks.push(Box::new(stream.sink()));
 
@@ -549,6 +553,10 @@ fn run() -> anyhow::Result<i32> {
         let l = *layout.read();
         seg.set_enabled(l.visible && backdrop.read().needs_mask(&l));
     }
+    // Overlay layers (saved ones come back hidden); the ticker draws them
+    // over everything while one is visible.
+    let data_dir = directories::ProjectDirs::from("", "", "page2cam").map(|d| d.data_dir().to_path_buf());
+    let overlays = overlay::OverlayLayers::new(data_dir.as_deref(), cfg.fps);
     let (events_tx, events) = mpsc::channel();
     let ticker = Ticker::spawn(
         spec,
@@ -558,7 +566,7 @@ fn run() -> anyhow::Result<i32> {
         segmenter.as_ref().map(|_| matte.clone()),
         layout.clone(),
         backdrop.clone(),
-        None,
+        Some(overlays.feed.clone()),
         video_start.producer,
         sinks,
         events_tx,
@@ -587,8 +595,7 @@ fn run() -> anyhow::Result<i32> {
         bg: Mutex::new(bg_state),
         apply_lock: Mutex::new(()),
         bg_base: OnceLock::new(),
-        data_dir: directories::ProjectDirs::from("", "", "page2cam")
-            .map(|d| d.data_dir().to_path_buf()),
+        data_dir,
         thumbs: background::ThumbCache::new(Box::new(|url| p2c_update::fetch_small(url, 8))),
         stream,
         mixer,
@@ -635,6 +642,7 @@ fn run() -> anyhow::Result<i32> {
         })),
         page_paused: Arc::default(),
         output_frame: preview.clone(),
+        overlay: overlays,
     });
 
     // Applies to the next stream start; a live stream is not restarted.
@@ -708,6 +716,7 @@ fn run() -> anyhow::Result<i32> {
                     // History moves (Back/Forward, the page itself) must not leave one
                     // of our background pages up.
                     app.keep_page_off_background();
+                    app.overlay.tick(std::time::Instant::now());
                     if round.is_multiple_of(4) {
                         app.sample_health();
                         app.govern_page_fps();
@@ -767,6 +776,7 @@ fn run() -> anyhow::Result<i32> {
     }
     // Background pages are served by the admin server: a saved YouTube,
     // picture or colour background starts now that its URL is known.
+    let ov_url = admin.as_ref().ok().map(|a| a.ov_url.clone());
     let start_url = match &admin {
         Ok(a) => app.start_background(a.bg_url.clone()),
         Err(_) => None,
@@ -807,7 +817,14 @@ fn run() -> anyhow::Result<i32> {
             // Built from a LUID enumerated again just now (R7).
             gpu_page: gpu_page(gpu_video.as_ref(), &fallback),
             paused: app.page_paused.clone(),
-            overlay: None,
+            overlay: ov_url.map(|url| p2c_browser::OverlayBrowser {
+                url,
+                slot: app.overlay.feed.slot.clone(),
+                fps: cfg.fps,
+                audio: Some(overlay_ring),
+                on_texture: gpu_overlay(gpu_video.as_ref()),
+                paused: app.overlay.paused.clone(),
+            }),
         };
         let watch = browser_cfg
             .gpu_page
@@ -835,6 +852,9 @@ fn run() -> anyhow::Result<i32> {
                 let q = app2.quit_main.lock();
                 let _ = app2.browser.set(handle.clone());
                 let _ = browser_cell.set(handle.clone());
+                if let Some(o) = handle.overlay() {
+                    app2.overlay.set_browser(o);
+                }
                 if *f {
                     handle.recreate_cpu();
                 }
@@ -1109,6 +1129,21 @@ fn gpu_page(
     _gpu: Option<&GpuVideo>,
     _fallback: &p2c_compositor::FallbackTrigger,
 ) -> Option<p2c_browser::GpuPage> {
+    None
+}
+
+/// The overlay browser's shared textures go to the overlay input of the
+/// current device (through the holder, like the page's).
+#[cfg(windows)]
+fn gpu_overlay(gpu: Option<&GpuVideo>) -> Option<p2c_browser::TextureCallback> {
+    let holder = gpu?.holder.clone();
+    Some(Arc::new(move |handle, _w, _h| {
+        holder.on_overlay_texture(handle).is_ok()
+    }))
+}
+
+#[cfg(not(windows))]
+fn gpu_overlay(_gpu: Option<&GpuVideo>) -> Option<p2c_browser::TextureCallback> {
     None
 }
 

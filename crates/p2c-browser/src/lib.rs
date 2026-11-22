@@ -7,7 +7,7 @@ mod handlers;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,9 @@ pub struct BrowserConfig {
     pub overlay: Option<OverlayBrowser>,
 }
 
+/// Receives a shared texture: NT handle (valid only during the call), width, height.
+pub type TextureCallback = Arc<dyn Fn(isize, u32, u32) -> bool + Send + Sync>;
+
 /// The transparent overlay browser: its background is fully transparent, so
 /// its frames carry premultiplied alpha (0 where nothing is drawn). It
 /// renders at the page's configured size (never resized) on the same GPU.
@@ -51,7 +54,7 @@ pub struct OverlayBrowser {
     /// Where its sound goes (48 kHz stereo); `None` plays to the speakers.
     pub audio: Option<AudioRing>,
     /// GPU path: shared textures (only used when the page is on the GPU).
-    pub on_texture: Option<Arc<dyn Fn(isize, u32, u32) -> bool + Send + Sync>>,
+    pub on_texture: Option<TextureCallback>,
     /// Paints are dropped while set (nothing visible: no overlay pass).
     pub paused: Arc<AtomicBool>,
 }
@@ -559,7 +562,7 @@ pub fn run(
         }
     });
 
-    let (tx, rx): (Sender<(Target, Cmd)>, Receiver<(Target, Cmd)>) = mpsc::channel();
+    let (tx, rx) = mpsc::channel::<(Target, Cmd)>();
     let overlay_handle = overlay.as_ref().map(|o| {
         Arc::new(BrowserHandle {
             tx: tx.clone(),

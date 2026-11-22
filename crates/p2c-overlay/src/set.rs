@@ -366,6 +366,34 @@ impl LayerSet {
         Ok(layer)
     }
 
+    /// A new file for an image or video layer (an upload from the control
+    /// page; recognised by its first bytes).
+    pub fn set_asset(&mut self, id: &str, bytes: &[u8], assets: &Assets) -> Result<Layer> {
+        let i = self.index(id)?;
+        let old = self.layers[i].clone();
+        let want = match old.content.kind() {
+            "image" => MediaKind::Image,
+            "video" => MediaKind::Video,
+            k => bail!("a {k} layer takes no file"),
+        };
+        let name = assets.store(id, bytes, want)?;
+        let mut base = old.to_json().as_object().cloned().expect("layer is an object");
+        base.insert("asset".into(), json!(name));
+        let layer = match from_json(Value::Object(base)) {
+            Ok(l) => l,
+            Err(e) => {
+                assets.remove(&name);
+                return Err(e);
+            }
+        };
+        if let Some(a) = old.content.asset() {
+            assets.remove(a);
+        }
+        self.layers[i] = layer.clone();
+        self.touch();
+        Ok(layer)
+    }
+
     /// Show a layer (plays its enter animation; restarts its auto-hide).
     pub fn show(&mut self, id: &str, now: Instant) -> Result<Layer> {
         let i = self.index(id)?;

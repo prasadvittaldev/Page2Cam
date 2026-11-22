@@ -101,6 +101,88 @@ fn overlay_is_transparent(slot: &FrameSlot) -> Result<(), String> {
     Err(last)
 }
 
+/// A tiny HTTP server for the real overlay scene (`p2c_overlay::scene`)
+/// with the admin server's headers: a news title and an HTML layer.
+fn serve_scene() -> String {
+    use std::io::{Read, Write};
+    let d = tempfile::tempdir().unwrap();
+    let assets = p2c_overlay::Assets::new(d.path());
+    let mut set = p2c_overlay::LayerSet::new();
+    let now = Instant::now();
+    set.add(
+        serde_json::json!({"kind": "title", "text": "Hi", "id": "t", "enter": "none"}),
+        &assets,
+        now,
+    )
+    .unwrap();
+    set.add(
+        serde_json::json!({"kind": "html", "id": "chart", "enter": "none",
+            "html": "<div style='width:100%;height:100%;background:#00ff00'></div>\
+                     <script>document.body.dataset.ok = 1</script>"}),
+        &assets,
+        now,
+    )
+    .unwrap();
+    let state = set.state_json().to_string();
+    let html = p2c_overlay::scene::layer_page(set.html_of("chart").unwrap());
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let _keep = d;
+        for s in l.incoming().flatten() {
+            let mut s = s;
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+            let path = path.split('?').next().unwrap_or("").to_string();
+            let (ctype, csp, body) = match path.as_str() {
+                "/ov/x/scene.html" => (
+                    "text/html",
+                    p2c_overlay::scene::SCENE_CSP,
+                    p2c_overlay::scene::SCENE_HTML.to_string(),
+                ),
+                "/ov/x/scene.js" => ("text/javascript", "", p2c_overlay::scene::SCENE_JS.to_string()),
+                "/ov/x/state" => ("application/json", "", state.clone()),
+                "/ov/x/layer/chart" => ("text/html", p2c_overlay::scene::LAYER_CSP, html.clone()),
+                _ => ("text/plain", "", String::new()),
+            };
+            let csp = if csp.is_empty() {
+                String::new()
+            } else {
+                format!("Content-Security-Policy: {csp}\r\n")
+            };
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n{csp}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    format!("http://127.0.0.1:{port}/ov/x/scene.html")
+}
+
+/// The overlay browser on the real scene page: the title's box and the
+/// HTML layer (in its sandboxed frame) are drawn, the rest stays transparent.
+fn scene_draws_layers(overlay: &BrowserHandle, slot: &FrameSlot) -> Result<(), String> {
+    overlay.navigate(&serve_scene());
+    let navy = [0x5b, 0x2a, 0x0b, 255];
+    let start = Instant::now();
+    let mut last = String::from("no overlay frame");
+    while start.elapsed() < Duration::from_secs(15) {
+        if let Some(f) = slot.latest() {
+            let (bg, title, chart) = (f.pixel(100, 60), f.pixel(300, 288), f.pixel(500, 80));
+            if bg[3] == 0 && close(title, navy) && close(chart, GREEN) {
+                println!("test overlay_scene_draws_layers ... ok");
+                return Ok(());
+            }
+            last = format!("transparent {bg:?}, title {title:?} (want {navy:?}), html {chart:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("scene: {last}"))
+}
+
 /// The page renders at a new view size (the quality throttle's resolution
 /// lever), and back; the overlay keeps its size.
 fn set_size_resizes_page(h: &BrowserHandle, slot: &FrameSlot, overlay: &FrameSlot) -> Result<(), String> {
@@ -489,6 +571,10 @@ fn main() {
             let r = gpu_steps()
                 .and_then(|()| overlay_is_transparent(&overlay_slot))
                 .and_then(|()| set_size_resizes_page(&h, &watch, &overlay_slot))
+                .and_then(|()| {
+                    let o = h.overlay().ok_or("no overlay browser")?;
+                    scene_draws_layers(&o, &overlay_slot)
+                })
                 .and_then(|()| scenario(&h, &watch, &audio));
             tx.send(r).unwrap();
             h.shutdown();

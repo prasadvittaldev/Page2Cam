@@ -2457,14 +2457,17 @@ version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "futures-util",
  "http-body-util",
  "jpeg-encoder",
  "p2c-compositor",
  "p2c-core",
+ "p2c-overlay",
  "rand 0.9.5",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",
@@ -2490,7 +2493,10 @@ dependencies = [
  "cef",
  "p2c-core",
  "p2c-d3d",
+ "p2c-overlay",
  "parking_lot",
+ "serde_json",
+ "tempfile",
  "tracing",
 ]
 

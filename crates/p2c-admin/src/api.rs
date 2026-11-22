@@ -233,6 +233,11 @@ pub struct Status {
     /// Agents may control Page2Cam (read from the tray). `None` without a tray.
     #[serde(default)]
     pub agents_allowed: Option<bool>,
+    /// Overlay layers visible now.
+    pub overlay_layers: usize,
+    /// The overlay pass is running (a layer is visible or its exit
+    /// animation is still playing).
+    pub overlay_on: bool,
 }
 
 /// Engine health for the tray (rates over a rolling ~10 s window).
@@ -341,7 +346,7 @@ impl ImageRow {
 }
 
 /// The app side of the admin UI. Implementations must be cheap and non-blocking.
-pub trait Controls: Send + Sync + 'static {
+pub trait Controls: Overlays + Send + Sync + 'static {
     fn navigate(&self, url: &str);
     fn nav(&self, a: NavAction);
     fn input(&self, ev: InputEvent);
@@ -394,4 +399,57 @@ pub trait Controls: Send + Sync + 'static {
     /// The monitors the screen background can show; an error where screen
     /// capture isn't available ("screen capture is Windows-only for now").
     fn screens(&self) -> Result<Vec<ScreenDto>, String>;
+}
+
+/// Overlay layers (titles, tickers, HTML, pictures, videos, YouTube) drawn
+/// over the output. Layers travel as flat JSON objects (see
+/// `p2c_overlay::Layer`). The defaults answer "unavailable" (a build or test
+/// without overlays).
+pub trait Overlays {
+    /// Every layer, back to front.
+    fn layers(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    /// Add a layer (`kind` plus fields; `path`/`data_base64` for media).
+    /// Slow with media (copies the file): call it off the async runtime.
+    fn add_layer(&self, _spec: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("overlay layers are not available")
+    }
+    /// Change some fields of a layer (`visible: true` shows it, restarting
+    /// its auto-hide). Errors change nothing.
+    fn update_layer(
+        &self,
+        _id: &str,
+        _patch: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("overlay layers are not available")
+    }
+    /// Delete a layer (and its stored file).
+    fn remove_layer(&self, _id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("overlay layers are not available")
+    }
+    /// Hide every layer; how many were visible.
+    fn clear_layers(&self) -> usize {
+        0
+    }
+    /// Restack: `ids` from back to front.
+    fn reorder_layers(&self, _ids: Vec<String>) -> anyhow::Result<()> {
+        anyhow::bail!("overlay layers are not available")
+    }
+    /// A new picture/video file for an image/video layer (an upload).
+    fn set_layer_asset(&self, _id: &str, _bytes: Vec<u8>) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("overlay layers are not available")
+    }
+    /// The scene state (`{rev, layers}`), or `None` while it is still `since`.
+    fn overlay_state(&self, _since: Option<u64>) -> Option<serde_json::Value> {
+        None
+    }
+    /// The fragment of an HTML layer.
+    fn overlay_layer_html(&self, _id: &str) -> Option<String> {
+        None
+    }
+    /// A stored overlay file and its content type.
+    fn overlay_asset(&self, _name: &str) -> Option<(Vec<u8>, &'static str)> {
+        None
+    }
 }

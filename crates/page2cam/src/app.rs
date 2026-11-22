@@ -101,6 +101,8 @@ pub struct App {
     pub page_paused: Arc<std::sync::atomic::AtomicBool>,
     /// Latest output frame (shared with the preview sink); snapshots encode from it on demand.
     pub output_frame: FrameSlot,
+    /// Overlay layers (titles, tickers, HTML…) and the overlay browser's on/off.
+    pub overlay: crate::overlay::OverlayLayers,
 }
 
 /// Lock `m` for the status/health readers. Debug builds panic if it stays
@@ -288,6 +290,7 @@ impl App {
                 "page frame rate changed (output skipping ticks)"
             );
             self.with_browser(|b| b.set_frame_rate(fps));
+            self.overlay.set_fps(fps);
         }
     }
 
@@ -707,6 +710,43 @@ impl App {
     }
 }
 
+impl p2c_admin::Overlays for App {
+    fn layers(&self) -> Vec<serde_json::Value> {
+        self.overlay.layers()
+    }
+    fn add_layer(&self, spec: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        self.overlay.add(spec)
+    }
+    fn update_layer(
+        &self,
+        id: &str,
+        patch: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.overlay.update(id, patch)
+    }
+    fn remove_layer(&self, id: &str) -> anyhow::Result<()> {
+        self.overlay.remove(id)
+    }
+    fn clear_layers(&self) -> usize {
+        self.overlay.clear()
+    }
+    fn reorder_layers(&self, ids: Vec<String>) -> anyhow::Result<()> {
+        self.overlay.reorder(ids)
+    }
+    fn set_layer_asset(&self, id: &str, bytes: Vec<u8>) -> anyhow::Result<serde_json::Value> {
+        self.overlay.set_asset(id, &bytes)
+    }
+    fn overlay_state(&self, since: Option<u64>) -> Option<serde_json::Value> {
+        self.overlay.state(since)
+    }
+    fn overlay_layer_html(&self, id: &str) -> Option<String> {
+        self.overlay.html_of(id)
+    }
+    fn overlay_asset(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
+        self.overlay.asset(name)
+    }
+}
+
 impl Controls for App {
     fn navigate(&self, url: &str) {
         tracing::info!(url, "navigate");
@@ -932,6 +972,8 @@ impl Controls for App {
             gpu_running: self.gpu_running.clone(),
             health,
             agents_allowed: p2c_admin::TrayLink::global().and_then(|l| l.allowed()),
+            overlay_layers: self.overlay.visible_count(),
+            overlay_on: self.overlay.is_active(),
             background,
             box_background,
             refined_edges,
@@ -1547,6 +1589,7 @@ mod tests {
             )),
             page_paused: Arc::default(),
             output_frame: FrameSlot::new(),
+            overlay: crate::overlay::OverlayLayers::new(None, 30),
         }
     }
 
