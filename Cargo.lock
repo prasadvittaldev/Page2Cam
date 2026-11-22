@@ -2534,6 +2534,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2c-overlay"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "p2c-proc"
 version = "0.5.0"
 dependencies = [
@@ -2680,6 +2692,7 @@ dependencies = [
  "p2c-core",
  "p2c-d3d",
  "p2c-mcp",
+ "p2c-overlay",
  "p2c-proc",
  "p2c-screen",
  "p2c-segment",
