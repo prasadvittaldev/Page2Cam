@@ -2453,7 +2453,7 @@ checksum = "8d22b0417f1838db5a3ac0b3f98dfe39f6fb73624aa0a27c6bbb5040b9c7db2b"
 
 [[package]]
 name = "p2c-admin"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2476,7 +2476,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-audio"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -2487,7 +2487,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-browser"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "cef",
@@ -2502,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-compositor"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "fast_image_resize",
@@ -2513,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "parking_lot",
  "thiserror 2.0.21",
@@ -2521,7 +2521,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-d3d"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "p2c-compositor",
@@ -2533,7 +2533,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-mcp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "serde_json",
@@ -2541,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-overlay"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2553,7 +2553,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-proc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -2563,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-screen"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "p2c-core",
@@ -2573,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-segment"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "image",
@@ -2588,11 +2588,11 @@ dependencies = [
 
 [[package]]
 name = "p2c-shm"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "p2c-stream"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "p2c-audio",
@@ -2606,7 +2606,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-tray"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -2630,7 +2630,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-update"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2644,7 +2644,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-vcam"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "nix 0.29.0",
@@ -2658,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-vcam-win-source"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "p2c-shm",
  "windows 0.62.2",
@@ -2667,7 +2667,7 @@ dependencies = [
 
 [[package]]
 name = "p2c-webcam"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2683,7 +2683,7 @@ dependencies = [
 
 [[package]]
 name = "page2cam"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
