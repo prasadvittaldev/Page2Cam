@@ -23,6 +23,8 @@ pub struct PageHolder(Arc<Mutex<HolderState>>);
 #[derive(Default)]
 struct HolderState {
     page: Option<PageInput>,
+    /// The overlay layers (transparent browser), on the same device.
+    overlay: Option<PageInput>,
     /// Bumped by every rebuild start and give-up: a rebuild thread publishes
     /// its page input only while its generation is current (a given-up
     /// rebuild that finishes late must not take Chromium's frames).
@@ -50,6 +52,28 @@ impl PageHolder {
         }
     }
 
+    /// The overlay browser's shared texture (see [`PageInput::on_shared_texture`]);
+    /// dropped while the device is being recreated.
+    pub fn on_overlay_texture(&self, handle: isize) -> Result<()> {
+        match self.current_overlay() {
+            Some(p) => p.on_shared_texture(handle),
+            None => Ok(()),
+        }
+    }
+
+    /// A CPU overlay frame (the overlay browser painting on the CPU).
+    pub fn upload_overlay_frame(&self, f: &p2c_core::Frame) -> Result<()> {
+        match self.current_overlay() {
+            Some(p) => p.upload_frame(f),
+            None => Ok(()),
+        }
+    }
+
+    /// The current overlay input (`None` while the device is being recreated).
+    pub fn current_overlay(&self) -> Option<PageInput> {
+        self.lock().overlay.clone()
+    }
+
     /// The current page input (`None` while the device is being recreated).
     pub fn current(&self) -> Option<PageInput> {
         self.lock().page.clone()
@@ -64,16 +88,18 @@ impl PageHolder {
     fn begin(&self) -> u64 {
         let mut s = self.lock();
         s.page = None;
+        s.overlay = None;
         s.generation += 1;
         s.generation
     }
 
     /// Route frames to `page` if `generation` is still current.
-    fn publish(&self, generation: u64, page: PageInput) -> bool {
+    fn publish(&self, generation: u64, page: PageInput, overlay: PageInput) -> bool {
         let mut s = self.lock();
         let current = s.generation == generation;
         if current {
             s.page = Some(page);
+            s.overlay = Some(overlay);
         }
         current
     }
@@ -157,9 +183,12 @@ pub struct RecoveringProducer {
 fn build(luid: u64, spec: OutputSpec, holder: &PageHolder, generation: u64) -> Result<GpuProducer> {
     let gpu = Gpu::new(luid).context("D3D11 device")?;
     let page = PageInput::new(&gpu, spec.width, spec.height).context("page texture")?;
-    let producer = GpuProducer::new(gpu, page.clone(), spec).context("GPU compositor")?;
+    let overlay = PageInput::new(&gpu, spec.width, spec.height).context("overlay texture")?;
+    let producer = GpuProducer::new(gpu, page.clone(), spec)
+        .context("GPU compositor")?
+        .with_overlay(overlay.clone());
     anyhow::ensure!(
-        holder.publish(generation, page),
+        holder.publish(generation, page, overlay),
         "GPU device rebuild was given up"
     );
     Ok(producer)

@@ -69,6 +69,10 @@ pub struct AdminServer {
     /// `http://127.0.0.1:<port>/bg/<per-launch random id>/` (no token needed;
     /// the unguessable id and the Host check guard it).
     pub bg_url: String,
+    /// The overlay scene page the overlay browser loads:
+    /// `http://127.0.0.1:<port>/ov/<per-launch random id>/scene.html` (no token
+    /// needed; the unguessable id and the Host check guard it).
+    pub ov_url: String,
 }
 
 #[derive(Clone)]
@@ -82,6 +86,8 @@ pub(crate) struct State {
     tray: Option<Arc<TrayLink>>,
     /// Per-launch random id of the background pages (`/bg/<id>/…`).
     pub(crate) bg_id: Arc<str>,
+    /// Per-launch random id of the overlay scene (`/ov/<id>/…`).
+    pub(crate) ov_id: Arc<str>,
 }
 
 impl State {
@@ -102,6 +108,7 @@ impl State {
             preview: Arc::new(tx),
             tray: TrayLink::global(),
             bg_id: random_token().into(),
+            ov_id: random_token().into(),
         }
     }
 }
@@ -140,6 +147,21 @@ pub(crate) fn router(st: State) -> Router {
         .route("/api/background/thumb", get(background_thumb))
         .route("/bg/{id}/current.html", get(bg_page))
         .route("/bg/{id}/image", get(bg_image))
+        .route("/api/layers", get(layers_get).post(layer_add))
+        .route("/api/layers/clear", post(layers_clear))
+        .route("/api/layers/order", post(layers_order))
+        .route("/api/layers/{id}", post(layer_update).delete(layer_delete))
+        .route(
+            "/api/layers/{id}/asset",
+            post(layer_asset)
+                // Pictures and video files (videos up to 200 MB).
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_LAYER_ASSET_BYTES)),
+        )
+        .route("/ov/{id}/scene.html", get(ov_scene))
+        .route("/ov/{id}/scene.js", get(ov_scene_js))
+        .route("/ov/{id}/state", get(ov_state))
+        .route("/ov/{id}/layer/{layer}", get(ov_layer))
+        .route("/ov/{id}/asset/{name}", get(ov_asset))
         .route("/ws", get(ws))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(st.clone(), guard))
@@ -153,7 +175,7 @@ pub fn serve(
     preview_frames: FrameSlot,
 ) -> anyhow::Result<AdminServer> {
     let token = cfg.token.clone().unwrap_or_else(random_token);
-    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<(SocketAddr, Arc<str>)>>();
+    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<(SocketAddr, Arc<str>, Arc<str>)>>();
     let token2 = token.clone();
     std::thread::Builder::new()
         .name("p2c-admin".into())
@@ -191,21 +213,27 @@ pub fn serve(
                 let addr = listener.local_addr().expect("bound socket has an address");
                 let st = State::new(controls, token2, addr.port(), cfg.width, cfg.height);
                 spawn_encoder(preview_frames, st.preview.clone());
-                let _ = tx.send(Ok((addr, st.bg_id.clone())));
+                let _ = tx.send(Ok((addr, st.bg_id.clone(), st.ov_id.clone())));
                 if let Err(e) = axum::serve(listener, router(st)).await {
                     tracing::error!(error = %e, "admin server stopped");
                 }
             });
         })?;
-    let (addr, bg_id) = rx.recv()??;
+    let (addr, bg_id, ov_id) = rx.recv()??;
     let bg_url = format!("http://127.0.0.1:{}/bg/{bg_id}/", addr.port());
+    let ov_url = format!("http://127.0.0.1:{}/ov/{ov_id}/scene.html", addr.port());
     let url = format!("http://127.0.0.1:{}/?t={}", addr.port(), token);
     if cfg.open_browser {
         if let Err(e) = webbrowser::open(&url) {
             tracing::warn!(error = %e, "could not open a browser; open the admin URL manually");
         }
     }
-    Ok(AdminServer { addr, url, bg_url })
+    Ok(AdminServer {
+        addr,
+        url,
+        bg_url,
+        ov_url,
+    })
 }
 
 fn random_token() -> String {
@@ -244,6 +272,19 @@ async fn guard(AxState(st): AxState<State>, req: Request, next: Next) -> Respons
         let known = rest.split_once('/').is_some_and(|(id, file)| {
             constant_time_eq(id.as_bytes(), st.bg_id.as_bytes())
                 && matches!(file, "current.html" | "image")
+        });
+        if !known {
+            return (StatusCode::NOT_FOUND, "not found").into_response();
+        }
+        return next.run(req).await;
+    }
+    // The overlay scene: the same rules, its own id and files.
+    if let Some(rest) = req.uri().path().strip_prefix("/ov/") {
+        if !host_ok {
+            return (StatusCode::FORBIDDEN, "forbidden").into_response();
+        }
+        let known = rest.split_once('/').is_some_and(|(id, file)| {
+            constant_time_eq(id.as_bytes(), st.ov_id.as_bytes()) && ov_file_ok(file)
         });
         if !known {
             return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -753,6 +794,205 @@ async fn bg_image(AxState(st): AxState<State>) -> Response {
     image_response(st.controls.background_image(ImageRow::Full))
 }
 
+/// Largest overlay file upload (videos).
+const MAX_LAYER_ASSET_BYTES: usize = 200 * 1024 * 1024;
+
+/// The overlay scene's files: `scene.html`, `scene.js`, `state`,
+/// `layer/<layer id>` and `asset/<stored name>` (names checked again by the
+/// handlers).
+fn ov_file_ok(file: &str) -> bool {
+    let simple = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 80
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+            && !s.contains("..")
+    };
+    match file {
+        "scene.html" | "scene.js" | "state" => true,
+        f => match f.split_once('/') {
+            Some(("layer", id)) => simple(id) && !id.contains('.'),
+            Some(("asset", name)) => simple(name),
+            _ => false,
+        },
+    }
+}
+
+/// Run an overlay call off the async runtime (it may copy files and write
+/// layers.json) and answer the layer, or 400 `{error}`.
+async fn overlay_call(
+    st: &State,
+    f: impl FnOnce(&dyn Controls) -> anyhow::Result<serde_json::Value> + Send + 'static,
+) -> Response {
+    let c = st.controls.clone();
+    match tokio::task::spawn_blocking(move || f(c.as_ref())).await {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => json_error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// `GET /api/layers`: the layers (back to front) and the choices.
+async fn layers_get(AxState(st): AxState<State>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "layers": st.controls.layers(),
+        "kinds": p2c_overlay::KINDS,
+        "presets": p2c_overlay::PRESETS,
+        "anims": p2c_overlay::ANIMS,
+    }))
+}
+
+/// `POST /api/layers`: add a layer.
+async fn layer_add(AxState(st): AxState<State>, Json(b): Json<serde_json::Value>) -> Response {
+    overlay_call(&st, move |c| c.add_layer(b)).await
+}
+
+/// `POST /api/layers/<id>`: change some fields (partial).
+async fn layer_update(
+    AxState(st): AxState<State>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(b): Json<serde_json::Value>,
+) -> Response {
+    overlay_call(&st, move |c| c.update_layer(&id, b)).await
+}
+
+/// `DELETE /api/layers/<id>`.
+async fn layer_delete(
+    AxState(st): AxState<State>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    overlay_call(&st, move |c| {
+        c.remove_layer(&id)
+            .map(|()| serde_json::json!({ "removed": id }))
+    })
+    .await
+}
+
+/// `POST /api/layers/clear`: hide every layer.
+async fn layers_clear(AxState(st): AxState<State>) -> Response {
+    overlay_call(&st, |c| {
+        Ok(serde_json::json!({ "hidden": c.clear_layers() }))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct OrderBody {
+    ids: Vec<String>,
+}
+
+/// `POST /api/layers/order` `{ids}`: back to front.
+async fn layers_order(AxState(st): AxState<State>, Json(b): Json<OrderBody>) -> Response {
+    overlay_call(&st, move |c| {
+        c.reorder_layers(b.ids)
+            .map(|()| serde_json::json!({ "layers": c.layers() }))
+    })
+    .await
+}
+
+/// `POST /api/layers/<id>/asset`, body = a picture or video file.
+async fn layer_asset(
+    AxState(st): AxState<State>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    if p2c_overlay::assets::sniff(&body).is_none() {
+        return json_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "only PNG, JPEG, WebP, GIF pictures and MP4, WebM videos are accepted",
+        );
+    }
+    overlay_call(&st, move |c| c.set_layer_asset(&id, body.to_vec())).await
+}
+
+/// `GET /ov/<id>/scene.html` (id checked by the guard; no token).
+async fn ov_scene() -> Response {
+    (
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                p2c_overlay::scene::SCENE_CSP,
+            ),
+            (header::REFERRER_POLICY, "strict-origin-when-cross-origin"),
+        ],
+        Html(p2c_overlay::scene::SCENE_HTML),
+    )
+        .into_response()
+}
+
+/// `GET /ov/<id>/scene.js`: the host page's own script.
+async fn ov_scene_js() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        p2c_overlay::scene::SCENE_JS,
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct SinceQuery {
+    since: Option<i64>,
+}
+
+/// `GET /ov/<id>/state[?since=<rev>]`: 204 while unchanged.
+async fn ov_state(
+    AxState(st): AxState<State>,
+    q: Result<axum::extract::Query<SinceQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let since = q
+        .ok()
+        .and_then(|q| q.0.since)
+        .and_then(|s| u64::try_from(s).ok());
+    match st.controls.overlay_state(since) {
+        Some(v) => ([(header::CACHE_CONTROL, "no-store")], Json(v)).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+/// `GET /ov/<id>/layer/<layer id>`: an HTML layer's page (sandboxed).
+async fn ov_layer(
+    AxState(st): AxState<State>,
+    axum::extract::Path((_, layer)): axum::extract::Path<(String, String)>,
+) -> Response {
+    match st.controls.overlay_layer_html(&layer) {
+        Some(frag) => (
+            [
+                (header::CACHE_CONTROL, "no-store"),
+                (
+                    header::CONTENT_SECURITY_POLICY,
+                    p2c_overlay::scene::LAYER_CSP,
+                ),
+            ],
+            Html(p2c_overlay::scene::layer_page(&frag)),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no such layer").into_response(),
+    }
+}
+
+/// `GET /ov/<id>/asset/<name>`: a stored overlay picture or video.
+async fn ov_asset(
+    AxState(st): AxState<State>,
+    axum::extract::Path((_, name)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let c = st.controls.clone();
+    match tokio::task::spawn_blocking(move || c.overlay_asset(&name)).await {
+        Ok(Some((bytes, kind))) => (
+            [
+                (header::CONTENT_TYPE, kind),
+                (header::CACHE_CONTROL, "max-age=3600"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        _ => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
 async fn ws(AxState(st): AxState<State>, up: WebSocketUpgrade) -> Response {
     up.on_upgrade(move |socket| handle_ws(st, socket))
 }
@@ -944,6 +1184,75 @@ mod tests {
             pub full_image: Mutex<Option<Vec<u8>>>,
             /// The `link` of every thumbnail request.
             pub thumbs: Mutex<Vec<Option<String>>>,
+            pub ov: OvFake,
+        }
+
+        /// A real layer list over a temporary asset folder.
+        pub struct OvFake {
+            pub set: Mutex<p2c_overlay::LayerSet>,
+            pub assets: p2c_overlay::Assets,
+            _dir: tempfile::TempDir,
+        }
+
+        impl Default for OvFake {
+            fn default() -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                OvFake {
+                    set: Mutex::default(),
+                    assets: p2c_overlay::Assets::new(dir.path().join("assets")),
+                    _dir: dir,
+                }
+            }
+        }
+
+        impl Overlays for Fake {
+            fn layers(&self) -> Vec<serde_json::Value> {
+                let s = self.ov.set.lock().unwrap();
+                s.layers().iter().map(|l| l.to_json()).collect()
+            }
+            fn add_layer(&self, spec: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+                let mut s = self.ov.set.lock().unwrap();
+                let now = std::time::Instant::now();
+                Ok(s.add(spec, &self.ov.assets, now)?.to_json())
+            }
+            fn update_layer(
+                &self,
+                id: &str,
+                patch: serde_json::Value,
+            ) -> anyhow::Result<serde_json::Value> {
+                let mut s = self.ov.set.lock().unwrap();
+                let now = std::time::Instant::now();
+                Ok(s.update(id, patch, &self.ov.assets, now)?.to_json())
+            }
+            fn remove_layer(&self, id: &str) -> anyhow::Result<()> {
+                let mut s = self.ov.set.lock().unwrap();
+                s.remove(id, &self.ov.assets).map(|_| ())
+            }
+            fn clear_layers(&self) -> usize {
+                self.ov.set.lock().unwrap().clear()
+            }
+            fn reorder_layers(&self, ids: Vec<String>) -> anyhow::Result<()> {
+                self.ov.set.lock().unwrap().reorder(&ids)
+            }
+            fn set_layer_asset(
+                &self,
+                id: &str,
+                bytes: Vec<u8>,
+            ) -> anyhow::Result<serde_json::Value> {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                self.update_layer(id, serde_json::json!({ "data_base64": b64 }))
+            }
+            fn overlay_state(&self, since: Option<u64>) -> Option<serde_json::Value> {
+                let s = self.ov.set.lock().unwrap();
+                (since != Some(s.rev())).then(|| s.state_json())
+            }
+            fn overlay_layer_html(&self, id: &str) -> Option<String> {
+                self.ov.set.lock().unwrap().html_of(id).map(str::to_string)
+            }
+            fn overlay_asset(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
+                self.ov.assets.read(name)
+            }
         }
 
         fn gpu(name: &str, kind: &str) -> GpuInfo {
@@ -2455,5 +2764,226 @@ mod tests {
         assert!(fake.background.lock().unwrap().is_none());
         assert!(fake.uploads.lock().unwrap().is_empty());
         assert!(fake.thumbs.lock().unwrap().is_empty());
+    }
+
+    async fn call_json(
+        a: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let r = a
+            .clone()
+            .oneshot(req(method, uri, "127.0.0.1:8765", Some(TOKEN), body))
+            .await
+            .unwrap();
+        let code = r.status();
+        let s = body_string(r).await;
+        (
+            code,
+            serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn layer_routes_add_change_list_and_remove() {
+        let fake = Arc::new(Fake::default());
+        let a = app(fake.clone());
+        let (c, v) = call_json(
+            &a,
+            "POST",
+            "/api/layers",
+            Some(r#"{"kind":"title","text":"Hello","subtitle":"World","style":"brand"}"#),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        assert_eq!(v["id"], "title-1");
+        assert_eq!(v["visible"], true);
+        // Partial change: only x moves.
+        let (c, v) = call_json(&a, "POST", "/api/layers/title-1", Some(r#"{"x":0.2}"#)).await;
+        assert_eq!(c, StatusCode::OK);
+        assert!((v["x"].as_f64().unwrap() - 0.2).abs() < 1e-6);
+        assert_eq!(v["subtitle"], "World");
+        // Bad input: 400 with the reason, nothing changed.
+        for (uri, body, msg) in [
+            ("/api/layers", r#"{"kind":"title"}"#, "needs text"),
+            ("/api/layers", r#"{"kind":"nope"}"#, "unknown kind"),
+            (
+                "/api/layers/title-1",
+                r#"{"style":"fancy"}"#,
+                "unknown style",
+            ),
+            ("/api/layers/nope", r#"{"x":0.1}"#, "no layer"),
+        ] {
+            let (c, v) = call_json(&a, "POST", uri, Some(body)).await;
+            assert_eq!(c, StatusCode::BAD_REQUEST, "{uri} {body}");
+            assert!(v["error"].as_str().unwrap().contains(msg), "{v}");
+        }
+        let (_, v) = call_json(
+            &a,
+            "POST",
+            "/api/layers",
+            Some(r#"{"kind":"ticker","items":["a","b"],"id":"news"}"#),
+        )
+        .await;
+        assert_eq!(v["id"], "news");
+        let (c, v) = call_json(&a, "GET", "/api/layers", None).await;
+        assert_eq!(c, StatusCode::OK);
+        assert_eq!(v["layers"].as_array().unwrap().len(), 2);
+        assert!(v["presets"].as_array().unwrap().contains(&"news".into()));
+        let (c, v) = call_json(
+            &a,
+            "POST",
+            "/api/layers/order",
+            Some(r#"{"ids":["news","title-1"]}"#),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK);
+        assert_eq!(v["layers"][1]["id"], "title-1", "front last");
+        let (_, v) = call_json(&a, "POST", "/api/layers/clear", None).await;
+        assert_eq!(v["hidden"], 2);
+        let (c, _) = call_json(&a, "DELETE", "/api/layers/news", None).await;
+        assert_eq!(c, StatusCode::OK);
+        let (c, _) = call_json(&a, "DELETE", "/api/layers/news", None).await;
+        assert_eq!(c, StatusCode::BAD_REQUEST);
+        // The token is required, as everywhere.
+        let r = a
+            .clone()
+            .oneshot(req("GET", "/api/layers", "127.0.0.1:8765", None, None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn layer_asset_upload_checks_the_bytes() {
+        let fake = Arc::new(Fake::default());
+        let a = app(fake.clone());
+        let png = b"\x89PNG\r\n\x1a\n0000".to_vec();
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let (c, v) = call_json(
+            &a,
+            "POST",
+            "/api/layers",
+            Some(&format!(
+                r#"{{"kind":"image","data_base64":"{b64}","id":"logo"}}"#
+            )),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let r = a
+            .clone()
+            .oneshot(upload(
+                "/api/layers/logo/asset?t=abc123",
+                b"<html>".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let r = a
+            .clone()
+            .oneshot(upload("/api/layers/logo/asset?t=abc123", png.clone()))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn overlay_scene_routes_need_id_and_host() {
+        let fake = Arc::new(Fake::default());
+        let st = State::new(fake.clone(), TOKEN.into(), PORT, 1920, 1080);
+        let (id, bg) = (st.ov_id.to_string(), st.bg_id.to_string());
+        assert_ne!(id, bg);
+        let a = router(st);
+        let png = b"\x89PNG\r\n\x1a\n0000";
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+        fake.add_layer(serde_json::json!({"kind": "html", "html": "<b>hi</b>", "id": "chart"}))
+            .unwrap();
+        let img = fake
+            .add_layer(serde_json::json!({"kind": "image", "data_base64": b64, "id": "logo"}))
+            .unwrap();
+        let asset = img["asset"].as_str().unwrap().to_string();
+        let get = |uri: String, host: &'static str| {
+            let a = a.clone();
+            async move { a.oneshot(req("GET", &uri, host, None, None)).await.unwrap() }
+        };
+        // The scene: no token, locked down to its own script.
+        let r = get(format!("/ov/{id}/scene.html"), "127.0.0.1:8765").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let csp = r.headers()["content-security-policy"].to_str().unwrap();
+        assert!(csp.contains("script-src 'self'"), "{csp}");
+        assert!(csp.contains("default-src 'none'"), "{csp}");
+        let r = get(format!("/ov/{id}/scene.js"), "localhost:8765").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/javascript"));
+        // State: full, then 204 while unchanged.
+        let r = get(format!("/ov/{id}/state"), "127.0.0.1:8765").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        let rev = v["rev"].as_u64().unwrap();
+        assert_eq!(v["layers"].as_array().unwrap().len(), 2);
+        assert!(
+            v["layers"][0].get("html").is_none(),
+            "html is fetched separately"
+        );
+        let r = get(format!("/ov/{id}/state?since={rev}"), "127.0.0.1:8765").await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        // An HTML layer's page is sandboxed.
+        let r = get(format!("/ov/{id}/layer/chart?v=1"), "127.0.0.1:8765").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let csp = r.headers()["content-security-policy"].to_str().unwrap();
+        assert!(csp.starts_with("sandbox allow-scripts;"), "{csp}");
+        assert!(body_string(r).await.contains("<b>hi</b>"));
+        let r = get(format!("/ov/{id}/asset/{asset}"), "127.0.0.1:8765").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()["content-type"], "image/png");
+        // Wrong id, wrong file, foreign host, the background id: nothing.
+        let wrong = "0".repeat(32);
+        let local = "127.0.0.1:8765";
+        for (uri, host, want) in [
+            (
+                format!("/ov/{wrong}/scene.html"),
+                local,
+                StatusCode::NOT_FOUND,
+            ),
+            (format!("/ov/{bg}/scene.html"), local, StatusCode::NOT_FOUND),
+            (
+                format!("/bg/{id}/current.html"),
+                local,
+                StatusCode::NOT_FOUND,
+            ),
+            (format!("/ov/{id}/other"), local, StatusCode::NOT_FOUND),
+            (format!("/ov/{id}/layer/nope"), local, StatusCode::NOT_FOUND),
+            (
+                format!("/ov/{id}/asset/../x.png"),
+                local,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                format!("/ov/{id}/asset/x.png"),
+                local,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                format!("/ov/{id}/scene.html"),
+                "evil.test:8765",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                format!("/ov/{id}/../api/layers"),
+                local,
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let r = get(uri.clone(), host).await;
+            assert_eq!(r.status(), want, "{uri} {host}");
+        }
+        let r = get(format!("/api/layers?ov={id}"), local).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 }

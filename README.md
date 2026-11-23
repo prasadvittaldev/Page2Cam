@@ -33,6 +33,7 @@ You control everything from a simple control page on your own computer. You can 
 - **Choose the sound for YouTube**: the website's sound, your microphone, or both, each with its own volume.
 - **Use the website live**: click, scroll and type on it from the control page while people are watching.
 - **Change the background**: a picture, a colour, a YouTube video, your blurred room, or **one of your screens**, live.
+- **Add overlays on top of everything**: titles and lower thirds, a scrolling ticker, animated charts, pictures and video clips, like TV graphics.
 - **Let an AI agent run it**: Claude Desktop, Claude Code, Codex, Cursor or VS Code can start Page2Cam, change the page or background, share a screen and go live, from a prompt.
 
 ### What you need
@@ -133,6 +134,15 @@ In the **Stream sound** panel, turn **Page sound** and **Microphone** on or off,
 ### Share a screen
 In the **Background** panel, choose **Screen** in the full-frame row and pick a monitor.
 Everything on that monitor is shown live (Windows draws a yellow border around it while it is shared), with you on top. Choose **Page** again to go back to your website.
+
+### Add overlays (titles, tickers, graphics)
+Overlays are drawn on top of everything, you included, like the graphics on a TV broadcast.
+1. In the **Overlays** panel, choose **Title** or **Ticker**, type the text (for a ticker, separate the items with `|`), pick a look (**News**, **Minimal** or **Brand**) and click **Add**.
+2. Click an overlay in the list to outline it in the preview, then drag it to move it or drag its corner to resize it.
+3. Use the tick box to show or hide one overlay, **×** to delete it, and **Hide all** to clear the picture at once.
+
+AI agents can add much more: animated charts and infographics (any HTML), pictures, video clips and YouTube boxes. For example, ask: *"Show a lower third with my name, Ada Lovelace, Chief Analyst, for 10 seconds, add a ticker along the bottom with our three launch headlines, and put a small animated bar chart of this week's sign-ups in the top-right corner."*
+Overlays come back hidden when Page2Cam starts again, so nothing appears in a call by surprise. Video sound only goes to YouTube (with the page sound), never into calls.
 
 ### Let AI agents control Page2Cam
 1. Click the Page2Cam tray icon and tick **Allow agents** (or use the installer's `-AllowAgents`).

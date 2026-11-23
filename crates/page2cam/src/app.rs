@@ -92,8 +92,8 @@ pub struct App {
     pub ticker_stats: Arc<p2c_compositor::TickerStats>,
     /// Recent samples for the health rates.
     pub health_window: Mutex<crate::health::HealthWindow>,
-    /// The page frame rate, lowered while the output skips ticks.
-    pub page_fps: Mutex<crate::page_fps::PageFps>,
+    /// The page frame rate and render size, lowered while the output skips ticks.
+    pub page_fps: Mutex<crate::page_fps::PageQuality>,
     /// The screen background's capture.
     pub screen: crate::screen::ScreenShare,
     /// Chromium's paints are dropped while set (the screen fills the page);
@@ -101,6 +101,50 @@ pub struct App {
     pub page_paused: Arc<std::sync::atomic::AtomicBool>,
     /// Latest output frame (shared with the preview sink); snapshots encode from it on demand.
     pub output_frame: FrameSlot,
+    /// Overlay layers (titles, tickers, HTML…) and the overlay browser's on/off.
+    pub overlay: crate::overlay::OverlayLayers,
+}
+
+/// `ev` (page pixels at the configured `from` size, as the admin maps them)
+/// in the pixels of the page as it renders now (`to`: lowered by the quality
+/// throttle). Wheel distances scale too, so a scroll moves the same share
+/// of the page.
+pub fn scale_input(ev: InputEvent, from: (u32, u32), to: (u32, u32)) -> InputEvent {
+    if from == to || from.0 == 0 || from.1 == 0 {
+        return ev;
+    }
+    let sx = |v: i32| (v as i64 * to.0 as i64 / from.0 as i64) as i32;
+    let sy = |v: i32| (v as i64 * to.1 as i64 / from.1 as i64) as i32;
+    match ev {
+        InputEvent::Move { x, y, mods } => InputEvent::Move {
+            x: sx(x),
+            y: sy(y),
+            mods,
+        },
+        InputEvent::Button {
+            x,
+            y,
+            button,
+            down,
+            clicks,
+            mods,
+        } => InputEvent::Button {
+            x: sx(x),
+            y: sy(y),
+            button,
+            down,
+            clicks,
+            mods,
+        },
+        InputEvent::Wheel { x, y, dx, dy, mods } => InputEvent::Wheel {
+            x: sx(x),
+            y: sy(y),
+            dx: sx(dx),
+            dy: sy(dy),
+            mods,
+        },
+        k @ InputEvent::Key { .. } => k,
+    }
 }
 
 /// Lock `m` for the status/health readers. Debug builds panic if it stays
@@ -272,22 +316,29 @@ impl App {
         self.health_window.lock().push(s);
     }
 
-    /// Slow the page down while the output skips ticks (a page that takes
-    /// the whole GPU starves the compositor), and back up once it keeps up.
-    /// Call after [`App::sample_health`].
+    /// Make the page cheaper while the output skips ticks (a page that takes
+    /// the whole GPU starves the compositor): lower frame rate, then lower
+    /// render size; back up once it keeps up. The overlay browser follows the
+    /// frame rate only. Call after [`App::sample_health`].
     pub fn govern_page_fps(&self) {
         if !self.ticker_stats.output_ready() {
             return;
         }
         let skipped = lock(&self.health_window, "health_window").skipped_pct();
         let changed = lock(&self.page_fps, "page_fps").update(std::time::Instant::now(), skipped);
-        if let Some(fps) = changed {
+        if let Some(level) = changed {
+            let (w, h) = level.res.size(self.width, self.height);
             tracing::info!(
-                fps,
+                fps = level.fps,
+                size = %format_args!("{w}x{h}"),
                 skipped_pct = skipped,
-                "page frame rate changed (output skipping ticks)"
+                "page quality changed (output skipping ticks)"
             );
-            self.with_browser(|b| b.set_frame_rate(fps));
+            self.with_browser(|b| {
+                b.set_frame_rate(level.fps);
+                b.set_size(w, h);
+            });
+            self.overlay.set_fps(level.fps);
         }
     }
 
@@ -707,6 +758,43 @@ impl App {
     }
 }
 
+impl p2c_admin::Overlays for App {
+    fn layers(&self) -> Vec<serde_json::Value> {
+        self.overlay.layers()
+    }
+    fn add_layer(&self, spec: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        self.overlay.add(spec)
+    }
+    fn update_layer(
+        &self,
+        id: &str,
+        patch: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.overlay.update(id, patch)
+    }
+    fn remove_layer(&self, id: &str) -> anyhow::Result<()> {
+        self.overlay.remove(id)
+    }
+    fn clear_layers(&self) -> usize {
+        self.overlay.clear()
+    }
+    fn reorder_layers(&self, ids: Vec<String>) -> anyhow::Result<()> {
+        self.overlay.reorder(ids)
+    }
+    fn set_layer_asset(&self, id: &str, bytes: Vec<u8>) -> anyhow::Result<serde_json::Value> {
+        self.overlay.set_asset(id, &bytes)
+    }
+    fn overlay_state(&self, since: Option<u64>) -> Option<serde_json::Value> {
+        self.overlay.state(since)
+    }
+    fn overlay_layer_html(&self, id: &str) -> Option<String> {
+        self.overlay.html_of(id)
+    }
+    fn overlay_asset(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
+        self.overlay.asset(name)
+    }
+}
+
 impl Controls for App {
     fn navigate(&self, url: &str) {
         tracing::info!(url, "navigate");
@@ -744,40 +832,42 @@ impl Controls for App {
     }
 
     fn input(&self, ev: InputEvent) {
-        self.with_browser(|b| match ev {
-            InputEvent::Move { x, y, mods } => b.mouse_move(x, y, mods),
-            InputEvent::Button {
-                x,
-                y,
-                button,
-                down,
-                clicks,
-                mods,
-            } => {
-                let button = match button {
-                    MouseBtn::Left => MouseButton::Left,
-                    MouseBtn::Middle => MouseButton::Middle,
-                    MouseBtn::Right => MouseButton::Right,
-                };
-                b.mouse_button(x, y, button, down, clicks, mods)
-            }
-            InputEvent::Wheel { x, y, dx, dy, mods } => b.wheel(x, y, dx, dy, mods),
-            InputEvent::Key {
-                action,
-                code,
-                ch,
-                mods,
-            } => b.key(KeyInput {
-                kind: match action {
-                    KeyAction::Down => KeyKind::Down,
-                    KeyAction::Up => KeyKind::Up,
-                    KeyAction::Char => KeyKind::Char,
-                },
-                windows_key_code: code,
-                character: ch,
-                modifiers: mods,
-            }),
-        });
+        self.with_browser(
+            |b| match scale_input(ev, (self.width, self.height), b.size()) {
+                InputEvent::Move { x, y, mods } => b.mouse_move(x, y, mods),
+                InputEvent::Button {
+                    x,
+                    y,
+                    button,
+                    down,
+                    clicks,
+                    mods,
+                } => {
+                    let button = match button {
+                        MouseBtn::Left => MouseButton::Left,
+                        MouseBtn::Middle => MouseButton::Middle,
+                        MouseBtn::Right => MouseButton::Right,
+                    };
+                    b.mouse_button(x, y, button, down, clicks, mods)
+                }
+                InputEvent::Wheel { x, y, dx, dy, mods } => b.wheel(x, y, dx, dy, mods),
+                InputEvent::Key {
+                    action,
+                    code,
+                    ch,
+                    mods,
+                } => b.key(KeyInput {
+                    kind: match action {
+                        KeyAction::Down => KeyKind::Down,
+                        KeyAction::Up => KeyKind::Up,
+                        KeyAction::Char => KeyKind::Char,
+                    },
+                    windows_key_code: code,
+                    character: ch,
+                    modifiers: mods,
+                }),
+            },
+        );
     }
 
     fn pip(&self) -> PipLayout {
@@ -932,6 +1022,8 @@ impl Controls for App {
             gpu_running: self.gpu_running.clone(),
             health,
             agents_allowed: p2c_admin::TrayLink::global().and_then(|l| l.allowed()),
+            overlay_layers: self.overlay.visible_count(),
+            overlay_on: self.overlay.is_active(),
             background,
             box_background,
             refined_edges,
@@ -1541,12 +1633,13 @@ mod tests {
             quit_main: Mutex::new(None),
             ticker_stats: Arc::default(),
             health_window: Mutex::new(Default::default()),
-            page_fps: Mutex::new(crate::page_fps::PageFps::new(30)),
+            page_fps: Mutex::new(crate::page_fps::PageQuality::new(30)),
             screen: crate::screen::ScreenShare::new(Box::new(
                 crate::screen::tests::FakeScreens::default(),
             )),
             page_paused: Arc::default(),
             output_frame: FrameSlot::new(),
+            overlay: crate::overlay::OverlayLayers::new(None, 30),
         }
     }
 
@@ -2207,6 +2300,58 @@ mod tests {
         *app.fallback_url.lock() = other_bg;
         app.keep_page_off_background();
         assert_eq!(shown(&app), "https://user.test/b", "page-driven history 2");
+    }
+
+    #[test]
+    fn input_follows_a_lowered_page_size() {
+        use p2c_admin::{InputEvent as E, MouseBtn};
+        let (full, half) = ((1920, 1080), (960, 540));
+        let click = E::Button {
+            x: 1919,
+            y: 540,
+            button: MouseBtn::Left,
+            down: true,
+            clicks: 1,
+            mods: 0,
+        };
+        assert_eq!(scale_input(click, full, full), click);
+        match scale_input(click, full, half) {
+            E::Button { x, y, .. } => assert_eq!((x, y), (959, 270)),
+            e => panic!("{e:?}"),
+        }
+        match scale_input(
+            E::Move {
+                x: 960,
+                y: 1079,
+                mods: 0,
+            },
+            full,
+            (1280, 720),
+        ) {
+            E::Move { x, y, .. } => assert_eq!((x, y), (640, 719)),
+            e => panic!("{e:?}"),
+        }
+        match scale_input(
+            E::Wheel {
+                x: 100,
+                y: 100,
+                dx: 0,
+                dy: -120,
+                mods: 0,
+            },
+            full,
+            half,
+        ) {
+            E::Wheel { x, y, dy, .. } => assert_eq!((x, y, dy), (50, 50, -60)),
+            e => panic!("{e:?}"),
+        }
+        let key = E::Key {
+            action: p2c_admin::KeyAction::Char,
+            code: 65,
+            ch: 97,
+            mods: 0,
+        };
+        assert_eq!(scale_input(key, full, half), key);
     }
 
     #[test]

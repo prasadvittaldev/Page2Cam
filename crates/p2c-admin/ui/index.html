@@ -119,6 +119,30 @@
     transform: translateX(-50%); padding: 3px 10px; border-radius: 12px; cursor: ew-resize;
     background: rgba(0,0,0,.6); color: #fff; font-size: 12px; white-space: nowrap;
   }
+  /* The selected overlay layer, outlined in the preview (drag to move, corner to resize). */
+  .ovsel {
+    position: absolute; border: 2px dashed #ffb400; box-sizing: border-box;
+    cursor: move; touch-action: none; background: rgba(255,180,0,.06);
+  }
+  .ovsel .grip {
+    position: absolute; right: -6px; bottom: -6px; width: 12px; height: 12px;
+    background: #ffb400; border: 1px solid #fff; border-radius: 3px; cursor: nwse-resize;
+  }
+  .ovlist { list-style: none; margin: 0 0 8px; padding: 0; }
+  .ovlist li {
+    display: flex; align-items: center; gap: 8px; padding: 5px 6px; margin-bottom: 6px;
+    border: 1px solid var(--line); border-radius: 6px; background: var(--well); cursor: pointer;
+  }
+  .ovlist li.sel { border-color: #ffb400; box-shadow: inset 3px 0 0 #ffb400; }
+  .ovlist .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  .ovlist .kd { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+  .ovlist .del { padding: 0 8px; line-height: 22px; }
+  .ovadd { display: flex; gap: 6px; margin-top: 8px; }
+  .ovadd input {
+    flex: 1; min-width: 0; background: var(--well); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 9px;
+  }
+  .ovadd select { background: var(--well); border: 1px solid var(--line); border-radius: 6px; padding: 6px; }
   .seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 0; }
   .seg .btn { border-radius: 0; font-size: 13px; padding: 5px 6px; }
   .seg .btn:first-child { border-radius: 6px 0 0 6px; }
@@ -244,6 +268,7 @@
         <canvas id="canvas" width="960" height="540"></canvas>
         <div class="empty" id="empty">Waiting for the first frame…</div>
         <div class="pip" id="pip" title="Drag to move your webcam, drag the corner to resize"><div class="grip" id="grip"></div><div class="handle" id="handle" title="Drag sideways to move yourself">↔ Move</div><div class="edge l" data-edge="l" title="Drag to trim the left side"></div><div class="edge t" data-edge="t" title="Drag to trim the top"></div><div class="edge r" data-edge="r" title="Drag to trim the right side"></div><div class="edge b" data-edge="b" title="Drag to trim the bottom"></div></div>
+        <div class="ovsel" id="ovsel" title="Drag to move this overlay, drag the corner to resize" hidden><div class="grip" id="ovgrip"></div></div>
       </div>
     </div>
     <p class="hint">Click, scroll and type in the picture to use the page. Drag the dashed box to place your webcam (in Cut-out full, drag the Move handle).</p>
@@ -366,6 +391,31 @@
       </div>
       <div class="state" id="bgErr"></div>
       <div class="state err" id="bgNote" role="status"></div>
+    </section>
+
+    <section class="panel" id="ovPanel" aria-labelledby="h-ov">
+      <h2 id="h-ov">Overlays</h2>
+      <p class="sub" style="margin-top:0">Titles, tickers and graphics drawn over everything, you included. Agents can add charts, videos and more. Click one to place it in the preview.</p>
+      <ul class="ovlist" id="ovList" aria-label="Overlay layers, front first"></ul>
+      <p class="sub" id="ovEmpty">No overlays yet.</p>
+      <div class="seg" role="group" aria-label="Quick add">
+        <button class="btn" data-ovkind="title" aria-pressed="true">Title</button>
+        <button class="btn" data-ovkind="ticker" aria-pressed="false">Ticker</button>
+      </div>
+      <div class="ovadd">
+        <input id="ovText" type="text" spellcheck="true" autocomplete="off" aria-label="Overlay text" placeholder="Title text">
+        <select id="ovStyle" aria-label="Style" title="Look">
+          <option value="news">News</option>
+          <option value="minimal">Minimal</option>
+          <option value="brand">Brand</option>
+        </select>
+        <button class="btn primary" id="ovAdd">Add</button>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <span class="sub" style="margin:0">Hide every overlay at once</span>
+        <button class="btn" id="ovHideAll">Hide all</button>
+      </div>
+      <div class="state" id="ovState"></div>
     </section>
 
     <section class="panel" aria-labelledby="h-stream">
@@ -1150,8 +1200,142 @@
     if (agentsShown && document.visibilityState === "visible") loadAgents();
   }, 5000);
 
+  // ---------- overlay layers ----------
+  // Geometry is the layer's own: x, y = top-left, w, h = size, 0..1 of the output.
+  let layers = [], ovSel = null, ovKind = "title", ovDragging = false;
+  async function loadLayers() {
+    if (ovDragging || restarting) return;
+    try {
+      const r = await api("/api/layers");
+      if (!r.ok) return;
+      layers = (await r.json()).layers || [];
+      renderLayers();
+    } catch {}
+  }
+  function layerLabel(l) {
+    if (l.name) return l.name;
+    if (l.kind === "title") return l.subtitle ? l.text + " / " + l.subtitle : l.text;
+    if (l.kind === "ticker") return (l.items || []).join(" · ");
+    return l.id;
+  }
+  function renderLayers() {
+    const ul = $("ovList");
+    ul.textContent = "";
+    $("ovEmpty").hidden = layers.length > 0;
+    if (ovSel && !layers.some((l) => l.id === ovSel)) ovSel = null;
+    // Front first.
+    layers.slice().reverse().forEach((l) => {
+      const li = document.createElement("li");
+      li.classList.toggle("sel", l.id === ovSel);
+      const cb = document.createElement("input");
+      cb.type = "checkbox"; cb.checked = l.visible; cb.title = "Show / hide";
+      cb.setAttribute("aria-label", "Show " + layerLabel(l));
+      cb.addEventListener("click", (e) => { e.stopPropagation(); ovChange(l.id, { visible: cb.checked }); });
+      const nm = document.createElement("span");
+      nm.className = "nm"; nm.textContent = layerLabel(l); nm.title = l.id;
+      const kd = document.createElement("span");
+      kd.className = "kd"; kd.textContent = l.kind;
+      const del = document.createElement("button");
+      del.className = "btn del"; del.textContent = "×"; del.title = "Delete this overlay";
+      del.setAttribute("aria-label", "Delete " + layerLabel(l));
+      del.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const r = await fetch("/api/layers/" + encodeURIComponent(l.id), { method: "DELETE", headers: { "x-p2c-token": token } });
+        setState("ovState", r.ok ? "" : "error: " + await errorText(r));
+        loadLayers();
+      });
+      li.addEventListener("click", () => { ovSel = ovSel === l.id ? null : l.id; renderLayers(); });
+      li.append(cb, nm, kd, del);
+      ul.appendChild(li);
+    });
+    layoutOvSel();
+  }
+  function layoutOvSel() {
+    const el = $("ovsel"), l = layers.find((x) => x.id === ovSel);
+    el.hidden = !l;
+    if (!l) return;
+    const r = screen.getBoundingClientRect();
+    Object.assign(el.style, {
+      left: l.x * r.width + "px", top: l.y * r.height + "px",
+      width: l.w * r.width + "px", height: l.h * r.height + "px",
+    });
+  }
+  async function ovChange(id, body) {
+    const r = await api("/api/layers/" + encodeURIComponent(id), body);
+    if (!r.ok) { setState("ovState", "error: " + await errorText(r)); loadLayers(); return; }
+    setState("ovState", "");
+    const l = await r.json();
+    layers = layers.map((x) => (x.id === id ? l : x));
+    if (!ovDragging) renderLayers();
+  }
+  $("ovsel").addEventListener("pointerdown", (e) => {
+    const l = layers.find((x) => x.id === ovSel);
+    if (!l) return;
+    e.preventDefault(); e.stopPropagation();
+    const el = $("ovsel"), resize = e.target === $("ovgrip");
+    el.setPointerCapture(e.pointerId);
+    ovDragging = true; dragging = true;
+    const r = screen.getBoundingClientRect();
+    const start = { x: e.clientX, y: e.clientY, l: { ...l } };
+    let timer = 0;
+    const push = (now) => {
+      clearTimeout(timer);
+      const body = resize ? { w: l.w, h: l.h } : { x: l.x, y: l.y };
+      const go = () => ovChange(l.id, body);
+      if (now) go(); else timer = setTimeout(go, 80);
+    };
+    const move = (ev) => {
+      const dx = (ev.clientX - start.x) / r.width, dy = (ev.clientY - start.y) / r.height;
+      if (resize) {
+        l.w = Math.min(Math.max(start.l.w + dx, 0.02), 1 - l.x);
+        l.h = Math.min(Math.max(start.l.h + dy, 0.02), 1 - l.y);
+      } else {
+        l.x = Math.min(Math.max(start.l.x + dx, 0), 1 - l.w);
+        l.y = Math.min(Math.max(start.l.y + dy, 0), 1 - l.h);
+      }
+      layoutOvSel(); push(false);
+    };
+    const up = () => {
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerup", up);
+      ovDragging = false; dragging = false;
+      push(true);
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", up);
+  });
+  document.querySelectorAll("[data-ovkind]").forEach((b) => b.addEventListener("click", () => {
+    ovKind = b.dataset.ovkind;
+    document.querySelectorAll("[data-ovkind]").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    $("ovText").placeholder = ovKind === "ticker" ? "Ticker items, separated by |" : "Title text";
+  }));
+  async function ovAdd() {
+    const text = $("ovText").value.trim();
+    if (!text) { $("ovText").focus(); return; }
+    const style = $("ovStyle").value;
+    const body = ovKind === "ticker"
+      ? { kind: "ticker", items: text.split("|").map((s) => s.trim()).filter(Boolean), style }
+      : { kind: "title", text, style };
+    const r = await api("/api/layers", body);
+    if (!r.ok) { setState("ovState", "error: " + await errorText(r)); return; }
+    setState("ovState", "");
+    $("ovText").value = "";
+    ovSel = (await r.json()).id;
+    loadLayers();
+  }
+  $("ovAdd").addEventListener("click", ovAdd);
+  $("ovText").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); ovAdd(); } });
+  $("ovHideAll").addEventListener("click", async () => {
+    const r = await api("/api/layers/clear", {});
+    setState("ovState", r.ok ? "" : "error: " + await errorText(r));
+    loadLayers();
+  });
+  new ResizeObserver(layoutOvSel).observe(screen);
+
   refresh();
+  loadLayers();
   setInterval(refresh, 1000);
+  setInterval(() => { if (document.visibilityState === "visible") loadLayers(); }, 1500);
 })();
 </script>
 </body>

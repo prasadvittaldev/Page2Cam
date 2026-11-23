@@ -74,6 +74,20 @@ pub enum BackendCall {
         row: String,
         bytes: Vec<u8>,
     },
+    ListLayers,
+    /// The engine's `POST /api/layers` body (`kind` plus layer fields).
+    AddLayer(Value),
+    /// Partial layer fields for `POST /api/layers/<id>`.
+    UpdateLayer {
+        id: String,
+        patch: Value,
+    },
+    ShowLayer(String),
+    HideLayer(String),
+    RemoveLayer(String),
+    ClearLayers,
+    /// Back to front.
+    ReorderLayers(Vec<String>),
 }
 
 impl BackendCall {
@@ -89,6 +103,7 @@ impl BackendCall {
                 | BackendCall::ListGpus
                 | BackendCall::GetBackground
                 | BackendCall::ListScreens
+                | BackendCall::ListLayers
         )
     }
 
@@ -115,6 +130,26 @@ impl BackendCall {
                     bytes.len().div_ceil(1024)
                 )
             }
+            BackendCall::AddLayer(v) => format!(
+                "add {} layer{}",
+                v["kind"].as_str().unwrap_or("?"),
+                v["id"]
+                    .as_str()
+                    .map(|i| format!(" {i:?}"))
+                    .unwrap_or_default()
+            ),
+            BackendCall::UpdateLayer { id, patch } => {
+                let keys: Vec<&str> = patch
+                    .as_object()
+                    .map(|m| m.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                format!("update layer {id:?} ({})", keys.join(", "))
+            }
+            BackendCall::ShowLayer(id) => format!("show layer {id:?}"),
+            BackendCall::HideLayer(id) => format!("hide layer {id:?}"),
+            BackendCall::RemoveLayer(id) => format!("remove layer {id:?}"),
+            BackendCall::ClearLayers => "hide all layers".into(),
+            BackendCall::ReorderLayers(ids) => format!("reorder layers {}", ids.join(", ")),
             other => format!("{other:?}").to_lowercase(),
         }
     }
@@ -223,7 +258,295 @@ Give a local file path or base64 file bytes (PNG, JPEG or WebP, up to 20 MB).".i
             &json!({ "type": "object", "required": ["row"], "additionalProperties": false,
                 "properties": { "row": { "enum": ["full", "box"] },
                     "path": { "type": "string" }, "base64": { "type": "string" } } })),
+        t("list_layers", "The overlay layers (graphics drawn over everything, the person included), back to front: id, name, kind, x, y, w, h, z, visible, opacity, animations, auto-hide and a short summary of the content.".into(), &none),
+        t("add_layer", format!("Add an overlay layer drawn over the whole picture, the person included; it shows at once (enter animation) unless visible is false, in front of the others. Returns its id. {LAYERS}"),
+            &layer_schema(true)),
+        t("update_layer", format!("Change an overlay layer: give its id and only what changes (a ticker keeps scrolling, a video keeps playing when you only move it). Use null to clear hide_after_s or a colour. {LAYERS}"),
+            &layer_schema(false)),
+        t("show_layer", "Show an overlay layer (plays its enter animation and restarts its auto-hide).".into(),
+            &json!({ "type": "object", "required": ["id"], "additionalProperties": false,
+                "properties": { "id": { "type": "string", "maxLength": 40 } } })),
+        t("hide_layer", "Hide an overlay layer (plays its exit animation; it stays in the list).".into(),
+            &json!({ "type": "object", "required": ["id"], "additionalProperties": false,
+                "properties": { "id": { "type": "string", "maxLength": 40 } } })),
+        t("remove_layer", "Delete an overlay layer (and its stored picture or video).".into(),
+            &json!({ "type": "object", "required": ["id"], "additionalProperties": false,
+                "properties": { "id": { "type": "string", "maxLength": 40 } } })),
+        t("clear_layers", "Hide every overlay layer (they stay in the list).".into(), &none),
+        t("reorder_layers", "Restack overlay layers: ids from back to front (the last is in front). Layers not listed stay behind them.".into(),
+            &json!({ "type": "object", "required": ["ids"], "additionalProperties": false,
+                "properties": { "ids": { "type": "array", "minItems": 1, "maxItems": 32,
+                    "items": { "type": "string", "maxLength": 40 } } } })),
     ]
+}
+
+/// What agents need to know about overlay layers.
+const LAYERS: &str = "x, y = top-left corner, w, h = size, all 0..1 of the 1920x1080 output (defaults per kind: \
+title 0.05,0.72 0.5x0.16; ticker 0,0.92 1x0.08; html/video/youtube 0.6,0.05 0.35x0.35 (a 16:9 box has h = w); image 0.75,0.05 0.2x0.2). \
+Kinds: title (text, optional subtitle: a title or lower third), ticker (items scrolling right to left, speed px/s), \
+html (any HTML/CSS/JS fragment with its own <style>/<script>, up to 256 KB, run in a sandboxed frame on a transparent \
+background: infographics, charts, small animations; it may load from the web but cannot reach Page2Cam), \
+image (path to a local PNG/JPEG/WebP/GIF or data_base64; transparency kept), video (path to a local MP4/WebM up to 200 MB, or an http(s) url; \
+loop and muted default true), youtube (link; muted and loop default true). Styles for title and ticker: news (navy band, red accent), \
+minimal (white text with a shadow, no box), brand (Page2Cam navy and blue); colour and background override the text and box colours. \
+Animations (enter/exit): none, fade (default), slide-left, slide-right, slide-up, slide-down. hide_after_s hides it by itself. \
+Sound of unmuted videos goes to the stream only (with page sound). Layers come back hidden after a restart. \
+Check the result with snapshot.";
+
+/// The `add_layer` (`add`) or `update_layer` input schema.
+fn layer_schema(add: bool) -> Value {
+    let unit = json!({ "type": "number", "minimum": 0, "maximum": 1 });
+    let size = json!({ "type": "number", "minimum": 0.01, "maximum": 1 });
+    let colour = json!({ "type": ["string", "null"], "pattern": "^#[0-9a-fA-F]{6}$" });
+    let anim =
+        json!({ "enum": ["none", "fade", "slide-left", "slide-right", "slide-up", "slide-down"] });
+    let text = json!({ "type": "string", "maxLength": MAX_LAYER_TEXT });
+    let mut props = json!({
+        "id": { "type": "string", "maxLength": 40 },
+        "name": { "type": "string", "maxLength": 80 },
+        "x": unit, "y": unit, "w": size, "h": size,
+        "z": { "type": "integer", "minimum": -1000, "maximum": 1000 },
+        "visible": { "type": "boolean" }, "opacity": unit,
+        "enter": anim, "exit": anim,
+        "hide_after_s": { "type": ["integer", "null"], "minimum": 1, "maximum": 3600 },
+        "text": text, "subtitle": text,
+        "style": { "enum": ["news", "minimal", "brand"] },
+        "colour": colour, "background": colour,
+        "items": { "type": "array", "minItems": 1, "maxItems": 50, "items": text },
+        "speed": { "type": "integer", "minimum": 10, "maximum": 1000 },
+        "html": { "type": "string", "maxLength": MAX_LAYER_HTML },
+        "path": { "type": "string", "maxLength": 1024 },
+        "data_base64": { "type": "string" },
+        "url": { "type": "string", "maxLength": MAX_URL_BYTES },
+        "link": { "type": "string", "maxLength": 2048 },
+        "start_s": { "type": "integer", "minimum": 0, "maximum": 86400 },
+        "loop": { "type": "boolean" }, "muted": { "type": "boolean" },
+    });
+    if add {
+        props["kind"] = json!({ "enum": ["title", "ticker", "html", "image", "video", "youtube"] });
+        json!({ "type": "object", "required": ["kind"], "additionalProperties": false, "properties": props })
+    } else {
+        json!({ "type": "object", "required": ["id"], "additionalProperties": false, "minProperties": 2, "properties": props })
+    }
+}
+
+/// Longest title, subtitle or ticker item.
+const MAX_LAYER_TEXT: usize = 500;
+/// Largest `html` layer.
+pub const MAX_LAYER_HTML: usize = 256 * 1024;
+
+/// Every field a layer call may carry (besides `kind`).
+const LAYER_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "x",
+    "y",
+    "w",
+    "h",
+    "z",
+    "visible",
+    "opacity",
+    "enter",
+    "exit",
+    "hide_after_s",
+    "text",
+    "subtitle",
+    "style",
+    "colour",
+    "background",
+    "items",
+    "speed",
+    "html",
+    "path",
+    "data_base64",
+    "url",
+    "link",
+    "start_s",
+    "loop",
+    "muted",
+];
+
+fn int_arg(args: &Args, k: &str, lo: i64, hi: i64) -> Result<Option<i64>, String> {
+    match args.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_f64() {
+            Some(n) if n.fract() == 0.0 && (lo as f64..=hi as f64).contains(&n) => {
+                Ok(Some(n as i64))
+            }
+            _ => Err(format!("{k} must be a whole number from {lo} to {hi}")),
+        },
+    }
+}
+
+fn text_arg(args: &Args, k: &str, max_chars: usize) -> Result<Option<String>, String> {
+    match str_arg(args, k)? {
+        Some(s) if s.chars().count() > max_chars => {
+            Err(format!("{k} is longer than {max_chars} characters"))
+        }
+        s => Ok(s.map(String::from)),
+    }
+}
+
+/// Check the layer fields of `args` (types and ranges; the engine checks
+/// which fields fit the kind) and build the engine body.
+fn layer_body(args: &Args) -> Result<Map<String, Value>, String> {
+    let mut m = Map::new();
+    if let Some(id) = text_arg(args, "id", 40)? {
+        m.insert("id".into(), id.into());
+    }
+    if let Some(n) = text_arg(args, "name", 80)? {
+        m.insert("name".into(), n.into());
+    }
+    for (k, lo) in [
+        ("x", 0.0),
+        ("y", 0.0),
+        ("w", 0.01),
+        ("h", 0.01),
+        ("opacity", 0.0),
+    ] {
+        if let Some(v) = num_arg(args, k, lo, 1.0)? {
+            m.insert(k.into(), v.into());
+        }
+    }
+    if let Some(z) = int_arg(args, "z", -1000, 1000)? {
+        m.insert("z".into(), z.into());
+    }
+    for k in ["visible", "loop", "muted"] {
+        if let Some(b) = bool_arg(args, k)? {
+            m.insert(k.into(), b.into());
+        }
+    }
+    for k in ["enter", "exit"] {
+        if let Some(a) = str_arg(args, k)? {
+            let a = one_of(
+                k,
+                a,
+                &[
+                    "none",
+                    "fade",
+                    "slide-left",
+                    "slide-right",
+                    "slide-up",
+                    "slide-down",
+                ],
+            )?;
+            m.insert(k.into(), a.into());
+        }
+    }
+    match args.get("hide_after_s") {
+        Some(Value::Null) => {
+            m.insert("hide_after_s".into(), Value::Null);
+        }
+        _ => {
+            if let Some(s) = int_arg(args, "hide_after_s", 1, 3600)? {
+                m.insert("hide_after_s".into(), s.into());
+            }
+        }
+    }
+    for k in ["text", "subtitle"] {
+        if let Some(t) = text_arg(args, k, MAX_LAYER_TEXT)? {
+            m.insert(k.into(), t.into());
+        }
+    }
+    if let Some(s) = str_arg(args, "style")? {
+        m.insert(
+            "style".into(),
+            one_of("style", s, &["news", "minimal", "brand"])?.into(),
+        );
+    }
+    for k in ["colour", "background"] {
+        match args.get(k) {
+            Some(Value::Null) => {
+                m.insert(k.into(), Value::Null);
+            }
+            _ => {
+                if let Some(c) = colour_arg(args, k)? {
+                    m.insert(k.into(), c.into());
+                }
+            }
+        }
+    }
+    if let Some(v) = args.get("items").filter(|v| !v.is_null()) {
+        let items = v
+            .as_array()
+            .filter(|a| !a.is_empty() && a.len() <= 50)
+            .ok_or("items must be a list of 1 to 50 texts")?;
+        for i in items {
+            match i.as_str() {
+                Some(s) if s.chars().count() <= MAX_LAYER_TEXT => {}
+                _ => {
+                    return Err(format!(
+                        "each item must be text of at most {MAX_LAYER_TEXT} characters"
+                    ))
+                }
+            }
+        }
+        m.insert("items".into(), v.clone());
+    }
+    if let Some(s) = int_arg(args, "speed", 10, 1000)? {
+        m.insert("speed".into(), s.into());
+    }
+    if let Some(h) = str_arg(args, "html")? {
+        if h.trim().is_empty() {
+            return Err("html is empty".into());
+        }
+        if h.len() > MAX_LAYER_HTML {
+            return Err(
+                "html is larger than 256 KB; link big assets instead of inlining them".into(),
+            );
+        }
+        m.insert("html".into(), h.into());
+    }
+    match (str_arg(args, "path")?, str_arg(args, "data_base64")?) {
+        (Some(_), Some(_)) => return Err("give either path or data_base64".into()),
+        (Some(p), None) => {
+            if !is_local_drive_path(p) {
+                return Err("path must be a local file on a drive (like C:\\Videos\\clip.mp4); network shares are not allowed".into());
+            }
+            m.insert("path".into(), p.into());
+        }
+        (None, Some(b)) => {
+            if b.len() / 4 * 3 > MAX_IMAGE_BYTES + 3 {
+                return Err("the picture is larger than 20 MB (give videos by path)".into());
+            }
+            let clean: String = b.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(&clean)
+                .map_err(|_| "data_base64 is not valid base64".to_string())?;
+            m.insert("data_base64".into(), clean.into());
+        }
+        (None, None) => {}
+    }
+    if let Some(u) = str_arg(args, "url")? {
+        let l = u.trim().to_ascii_lowercase();
+        if !(l.starts_with("https://") || l.starts_with("http://")) || u.len() > MAX_URL_BYTES {
+            return Err("url must be an http:// or https:// address".into());
+        }
+        m.insert("url".into(), u.trim().into());
+    }
+    if let Some(l) = text_arg(args, "link", 2048)? {
+        if l.trim().is_empty() {
+            return Err("link must be a YouTube link or video id".into());
+        }
+        m.insert("link".into(), l.trim().into());
+    }
+    if let Some(s) = int_arg(args, "start_s", 0, 86400)? {
+        m.insert("start_s".into(), s.into());
+    }
+    Ok(m)
+}
+
+fn layer_id(args: &Args) -> Result<String, String> {
+    let id = req_str(args, "id")?.trim();
+    if id.is_empty()
+        || id.len() > 40
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("id must be a layer id from list_layers".into());
+    }
+    Ok(id.to_string())
 }
 
 /// The tool names, in `tools/list` order.
@@ -541,6 +864,61 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
                 return Err("the picture must be 1 byte to 20 MB".into());
             }
             Ok(C::UploadBackgroundImage { row, bytes })
+        })(),
+        "list_layers" => return simple(C::ListLayers),
+        "clear_layers" => return simple(C::ClearLayers),
+        "add_layer" => (|| {
+            let mut allowed = LAYER_FIELDS.to_vec();
+            allowed.push("kind");
+            only(args, &allowed)?;
+            let kind = one_of(
+                "kind",
+                req_str(args, "kind")?,
+                &["title", "ticker", "html", "image", "video", "youtube"],
+            )?;
+            let mut m = layer_body(args)?;
+            m.insert("kind".into(), kind.into());
+            Ok(C::AddLayer(Value::Object(m)))
+        })(),
+        "update_layer" => (|| {
+            only(args, LAYER_FIELDS)?;
+            let id = layer_id(args)?;
+            let mut m = layer_body(args)?;
+            m.remove("id");
+            if m.is_empty() {
+                return Err("give at least one field to change besides id".into());
+            }
+            Ok(C::UpdateLayer {
+                id,
+                patch: Value::Object(m),
+            })
+        })(),
+        "show_layer" | "hide_layer" | "remove_layer" => (|| {
+            only(args, &["id"])?;
+            let id = layer_id(args)?;
+            Ok(match name {
+                "show_layer" => C::ShowLayer(id),
+                "hide_layer" => C::HideLayer(id),
+                _ => C::RemoveLayer(id),
+            })
+        })(),
+        "reorder_layers" => (|| {
+            only(args, &["ids"])?;
+            let ids = args
+                .get("ids")
+                .and_then(Value::as_array)
+                .filter(|a| !a.is_empty() && a.len() <= 32)
+                .ok_or("ids must be a list of 1 to 32 layer ids")?;
+            let ids = ids
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .filter(|s| !s.is_empty() && s.len() <= 40)
+                        .map(String::from)
+                        .ok_or_else(|| "each id must be a layer id from list_layers".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(C::ReorderLayers(ids))
         })(),
         _ => return Err(None),
     };

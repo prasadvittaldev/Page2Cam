@@ -28,6 +28,8 @@ impl Default for MixSettings {
 #[derive(Clone)]
 pub struct Mixer {
     page: AudioRing,
+    /// Overlay-layer sound (videos, YouTube): mixed as page sound.
+    overlay: Option<AudioRing>,
     mic: AudioRing,
     settings: Arc<RwLock<MixSettings>>,
     delay: Arc<parking_lot::Mutex<MicDelay>>,
@@ -52,10 +54,18 @@ impl Mixer {
     pub fn new(page: AudioRing, mic: AudioRing, settings: MixSettings) -> Self {
         Mixer {
             page,
+            overlay: None,
             mic,
             settings: Arc::new(RwLock::new(settings)),
             delay: Arc::default(),
         }
+    }
+
+    /// Also mix `ring` (the overlay browser's sound) as part of page sound:
+    /// same on/off and gain.
+    pub fn with_overlay(mut self, ring: AudioRing) -> Self {
+        self.overlay = Some(ring);
+        self
     }
 
     pub fn set(&self, s: MixSettings) {
@@ -81,6 +91,9 @@ impl Mixer {
     /// Drop anything buffered (e.g. when a stream starts).
     pub fn reset(&self) {
         self.page.clear();
+        if let Some(o) = &self.overlay {
+            o.clear();
+        }
         self.mic.clear();
         let mut d = self.delay.lock();
         d.priming = d.frames > 0;
@@ -111,10 +124,14 @@ impl Mixer {
             }
             d.priming
         };
-        for (ring, on, gain, hold) in [
-            (&self.page, s.page_on, s.page_gain, false),
-            (&self.mic, s.mic_on, s.mic_gain, hold_mic),
-        ] {
+        let sources = [
+            Some((&self.page, s.page_on, s.page_gain, false)),
+            self.overlay
+                .as_ref()
+                .map(|o| (o, s.page_on, s.page_gain, false)),
+            Some((&self.mic, s.mic_on, s.mic_gain, hold_mic)),
+        ];
+        for (ring, on, gain, hold) in sources.into_iter().flatten() {
             if hold {
                 continue;
             }
@@ -236,5 +253,34 @@ mod tests {
         });
         page.push(&[0.9, 0.9]);
         assert_eq!(m.pull(1), vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn overlay_sound_follows_page_settings() {
+        let (page, mic, ov) = (
+            AudioRing::new(1000),
+            AudioRing::new(1000),
+            AudioRing::new(1000),
+        );
+        let m = Mixer::new(page.clone(), mic, MixSettings::default()).with_overlay(ov.clone());
+        page.push(&[0.25, 0.25]);
+        ov.push(&[0.5, 0.5]);
+        assert_eq!(&m.pull(1)[..], &[0.75, 0.75]);
+        m.set(MixSettings {
+            page_on: true,
+            page_gain: 0.5,
+            ..MixSettings::default()
+        });
+        ov.push(&[0.5, 0.5]);
+        assert_eq!(&m.pull(1)[..], &[0.25, 0.25]);
+        m.set(MixSettings {
+            page_on: false,
+            ..MixSettings::default()
+        });
+        ov.push(&[0.5, 0.5]);
+        assert_eq!(&m.pull(1)[..], &[0.0, 0.0]);
+        // Drained while off: nothing replays when page sound comes back.
+        m.set(MixSettings::default());
+        assert_eq!(&m.pull(1)[..], &[0.0, 0.0]);
     }
 }

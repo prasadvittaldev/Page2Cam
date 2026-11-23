@@ -26,10 +26,19 @@ fn close(a: [u8; 4], b: [u8; 4]) -> bool {
 }
 
 fn wait_for(slot: &FrameSlot, what: &str, check: impl Fn(&Frame) -> bool) -> Result<(), String> {
+    wait_for_size(slot, (W, H), what, check)
+}
+
+fn wait_for_size(
+    slot: &FrameSlot,
+    (w, h): (u32, u32),
+    what: &str,
+    check: impl Fn(&Frame) -> bool,
+) -> Result<(), String> {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(10) {
         if let Some(f) = slot.latest() {
-            if f.width == W && f.height == H && check(&f) {
+            if f.width == w && f.height == h && check(&f) {
                 return Ok(());
             }
         }
@@ -51,6 +60,157 @@ const PAGE: &str = "<body style='margin:0'><div style='display:flex;height:100vh
     o.connect(g).connect(c.destination);o.start();\
     document.onkeypress=e=>{if(e.key==='k')r.style.background='%23ff00ff'};</script></body>";
 
+/// The overlay browser's page: no background (transparent), an opaque red
+/// block bottom-right and a 50 % green block bottom-left.
+const OVERLAY: &str = "<body style='margin:0;background:transparent'>\
+    <div style='position:fixed;right:0;bottom:0;width:50%;height:50%;background:%23ff0000'></div>\
+    <div style='position:fixed;left:0;bottom:0;width:50%;height:50%;background:rgba(0,255,0,0.5)'></div>\
+    </body>";
+
+/// Transparent where nothing is drawn, opaque under the red block, and
+/// premultiplied (about half green, alpha half) under the 50 % block.
+fn overlay_pixels_ok(f: &Frame) -> Result<(), String> {
+    let (top, red, half) = (f.pixel(100, 60), f.pixel(540, 300), f.pixel(100, 300));
+    let premul_half = (100..=155).contains(&half[1]) && (100..=155).contains(&half[3]);
+    if top[3] == 0 && close(red, RED) && premul_half && half[0] < 8 && half[2] < 8 {
+        Ok(())
+    } else {
+        Err(format!(
+            "overlay pixels: top {top:?} (want alpha 0), red {red:?}, half {half:?} (want ~[0,128,0,128])"
+        ))
+    }
+}
+
+fn overlay_is_transparent(slot: &FrameSlot) -> Result<(), String> {
+    let start = Instant::now();
+    let mut last = String::from("no overlay frame");
+    while start.elapsed() < Duration::from_secs(10) {
+        if let Some(f) = slot.latest() {
+            if (f.width, f.height) == (W, H) {
+                match overlay_pixels_ok(&f) {
+                    Ok(()) => {
+                        println!("test overlay_browser_is_transparent ... ok");
+                        return Ok(());
+                    }
+                    Err(e) => last = e,
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(last)
+}
+
+/// A tiny HTTP server for the real overlay scene (`p2c_overlay::scene`)
+/// with the admin server's headers: a news title and an HTML layer.
+fn serve_scene() -> String {
+    use std::io::{Read, Write};
+    let d = tempfile::tempdir().unwrap();
+    let assets = p2c_overlay::Assets::new(d.path());
+    let mut set = p2c_overlay::LayerSet::new();
+    let now = Instant::now();
+    set.add(
+        serde_json::json!({"kind": "title", "text": "Hi", "id": "t", "enter": "none"}),
+        &assets,
+        now,
+    )
+    .unwrap();
+    set.add(
+        serde_json::json!({"kind": "html", "id": "chart", "enter": "none",
+            "html": "<div style='width:100%;height:100%;background:#00ff00'></div>\
+                     <script>document.body.dataset.ok = 1</script>"}),
+        &assets,
+        now,
+    )
+    .unwrap();
+    let state = set.state_json().to_string();
+    let html = p2c_overlay::scene::layer_page(set.html_of("chart").unwrap());
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let _keep = d;
+        for s in l.incoming().flatten() {
+            let mut s = s;
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+            let path = path.split('?').next().unwrap_or("").to_string();
+            let (ctype, csp, body) = match path.as_str() {
+                "/ov/x/scene.html" => (
+                    "text/html",
+                    p2c_overlay::scene::SCENE_CSP,
+                    p2c_overlay::scene::SCENE_HTML.to_string(),
+                ),
+                "/ov/x/scene.js" => (
+                    "text/javascript",
+                    "",
+                    p2c_overlay::scene::SCENE_JS.to_string(),
+                ),
+                "/ov/x/state" => ("application/json", "", state.clone()),
+                "/ov/x/layer/chart" => ("text/html", p2c_overlay::scene::LAYER_CSP, html.clone()),
+                _ => ("text/plain", "", String::new()),
+            };
+            let csp = if csp.is_empty() {
+                String::new()
+            } else {
+                format!("Content-Security-Policy: {csp}\r\n")
+            };
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n{csp}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    format!("http://127.0.0.1:{port}/ov/x/scene.html")
+}
+
+/// The overlay browser on the real scene page: the title's box and the
+/// HTML layer (in its sandboxed frame) are drawn, the rest stays transparent.
+fn scene_draws_layers(overlay: &BrowserHandle, slot: &FrameSlot) -> Result<(), String> {
+    overlay.navigate(&serve_scene());
+    let navy = [0x5b, 0x2a, 0x0b, 255];
+    let start = Instant::now();
+    let mut last = String::from("no overlay frame");
+    while start.elapsed() < Duration::from_secs(15) {
+        if let Some(f) = slot.latest() {
+            let (bg, title, chart) = (f.pixel(100, 60), f.pixel(300, 288), f.pixel(500, 80));
+            if bg[3] == 0 && close(title, navy) && close(chart, GREEN) {
+                println!("test overlay_scene_draws_layers ... ok");
+                return Ok(());
+            }
+            last = format!("transparent {bg:?}, title {title:?} (want {navy:?}), html {chart:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("scene: {last}"))
+}
+
+/// The page renders at a new view size (the quality throttle's resolution
+/// lever), and back; the overlay keeps its size.
+fn set_size_resizes_page(
+    h: &BrowserHandle,
+    slot: &FrameSlot,
+    overlay: &FrameSlot,
+) -> Result<(), String> {
+    h.set_size(960, 540);
+    wait_for_size(slot, (960, 540), "960x540 page after set_size", |f| {
+        close(f.pixel(150, 270), GREEN)
+    })?;
+    if let Some(f) = overlay.latest() {
+        if (f.width, f.height) != (W, H) {
+            return Err(format!("overlay resized to {}x{}", f.width, f.height));
+        }
+    }
+    h.set_size(W, H);
+    wait_for(slot, "page back at its size", |f| {
+        close(f.pixel(100, 180), GREEN)
+    })?;
+    println!("test set_size_resizes_page ... ok");
+    Ok(())
+}
+
 #[cfg(windows)]
 mod gpu {
     //! The GPU path: Chromium on the chosen adapter, its shared textures
@@ -65,11 +225,18 @@ mod gpu {
         pub ok: Arc<AtomicU64>,
         pub failed: Arc<AtomicU64>,
         pub name: String,
+        pub overlay: p2c_d3d::PageInput,
+        pub overlay_ok: Arc<AtomicU64>,
     }
 
     /// The adapter `gpu = "auto"` picks, a device and page input on it, and
     /// the `GpuPage` that feeds it. `None` without a hardware adapter.
-    pub fn setup() -> Option<(Session, p2c_browser::GpuPage)> {
+    #[allow(clippy::type_complexity)]
+    pub fn setup() -> Option<(
+        Session,
+        p2c_browser::GpuPage,
+        Arc<dyn Fn(isize, u32, u32) -> bool + Send + Sync>,
+    )> {
         let adapters = p2c_d3d::enumerate();
         let p2c_d3d::GpuChoice::Gpu(a) = p2c_d3d::choose(&adapters, &p2c_d3d::GpuSetting::Auto).0
         else {
@@ -77,6 +244,17 @@ mod gpu {
         };
         let gpu = p2c_d3d::Gpu::new(a.luid).expect("D3D11 device");
         let page = p2c_d3d::PageInput::new(&gpu, W, H).expect("page input");
+        let overlay = p2c_d3d::PageInput::new(&gpu, W, H).expect("overlay input");
+        let overlay_ok = Arc::new(AtomicU64::new(0));
+        let (ov, ook) = (overlay.clone(), overlay_ok.clone());
+        let on_overlay: Arc<dyn Fn(isize, u32, u32) -> bool + Send + Sync> =
+            Arc::new(move |handle, _w, _h| {
+                let ok = ov.on_shared_texture(handle).is_ok();
+                if ok {
+                    ook.fetch_add(1, Ordering::SeqCst);
+                }
+                ok
+            });
         let ok = Arc::new(AtomicU64::new(0));
         let failed = Arc::new(AtomicU64::new(0));
         let (p, o, f) = (page.clone(), ok.clone(), failed.clone());
@@ -102,9 +280,64 @@ mod gpu {
                 ok,
                 failed,
                 name: a.name,
+                overlay,
+                overlay_ok,
             },
             gpu_page,
+            on_overlay,
         ))
+    }
+
+    /// The overlay browser's shared textures keep their transparency.
+    pub fn overlay_textures_are_transparent(s: &Session) -> Result<(), String> {
+        let start = Instant::now();
+        let mut last = String::from("no overlay texture");
+        while start.elapsed() < Duration::from_secs(10) {
+            if s.overlay_ok.load(Ordering::SeqCst) > 0 {
+                let f = s
+                    .gpu
+                    .read_bgra(&s.overlay.texture())
+                    .map_err(|e| format!("{e:#}"))?;
+                if (f.width, f.height) == (W, H) {
+                    match super::overlay_pixels_ok(&f) {
+                        Ok(()) => {
+                            println!("test overlay_textures_are_transparent ... ok");
+                            return Ok(());
+                        }
+                        Err(e) => last = e,
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err(last)
+    }
+
+    /// A new view size reaches our page texture (it is recreated at the new
+    /// size, no device error), and back.
+    pub fn set_size_on_gpu(s: &Session, h: &p2c_browser::BrowserHandle) -> Result<(), String> {
+        for (w, ht, x, y) in [(960, 540, 150, 270), (W, H, 100, 180)] {
+            h.set_size(w, ht);
+            let start = Instant::now();
+            loop {
+                let f = s
+                    .gpu
+                    .read_bgra(&s.page.texture())
+                    .map_err(|e| format!("{e:#}"))?;
+                if (f.width, f.height) == (w, ht) && close(f.pixel(x, y), GREEN) {
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(10) {
+                    return Err(format!(
+                        "page texture {}x{} after set_size({w}, {ht})",
+                        f.width, f.height
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        println!("test set_size_on_gpu ... ok");
+        Ok(())
     }
 
     pub fn shared_textures_arrive(s: &Session) -> Result<(), String> {
@@ -296,15 +529,16 @@ fn main() {
     let profile: PathBuf =
         std::env::temp_dir().join(format!("p2c-test-profile-{}", std::process::id()));
     #[cfg(windows)]
-    let (session, gpu_page) = match gpu::setup() {
-        Some((s, p)) => (Some(s), Some(p)),
+    let (session, gpu_page, on_overlay) = match gpu::setup() {
+        Some((s, p, o)) => (Some(s), Some(p), Some(o)),
         None => {
             println!("no hardware GPU: shared texture step skipped");
-            (None, None)
+            (None, None, None)
         }
     };
     #[cfg(not(windows))]
-    let gpu_page = None;
+    let (gpu_page, on_overlay) = (None, None);
+    let overlay_slot = FrameSlot::new();
     let cfg = BrowserConfig {
         url: format!("data:text/html,{PAGE}"),
         width: W,
@@ -314,6 +548,14 @@ fn main() {
         audio: Some(audio.clone()),
         gpu_page,
         paused: Default::default(),
+        overlay: Some(p2c_browser::OverlayBrowser {
+            url: format!("data:text/html,{OVERLAY}"),
+            slot: overlay_slot.clone(),
+            fps: 30,
+            audio: None,
+            on_texture: on_overlay,
+            paused: Default::default(),
+        }),
     };
     let (tx, rx) = std::sync::mpsc::channel();
     let watch = slot.clone();
@@ -323,7 +565,9 @@ fn main() {
                 #[cfg(windows)]
                 if let Some(s) = &session {
                     gpu::shared_textures_arrive(s)?;
+                    gpu::overlay_textures_are_transparent(s)?;
                     gpu::repaint_paints_a_static_page(s, &h)?;
+                    gpu::set_size_on_gpu(s, &h)?;
                     // CPU fallback without re-initialising CEF: the other
                     // steps run on the recreated browser's CPU paints.
                     h.recreate_cpu();
@@ -334,7 +578,14 @@ fn main() {
                 }
                 Ok(())
             };
-            let r = gpu_steps().and_then(|()| scenario(&h, &watch, &audio));
+            let r = gpu_steps()
+                .and_then(|()| overlay_is_transparent(&overlay_slot))
+                .and_then(|()| set_size_resizes_page(&h, &watch, &overlay_slot))
+                .and_then(|()| {
+                    let o = h.overlay().ok_or("no overlay browser")?;
+                    scene_draws_layers(&o, &overlay_slot)
+                })
+                .and_then(|()| scenario(&h, &watch, &audio));
             tx.send(r).unwrap();
             h.shutdown();
         });

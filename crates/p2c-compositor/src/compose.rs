@@ -112,6 +112,8 @@ pub struct Compositor {
     refined_t: DurationStats,
     /// Composites by cause since the last [`Compositor::take_redraw_why`].
     why: RedrawWhy,
+    /// The overlay-layer frame scaled to the output (when its size differs).
+    overlay: Option<ScaledPage>,
 }
 
 /// The page scaled to fit the output.
@@ -150,6 +152,7 @@ struct Inputs {
     mask: Option<Arc<Mask>>,
     layout: Option<PipLayout>,
     backdrop: Backdrop,
+    overlay: Option<Arc<Frame>>,
     out: (u32, u32),
 }
 
@@ -223,13 +226,21 @@ pub struct Changed {
     /// PIP position, size, style or visibility.
     pub layout: bool,
     pub backdrop: bool,
+    /// A new overlay-layer frame, or the overlay shown or hidden.
+    pub overlay: bool,
     /// No previous composite (first one, after an error, output size).
     pub other: bool,
 }
 
 impl Changed {
     pub fn any(&self) -> bool {
-        self.page || self.webcam || self.mask || self.layout || self.backdrop || self.other
+        self.page
+            || self.webcam
+            || self.mask
+            || self.layout
+            || self.backdrop
+            || self.overlay
+            || self.other
     }
 }
 
@@ -243,6 +254,7 @@ pub struct RedrawWhy {
     pub mask: u32,
     pub layout: u32,
     pub backdrop: u32,
+    pub overlay: u32,
     pub other: u32,
 }
 
@@ -259,6 +271,7 @@ impl RedrawWhy {
             (&mut self.mask, c.mask),
             (&mut self.layout, c.layout),
             (&mut self.backdrop, c.backdrop),
+            (&mut self.overlay, c.overlay),
             (&mut self.other, c.other),
         ] {
             *n += u32::from(yes);
@@ -270,13 +283,14 @@ impl std::fmt::Display for RedrawWhy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "composites {} (page {}, webcam {}, mask {}, layout {}, backdrop {}, other {})",
+            "composites {} (page {}, webcam {}, mask {}, layout {}, backdrop {}, overlay {}, other {})",
             self.composites,
             self.page,
             self.webcam,
             self.mask,
             self.layout,
             self.backdrop,
+            self.overlay,
             self.other
         )
     }
@@ -384,6 +398,7 @@ impl Compositor {
             guided_out: Vec::new(),
             refined_t: DurationStats::default(),
             why: RedrawWhy::default(),
+            overlay: None,
         }
     }
 
@@ -412,8 +427,22 @@ impl Compositor {
         backdrop: &Backdrop,
         out: &mut Frame,
     ) -> bool {
+        self.compose_with(page, pip, backdrop, None, out)
+    }
+
+    /// [`Compositor::compose`], then the overlay layers (a premultiplied BGRA
+    /// frame, transparent where nothing is drawn) over everything, scaled to
+    /// fit the output when its size differs. The output stays opaque.
+    pub fn compose_with(
+        &mut self,
+        page: Option<&Arc<Frame>>,
+        pip: Option<Pip>,
+        backdrop: &Backdrop,
+        overlay: Option<&Arc<Frame>>,
+        out: &mut Frame,
+    ) -> bool {
         let plan = plan_compose(page, pip, backdrop);
-        let changed = self.changes(&plan, backdrop, (out.width, out.height));
+        let changed = self.changes(&plan, backdrop, overlay, (out.width, out.height));
         if !changed.any() {
             return false;
         }
@@ -441,6 +470,9 @@ impl Compositor {
                 }
             }
         }
+        if let Some(ov) = overlay {
+            self.draw_overlay(ov, out);
+        }
         self.note = ComposeNote::of(
             backdrop,
             pip.map_or(&PipLayout::default(), |p| p.layout),
@@ -453,6 +485,7 @@ impl Compositor {
             mask: plan.shown_pip().and_then(|p| p.mask.cloned()),
             layout: plan.shown_pip().map(|p| p.layout),
             backdrop: backdrop.clone(),
+            overlay: overlay.cloned(),
             out: (out.width, out.height),
         });
         true
@@ -468,11 +501,27 @@ impl Compositor {
         width: u32,
         height: u32,
     ) -> bool {
-        self.same_inputs(
-            &plan_compose(page, pip, backdrop),
-            backdrop,
-            (width, height),
-        )
+        self.is_unchanged_with(page, pip, backdrop, None, width, height)
+    }
+
+    /// [`Compositor::is_unchanged`] for [`Compositor::compose_with`].
+    pub fn is_unchanged_with(
+        &self,
+        page: Option<&Arc<Frame>>,
+        pip: Option<Pip>,
+        backdrop: &Backdrop,
+        overlay: Option<&Arc<Frame>>,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        !self
+            .changes(
+                &plan_compose(page, pip, backdrop),
+                backdrop,
+                overlay,
+                (width, height),
+            )
+            .any()
     }
 
     /// Composites since the last call, by cause (for the stats line).
@@ -485,7 +534,13 @@ impl Compositor {
     /// a blur is only rebuilt for a new webcam frame or a new size, and both
     /// are compared here. A hidden PIP's webcam, mask and layout don't count
     /// ([`ComposePlan::shown_pip`]).
-    fn changes(&self, plan: &ComposePlan, backdrop: &Backdrop, out: (u32, u32)) -> Changed {
+    fn changes(
+        &self,
+        plan: &ComposePlan,
+        backdrop: &Backdrop,
+        overlay: Option<&Arc<Frame>>,
+        out: (u32, u32),
+    ) -> Changed {
         let Some(l) = &self.last else {
             return Changed {
                 other: true,
@@ -499,12 +554,43 @@ impl Compositor {
             mask: !same(&l.mask, shown.and_then(|p| p.mask)),
             layout: l.layout != shown.map(|p| p.layout),
             backdrop: l.backdrop != *backdrop,
+            overlay: !same(&l.overlay, overlay),
             other: l.out != out,
         }
     }
 
-    fn same_inputs(&self, plan: &ComposePlan, backdrop: &Backdrop, out: (u32, u32)) -> bool {
-        !self.changes(plan, backdrop, out).any()
+    /// The overlay layers (premultiplied) over `out`: 1:1 when the sizes
+    /// match, else scaled to fit (cached per overlay frame and size).
+    fn draw_overlay(&mut self, ov: &Arc<Frame>, out: &mut Frame) {
+        if ov.width == 0 || ov.height == 0 {
+            return;
+        }
+        if (ov.width, ov.height) == (out.width, out.height) {
+            blend_premultiplied(&ov.data, ov.width, ov.height, out, 0, 0);
+            return;
+        }
+        let (dx, dy, dw, dh) = fit_rect(ov.width, ov.height, out.width, out.height);
+        if dw == 0 || dh == 0 {
+            return;
+        }
+        let fresh = self
+            .overlay
+            .as_ref()
+            .is_some_and(|s| Arc::ptr_eq(&s.src, ov) && (s.w, s.h) == (dw, dh));
+        if !fresh {
+            let mut data = self.overlay.take().map(|s| s.data).unwrap_or_default();
+            data.resize(dw as usize * dh as usize * 4, 0);
+            // Already premultiplied: every channel is scaled as plain data.
+            resize_into(&mut self.resizer, ov, &mut data, dw, dh, false);
+            self.overlay = Some(ScaledPage {
+                src: ov.clone(),
+                w: dw,
+                h: dh,
+                data,
+            });
+        }
+        let s = self.overlay.as_ref().expect("overlay just scaled");
+        blend_premultiplied(&s.data, dw, dh, out, dx as i32, dy);
     }
 
     fn draw_page(&mut self, page: Option<&Arc<Frame>>, out: &mut Frame) {
@@ -1998,13 +2084,14 @@ mod tests {
                 mask: 1,
                 layout: 1,
                 backdrop: 1,
+                overlay: 0,
                 other: 1,
             }
         );
         assert_eq!(c.take_redraw_why(), RedrawWhy::default(), "taking resets");
         assert_eq!(
             why.to_string(),
-            "composites 5 (page 1, webcam 1, mask 1, layout 1, backdrop 1, other 1)"
+            "composites 5 (page 1, webcam 1, mask 1, layout 1, backdrop 1, overlay 0, other 1)"
         );
     }
 
@@ -2052,5 +2139,45 @@ mod tests {
         let (want, _) = draw(&cam, None, &b, &Backdrop::default());
         assert!(got == want);
         assert_eq!(note, ComposeNote::None);
+    }
+
+    #[test]
+    fn overlay_is_blended_over_everything_and_counted() {
+        let bd = Backdrop::default();
+        let page = Arc::new(Frame::from_bgra(4, 2, [100, 100, 100, 255].repeat(8)).unwrap());
+        let mut px = vec![0u8; 4 * 2 * 4];
+        px[4..8].copy_from_slice(&[0, 0, 255, 255]);
+        px[8..12].copy_from_slice(&[64, 0, 0, 128]);
+        let ov = Arc::new(Frame::from_bgra(4, 2, px).unwrap());
+        let mut c = Compositor::new();
+        let mut out = Frame::new_black(4, 2);
+        assert!(c.compose_with(Some(&page), None, &bd, Some(&ov), &mut out));
+        // Transparent: the page. Opaque: the overlay. Half: premultiplied over.
+        assert_eq!(&out.data[0..4], &[100, 100, 100, 255]);
+        assert_eq!(&out.data[4..8], &[0, 0, 255, 255]);
+        assert_eq!(&out.data[8..12], &[114, 50, 50, 255]);
+        assert!(c.is_unchanged_with(Some(&page), None, &bd, Some(&ov), 4, 2));
+        assert!(!c.compose_with(Some(&page), None, &bd, Some(&ov), &mut out));
+        // A new overlay frame redraws, and so does the overlay going away.
+        let ov2 = Arc::new((*ov).clone());
+        assert!(!c.is_unchanged_with(Some(&page), None, &bd, Some(&ov2), 4, 2));
+        assert!(c.compose_with(Some(&page), None, &bd, Some(&ov2), &mut out));
+        assert!(c.compose_with(Some(&page), None, &bd, None, &mut out));
+        assert_eq!(&out.data[4..8], &[100, 100, 100, 255]);
+        let why = c.take_redraw_why();
+        assert_eq!((why.composites, why.overlay, why.other), (3, 2, 1));
+        assert!(why.to_string().contains("overlay 2"), "{why}");
+    }
+
+    #[test]
+    fn overlay_of_another_size_is_scaled_to_the_output() {
+        let page = Arc::new(Frame::from_bgra(4, 2, [9, 9, 9, 255].repeat(8)).unwrap());
+        let ov = Arc::new(Frame::from_bgra(2, 1, [0, 0, 255, 255].repeat(2)).unwrap());
+        let mut c = Compositor::new();
+        let mut out = Frame::new_black(4, 2);
+        c.compose_with(Some(&page), None, &Backdrop::default(), Some(&ov), &mut out);
+        for p in out.data.as_chunks::<4>().0 {
+            assert_eq!(*p, [0, 0, 255, 255]);
+        }
     }
 }

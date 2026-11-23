@@ -86,8 +86,8 @@ struct Pipeline {
     /// Premultiplied "over" for colour; destination alpha kept (opaque).
     blend: ID3D11BlendState,
     /// One constant buffer per draw of a frame (page, layer build, layer
-    /// draw, preview, blurred room, box backdrop).
-    cbs: [ID3D11Buffer; 6],
+    /// draw, preview, blurred room, box backdrop, overlay layers).
+    cbs: [ID3D11Buffer; 7],
 }
 
 impl Pipeline {
@@ -127,7 +127,7 @@ impl Pipeline {
             ps_layer: crate::shaders::ps(device, COMPOSE_HLSL, "compose.hlsl", "ps_layer")?,
             ps_sample: crate::shaders::ps(device, COMPOSE_HLSL, "compose.hlsl", "ps_sample")?,
             blend: blend.context("CreateBlendState returned nothing")?,
-            cbs: [cb()?, cb()?, cb()?, cb()?, cb()?, cb()?],
+            cbs: [cb()?, cb()?, cb()?, cb()?, cb()?, cb()?, cb()?],
         })
     }
 }
@@ -181,6 +181,8 @@ struct Key {
     mask: Option<Arc<Mask>>,
     layout: Option<PipLayout>,
     backdrop: Backdrop,
+    /// The overlay frame drawn (0: no overlay pass).
+    overlay_seq: u64,
 }
 
 fn same<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
@@ -194,7 +196,7 @@ fn same<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
 impl Key {
     /// A hidden PIP's webcam, mask and layout are left out: they change
     /// nothing in the output ([`ComposePlan::shown_pip`]).
-    fn of(page_seq: u64, inputs: &TickInputs) -> Key {
+    fn of(page_seq: u64, overlay_seq: u64, inputs: &TickInputs) -> Key {
         let plan = plan_of(inputs);
         let shown = plan.shown_pip();
         let (page_seq, cam) = match plan.base {
@@ -207,6 +209,7 @@ impl Key {
             mask: shown.and_then(|p| p.mask.cloned()),
             layout: shown.map(|p| p.layout),
             backdrop: inputs.backdrop.clone(),
+            overlay_seq,
         }
     }
 
@@ -224,6 +227,7 @@ impl Key {
             mask: !same(&self.mask, &o.mask),
             layout: self.layout != o.layout,
             backdrop: self.backdrop != o.backdrop,
+            overlay: self.overlay_seq != o.overlay_seq,
             other: false,
         }
     }
@@ -317,6 +321,9 @@ struct Preview {
 pub struct GpuProducer {
     gpu: Gpu,
     page: PageInput,
+    /// The overlay layers (premultiplied), drawn over everything while
+    /// `TickInputs::overlay_on`.
+    overlay: Option<PageInput>,
     spec: OutputSpec,
     pipe: Pipeline,
     /// The composited BGRA frame at the output size.
@@ -415,6 +422,7 @@ impl GpuProducer {
         Ok(GpuProducer {
             gpu,
             page,
+            overlay: None,
             spec,
             pipe,
             target,
@@ -447,6 +455,20 @@ impl GpuProducer {
             prof: Profiler::new(),
             last_profile: None,
         })
+    }
+
+    /// Draw the overlay layers from `overlay` (a texture on this device).
+    pub fn with_overlay(mut self, overlay: PageInput) -> GpuProducer {
+        self.overlay = Some(overlay);
+        self
+    }
+
+    /// The overlay frame to draw for `inputs` (0: none).
+    fn overlay_seq(&self, inputs: &TickInputs) -> u64 {
+        match &self.overlay {
+            Some(o) if inputs.overlay_on => o.seq(),
+            _ => 0,
+        }
     }
 
     /// The device this producer renders on.
@@ -495,7 +517,7 @@ impl GpuProducer {
         if !self.can_draw(inputs) {
             bail!("backdrop shaders unavailable on this GPU");
         }
-        self.composite(self.page.seq(), inputs)?;
+        self.composite(self.page.seq(), self.overlay_seq(inputs), inputs)?;
         self.gpu.read_bgra(&self.target)
     }
 
@@ -758,7 +780,7 @@ impl GpuProducer {
     /// Draw what [`plan_compose`] decides for `inputs` into `self.target`:
     /// the page or the blurred room, then the PIP (box backdrop, then the
     /// webcam layer over it).
-    fn composite(&mut self, page_seq: u64, inputs: &TickInputs) -> Result<()> {
+    fn composite(&mut self, page_seq: u64, overlay_seq: u64, inputs: &TickInputs) -> Result<()> {
         let plan = plan_of(inputs);
         let (ow, oh) = (self.spec.width, self.spec.height);
         let room_cam = match plan.base {
@@ -799,6 +821,9 @@ impl GpuProducer {
         // Take the page texture before locking the context: PageInput's
         // mutex must never be taken while holding `gpu.lock()` (R22).
         let page = (room.is_none() && page_seq > 0).then(|| self.page.texture());
+        let overlay = (overlay_seq > 0)
+            .then(|| self.overlay.as_ref().map(|o| o.texture()))
+            .flatten();
 
         let page_draw = page.as_ref().and_then(|t| {
             let (x, y, w, h) = fit_rect(t.width(), t.height(), ow, oh);
@@ -932,7 +957,7 @@ impl GpuProducer {
                 ctx.UpdateSubresource(cb, 0, None, &c as *const _ as _, 0, 0);
                 ctx.PSSetShader(&self.pipe.ps_layer, None);
                 ctx.OMSetBlendState(&self.pipe.blend, None, 0xffff_ffff);
-                ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+                ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
                 ctx.PSSetConstantBuffers(0, Some(&[Some(cb.clone())]));
                 ctx.PSSetShaderResources(0, Some(&[srv, None]));
                 ctx.RSSetViewports(Some(&[viewport(
@@ -942,6 +967,35 @@ impl GpuProducer {
             }
             if self.profiling {
                 self.prof.mark(&self.gpu, "pip")?;
+            }
+            if let Some(t) = &overlay {
+                // The overlay layers over everything (premultiplied "over"):
+                // 1:1 when the sizes match, else scaled to fit.
+                let (x, y, w, h) = fit_rect(t.width(), t.height(), ow, oh);
+                if w > 0 && h > 0 {
+                    let c = PassConsts {
+                        rect: [x as f32, y as f32, w as f32, h as f32],
+                        ..Default::default()
+                    };
+                    let cb = &self.pipe.cbs[6];
+                    ctx.UpdateSubresource(cb, 0, None, &c as *const _ as _, 0, 0);
+                    let shader = if (w, h) == (t.width(), t.height()) {
+                        &self.pipe.ps_layer
+                    } else {
+                        &self.pipe.ps_sample
+                    };
+                    ctx.PSSetShader(shader, None);
+                    ctx.PSSetSamplers(0, Some(&[Some(s.linear_clamp.clone())]));
+                    ctx.OMSetBlendState(&self.pipe.blend, None, 0xffff_ffff);
+                    ctx.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+                    ctx.PSSetConstantBuffers(0, Some(&[Some(cb.clone())]));
+                    ctx.PSSetShaderResources(0, Some(&[t.srv().cloned(), None]));
+                    ctx.RSSetViewports(Some(&[viewport(x as f32, y as f32, w as f32, h as f32)]));
+                    ctx.Draw(3, 0);
+                }
+            }
+            if self.profiling {
+                self.prof.mark(&self.gpu, "overlay")?;
             }
             // Unbind so the target can be sampled and the inputs updated.
             ctx.OMSetRenderTargets(None, None);
@@ -1122,10 +1176,10 @@ impl GpuProducer {
             // Nothing drawn: the ticker repeats the last output and hands over.
             return Ok(None);
         }
-        let key = Key::of(self.page.seq(), inputs);
+        let key = Key::of(self.page.seq(), self.overlay_seq(inputs), inputs);
         let changed = key.changes(self.last_key.as_ref());
         let fresh = if changed.any() {
-            self.composite(key.page_seq, inputs)?;
+            self.composite(key.page_seq, key.overlay_seq, inputs)?;
             // Counted once drawn: a failed composite is redrawn (and
             // counted) on the next tick.
             self.why.count(changed);
@@ -1212,6 +1266,8 @@ mod tests {
             mask: m.cloned(),
             layout,
             backdrop,
+            overlay_on: false,
+            overlay: None,
         }
     }
 
@@ -1234,7 +1290,7 @@ mod tests {
 
     /// What changed from `a` (page seq `sa`) to `b` (page seq `sb`).
     fn changes(sa: u64, a: &TickInputs, sb: u64, b: &TickInputs) -> Changed {
-        Key::of(sb, b).changes(Some(&Key::of(sa, a)))
+        Key::of(sb, 0, b).changes(Some(&Key::of(sa, 0, a)))
     }
 
     #[test]
@@ -1246,6 +1302,8 @@ mod tests {
             mask: None,
             layout: cutout(true),
             backdrop: Backdrop::default(),
+            overlay_on: false,
+            overlay: None,
         };
         let cases = [
             none,
@@ -1311,7 +1369,7 @@ mod tests {
                 ..Changed::default()
             }
         );
-        let first = Key::of(1, &base).changes(None);
+        let first = Key::of(1, 0, &base).changes(None);
         assert_eq!(
             first,
             Changed {
