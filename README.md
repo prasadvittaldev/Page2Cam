@@ -1,40 +1,52 @@
 <p align="center"><img src="assets/logo.png" alt="Page2Cam" width="560"></p>
 
-# Page2Cam
+<h1 align="center">Page2Cam</h1>
+
+<p align="center"><b>Your Webcam. Your Rules. Your AI.</b><br>
+<i>Create. Customize. Express. Automate.</i></p>
+
+<p align="center">A creative virtual camera platform that puts control of your visual identity in your hands, or in the hands of your AI agent.</p>
 
 **Page2Cam is a project by Prasad Vittaldev.**
 Connect with him on LinkedIn: <https://www.linkedin.com/in/prasadvittaldev/>
 
 ---
 
+## Three pillars of Page2Cam
+
+| 1. Creative Freedom | 2. Visual Control | 3. Agentic Control |
+|---|---|---|
+| Switch between professional, playful, expressive and completely custom webcam experiences. | Transform websites, webcam feeds, backgrounds, overlays and presentations into your own camera experience. | Let AI agents operate and orchestrate the camera experience: changing scenes, adjusting presentation and controlling streaming workflows. |
+
 ## What is Page2Cam?
 
-Page2Cam turns any website into a camera.
+A camera experience you create, control and express, yourself or through AI agents.
 
-When you are in a video call on Teams, Zoom or Google Meet, the other people normally see you through your webcam. With Page2Cam, they can see a **website** instead, such as a dashboard, a slide show, a map, a news page or anything else you can open in a browser. You can also put **yourself** on top of that website, so people see both you and the page at the same time.
+Page2Cam is a virtual camera for Teams, Zoom, Google Meet and any other app that uses a webcam, and a live stream to YouTube. Instead of just your webcam, people see what you design: a live website, a dashboard, a slide show or one of your screens, with **you** on top of it (in a box, or cut out of your room), and TV-style graphics over everything.
 
-Page2Cam can also send the same picture, with sound, **live to YouTube**.
+You run it from a simple control page on your own computer, or you just ask your AI agent. The people watching only see the result, never your controls.
 
-You control everything from a simple control page on your own computer. You can change the website, click, scroll and type in it while it is live, and the people watching only see the website, never your controls.
+### 1. Creative Freedom
 
-### What you can do with it
-
-- **Show a website as your camera** in Teams, Zoom, Google Meet or any other app that uses a webcam.
-- **Go live on YouTube** with the website and its sound.
 - **Put yourself on the page** in one of three ways:
   - **Box**: your webcam in a small box that you can move and resize anywhere on the page.
   - **Cut-out small**: just you, with your room removed, standing at the bottom of the page.
   - **Cut-out full**: like a Teams background, except the background is the live website.
-- **Choose the cut-out quality**:
-  - **Quality** gives cleaner edges around your hair.
-  - **Fast** runs smoothly on any computer.
-
-  If your computer can't keep up with Quality, Page2Cam switches to Fast by itself so your video stays smooth.
-- **Choose the sound for YouTube**: the website's sound, your microphone, or both, each with its own volume.
-- **Use the website live**: click, scroll and type on it from the control page while people are watching.
 - **Change the background**: a picture, a colour, a YouTube video, your blurred room, or **one of your screens**, live.
-- **Add overlays on top of everything**: titles and lower thirds, a scrolling ticker, animated charts, pictures and video clips, like TV graphics.
-- **Let an AI agent run it**: Claude Desktop, Claude Code, Codex, Cursor or VS Code can start Page2Cam, change the page or background, share a screen and go live, from a prompt.
+- **48 ready-made graphics** you fill in: name badges and lower thirds, countdowns, agendas, polls, charts, QR codes, product cards, release notes, code cards and more. Their values change live.
+- **Make your own**: save your own graphics as templates, and save a whole look (graphics, background, webcam) as a **scene** you can bring back with one click.
+
+### 2. Visual Control
+
+- **Show a website as your camera**, and click, scroll and type in it from the control page while people are watching.
+- **Add overlays on top of everything**: titles, a scrolling ticker, animated charts, pictures and video clips.
+- **Go live on YouTube** with the same picture, and choose the sound: the website's, your microphone, or both, each with its own volume.
+- **Choose the cut-out quality**: **Quality** gives cleaner edges around your hair, **Fast** runs smoothly on any computer. If your computer can't keep up with Quality, Page2Cam switches to Fast by itself so your video stays smooth.
+
+### 3. Agentic Control
+
+- **Let an AI agent run it**: Claude Desktop, Claude Code, Codex, Cursor or VS Code can start Page2Cam, change the page or background, share a screen, add and update graphics, switch scenes and go live, from a prompt.
+- **Agents already know how**: Page2Cam teaches them ready-made setups for 24 kinds of users: streamers and podcasters, sales demos and webinars, teachers, telehealth and therapy, live shopping, faith and community events, and software teams (release demos, stand-ups, developer streams). Just say *"I'm starting a telehealth call, set me up"*.
 
 ### What you need
 
