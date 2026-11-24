@@ -126,6 +126,30 @@ if ($p.ExitCode -ne 0) { throw "The installer failed (exit code $($p.ExitCode)).
 
 Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 $exe = Join-Path $env:ProgramFiles 'Page2Cam\page2cam.exe'
+if (-not (Test-Path $exe)) { throw "The installer finished but $exe is missing. Run this again." }
+
+# --- Camera -----------------------------------------------------------------
+# The installer registers the camera component (regsvr32); the camera named
+# Page2Cam then appears while Page2Cam's tray runs.
+$clsidKey = 'HKLM:\SOFTWARE\Classes\CLSID\{7C2F9A41-3B6E-4D8A-9C1F-5E2B8D4A6F10}\InProcServer32'
+if (-not (Test-Path $clsidKey)) {
+    throw 'The Page2Cam camera was not registered. Restart the PC and run this again.'
+}
+$camera = $null
+if (-not $NoLaunch) {
+    for ($i = 0; $i -lt 20 -and -not $camera; $i++) {
+        Start-Sleep -Seconds 1
+        $camera = Get-PnpDevice -Class Camera -PresentOnly -ErrorAction SilentlyContinue |
+            Where-Object FriendlyName -eq 'Page2Cam' | Select-Object -First 1
+    }
+}
+if ($camera) {
+    Say 'Camera: Page2Cam is ready (choose it in Teams, Zoom or Meet).'
+} elseif ($NoLaunch) {
+    Say 'Camera: registered; the camera Page2Cam appears once Page2Cam is started.'
+} else {
+    Say 'Camera: registered, but not shown yet. It appears while Page2Cam runs in the tray; if it is missing, open Page2Cam from the Start menu.'
+}
 Say "Installed: $exe"
 if ($NoLaunch) {
     Say 'Start it from the Start menu (Page2Cam) when you want it.'

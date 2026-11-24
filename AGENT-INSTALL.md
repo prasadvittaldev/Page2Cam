@@ -6,8 +6,9 @@ Users can start you with: *"Install Page2Cam for me: follow https://raw.githubus
 
 ## Ground rules
 
-- Run commands in **PowerShell** on the user's PC. Windows will ask the user **once** for administrator permission (the installer sets up the Page2Cam camera): tell them to click **Yes**.
-- Don't change anything else on the PC: no drivers, no power plans, no other apps' settings. Suggest those to the user instead.
+- Run commands in **PowerShell** on the user's PC. Windows will ask the user **once** for administrator permission: tell them to click **Yes**.
+- **The Page2Cam camera is part of Page2Cam, not an extra driver.** The installer in Step 4 sets it up by itself (it registers Page2Cam's camera component with Windows). That is required and expected, so do run it. Don't install or download any other camera software or driver.
+- Apart from that, don't change anything else on the PC: no other drivers, no power plans, no other apps' settings. Suggest those to the user instead.
 - Don't install or tune while the user is in a call or live stream: some steps restart Page2Cam. Ask first if unsure.
 - Don't stop or kill a running Page2Cam without asking.
 
@@ -82,7 +83,22 @@ Only these keys are valid for this step: `width`, `height` (even numbers), `fps`
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/prasadvittaldev/Page2Cam/main/scripts/install-windows.ps1))) -AllowAgents"
 ```
 
-It downloads the latest release from GitHub, checks its SHA-256 checksum, installs it silently (the one permission prompt), turns on **Allow agents** and leaves Page2Cam waiting in the tray, **stopped**. It ends with `Installed: C:\Program Files\Page2Cam\page2cam.exe`.
+It downloads the latest release from GitHub, checks its SHA-256 checksum, installs it silently (the one permission prompt) **including the Page2Cam camera**, checks that the camera is registered, turns on **Allow agents** and leaves Page2Cam waiting in the tray, **stopped**. It ends with `Installed: C:\Program Files\Page2Cam\page2cam.exe`, after a `Camera: ...` line.
+
+Then check the camera (read only):
+
+```powershell
+$clsid = '{7C2F9A41-3B6E-4D8A-9C1F-5E2B8D4A6F10}'
+[pscustomobject]@{
+  Installed   = Test-Path "$env:ProgramFiles\Page2Cam\page2cam.exe"
+  Registered  = Test-Path "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InProcServer32"
+  TrayRunning = [bool](Get-Process page2cam -ErrorAction SilentlyContinue)
+  CameraShown = [bool](Get-PnpDevice -Class Camera -PresentOnly -ErrorAction SilentlyContinue | Where-Object FriendlyName -eq 'Page2Cam')
+} | Format-List
+```
+
+- `Installed` and `Registered` must be `True`. If not, the install did not finish: run the Step 4 command again (and make sure the user clicked **Yes**). If `Registered` stays `False`, ask the user to restart the PC and run it once more.
+- The camera named **Page2Cam** exists only while Page2Cam's tray is running, so `CameraShown` turns `True` a few seconds after the tray starts. If `TrayRunning` is `False`, ask the user to open Page2Cam from the Start menu, then check again.
 
 If it fails, report the message as it is. Common causes: the permission prompt was declined (run it again), no internet, or not Windows 11.
 
