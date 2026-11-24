@@ -225,8 +225,27 @@ pub fn catalogue() -> String {
     s
 }
 
+/// `v` with object keys in sorted order, whatever serde_json's
+/// `preserve_order` feature (another crate in the build may turn it on), so
+/// generated texts are the same in every build.
+fn sorted(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            Value::Object(
+                keys.into_iter()
+                    .map(|k| (k.clone(), sorted(&m[k])))
+                    .collect(),
+            )
+        }
+        Value::Array(a) => Value::Array(a.iter().map(sorted).collect()),
+        x => x.clone(),
+    }
+}
+
 fn compact(v: &Value) -> String {
-    serde_json::to_string(v).unwrap_or_default()
+    serde_json::to_string(&sorted(v)).unwrap_or_default()
 }
 
 /// One template's reference: parameters, an example call, a live change.
