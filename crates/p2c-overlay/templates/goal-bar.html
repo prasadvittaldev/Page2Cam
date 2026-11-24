@@ -1,0 +1,36 @@
+<style>
+  .gb{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:8vh 6vh;border-radius:8vh}
+  .gb .hd{display:flex;align-items:baseline;gap:4vh;min-width:0;flex:none}
+  .gb h1{margin:0;flex:1;min-width:0;font-size:19vh;font-weight:700}
+  .gb .of{flex:none;max-width:55%;font-size:15vh;color:var(--muted);font-variant-numeric:tabular-nums}
+  .gb .track{position:relative;margin-top:5vh;height:34vh;border-radius:17vh;background:var(--line);overflow:hidden;flex:none}
+  .gb .fill{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:17vh;background:var(--accent);
+            background-image:linear-gradient(180deg,rgba(255,255,255,.22),rgba(255,255,255,0) 60%)}
+  .theme-minimal .gb .fill{background-color:rgba(255,255,255,.5)}
+  .gb .amt{position:absolute;left:4vh;top:0;bottom:0;display:flex;align-items:center;font-size:20vh;font-weight:800;font-variant-numeric:tabular-nums;color:#fff;text-shadow:0 .06em .25em rgba(0,0,0,.6)}
+</style>
+<div class="gb p2c-panel">
+  <div class="hd"><h1 class="p2c-ellipsis" id="h"></h1><div class="of p2c-ellipsis" id="of"></div></div>
+  <div class="track"><div class="fill" id="fill"></div><div class="amt" id="amt"></div></div>
+</div>
+<script>
+var shown = NaN;
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#h"), p.title);
+  var cur = P2C.num(p.current);
+  if (!isFinite(cur) || cur < 0) cur = 0;
+  var goal = P2C.num(p.goal);
+  if (!isFinite(goal)) goal = 0;
+  var pre = p.prefix || "", unit = p.unit || "";
+  var fill = P2C.$("#fill"), amt = P2C.$("#amt"), of = P2C.$("#of");
+  var from = isFinite(shown) ? shown : 0;
+  P2C.tween("goal", from, cur, 1200, function (v) {
+    shown = v;
+    var frac = goal > 0 ? Math.max(0, Math.min(1, v / goal)) : 0;
+    fill.style.width = (frac * 100).toFixed(2) + "%";
+    P2C.text(amt, pre + P2C.fmtNum(Math.round(v)) + unit);
+    var pct = goal > 0 ? Math.floor((v / goal) * 100) : 0;
+    P2C.text(of, goal > 0 ? pct + "% of " + pre + P2C.fmtNum(goal) + unit : "");
+  });
+});
+</script>

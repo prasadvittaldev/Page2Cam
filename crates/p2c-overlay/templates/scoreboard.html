@@ -1,0 +1,58 @@
+<style>
+  .sb{position:absolute;inset:0;display:flex;align-items:stretch;border-radius:14vh;overflow:hidden}
+  .sb .stripe{flex:none;width:6vh;background:var(--accent)}
+  .sb .stripe.away{background:var(--muted)}
+  .sb .nm{flex:1;min-width:0;display:flex;align-items:center;padding:0 5vh;font-size:36vh;font-weight:800;text-transform:uppercase;letter-spacing:.04em}
+  .sb .nm.away{justify-content:flex-end;text-align:right}
+  .sb .nm span{min-width:0;max-width:100%}
+  .sb .sc{flex:none;min-width:1.5em;padding:0 .25em;display:flex;align-items:center;justify-content:center;font-size:58vh;font-weight:800;font-variant-numeric:tabular-nums;
+          background:var(--bg2);color:var(--fg2);text-shadow:none}
+  .sb .sc.away{border-left:1px solid var(--line)}
+  .theme-minimal .sb .sc{text-shadow:var(--shadow)}
+  .sb .sc.bump{animation:bump 1.2s ease-out}
+  .sb{--glow:rgba(255,255,255,.75)}
+  .theme-news .sb{--glow:var(--accent)}
+  @keyframes bump{0%{box-shadow:inset 0 0 0 0 transparent}25%{box-shadow:inset 0 0 0 .1em var(--glow)}100%{box-shadow:inset 0 0 0 0 transparent}}
+  .sb .info{flex:none;min-width:22%;max-width:34%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 5vh;background:var(--bg);border-left:1px solid var(--line)}
+  .theme-minimal .sb .info{background:transparent}
+  .sb .pe{font-size:24vh;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;max-width:100%;line-height:1.15}
+  .sb .ck{font-size:34vh;font-weight:800;font-variant-numeric:tabular-nums;max-width:100%;line-height:1.1}
+  .sb .info.solo .pe{font-size:34vh;color:var(--fg)}
+</style>
+<div class="sb p2c-panel">
+  <div class="stripe" id="hs"></div><div class="nm"><span class="p2c-ellipsis" id="hn"></span></div><div class="sc" id="hsc"></div>
+  <div class="sc away" id="asc"></div><div class="nm away"><span class="p2c-ellipsis" id="an"></span></div><div class="stripe away" id="as"></div>
+  <div class="info" id="info"><div class="pe p2c-ellipsis" id="pe"></div><div class="ck p2c-ellipsis" id="ck"></div></div>
+</div>
+<script>
+var shown = { h: NaN, a: NaN };
+function score(key, el, v) {
+  var n = P2C.num(v);
+  if (!isFinite(n)) n = 0;
+  n = Math.round(n);
+  var prev = shown[key];
+  if (isFinite(prev) && Math.round(prev) !== n) {
+    el.classList.remove("bump");
+    void el.offsetWidth;
+    el.classList.add("bump");
+  }
+  P2C.tween("score-" + key, isFinite(prev) ? prev : n, n, 600, function (x) {
+    shown[key] = x;
+    P2C.text(el, Math.round(x));
+  });
+}
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#hn"), p.home_name);
+  P2C.text(P2C.$("#an"), p.away_name);
+  P2C.$("#hs").style.background = p.home_colour || "";
+  P2C.$("#as").style.background = p.away_colour || "";
+  score("h", P2C.$("#hsc"), p.home_score);
+  score("a", P2C.$("#asc"), p.away_score);
+  P2C.text(P2C.$("#pe"), p.period);
+  P2C.show(P2C.$("#pe"), !!p.period);
+  P2C.text(P2C.$("#ck"), p.clock);
+  P2C.show(P2C.$("#ck"), !!p.clock);
+  P2C.show(P2C.$("#info"), !!(p.period || p.clock));
+  P2C.$("#info").classList.toggle("solo", !p.clock);
+});
+</script>

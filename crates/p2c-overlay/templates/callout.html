@@ -1,0 +1,57 @@
+<style>
+  .co{position:absolute;inset:0;display:flex;align-items:center;justify-content:flex-start;gap:3vmin}
+  .co.h{padding:6vh 22vh}
+  .co.v{padding:17vw 6vw}
+  .co.right{flex-direction:row-reverse}
+  .co.up{flex-direction:column}
+  .co.down{flex-direction:column-reverse}
+  .co .arr{position:relative;flex:none}
+  .co.h .arr{width:32%;height:60%}
+  .co.v .arr{width:60%;height:30%}
+  .co .arr svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
+  .co .shaft{fill:none;stroke:var(--accent);stroke-linecap:round}
+  .co .head{fill:var(--accent)}
+  .theme-minimal .co .shaft{stroke:#fff}
+  .theme-minimal .co .head{fill:#fff}
+  .theme-minimal .co .arr svg{filter:drop-shadow(0 .3vmin .8vmin rgba(0,0,0,.7))}
+  .co .lbl{min-width:0;max-width:100%;padding:.3em .75em;border-radius:.45em;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border:.12em solid var(--accent)}
+  .theme-minimal .co .lbl{border-color:rgba(255,255,255,.6)}
+  .co.h .lbl{font-size:24vh;flex:0 1 auto}
+  .co.v .lbl{font-size:9vw;text-align:center}
+  .co .tip{position:absolute}
+  .co.h .tip{width:40vh;height:40vh;margin:-20vh 0 0 -20vh}
+  .co.v .tip{width:30vw;height:30vw;margin:-15vw 0 0 -15vw}
+  .co .tip .dot{position:absolute;inset:32%;border-radius:50%;background:var(--accent)}
+  .co .tip .ring{position:absolute;inset:0;border-radius:50%;border:3vh solid var(--accent);animation:coPulse 2.8s ease-out infinite}
+  .co.v .tip .ring{border-width:2.2vw}
+  .theme-minimal .co .tip .dot{background:#fff}
+  .theme-minimal .co .tip .ring{border-color:#fff}
+  @keyframes coPulse{0%{transform:scale(.5);opacity:.75}100%{transform:scale(1.5);opacity:0}}
+</style>
+<div class="co" id="co"><div class="arr" id="arr"><svg id="svg"></svg><div class="tip" id="tip"><div class="ring" id="ring"></div><div class="dot"></div></div></div><div class="lbl p2c-panel" id="lbl"></div></div>
+<script>
+P2C.onParams(function (p) {
+  var dir = { left: 1, right: 1, up: 1, down: 1 }[p.direction] ? p.direction : "left";
+  var horiz = dir === "left" || dir === "right";
+  var co = P2C.$("#co");
+  co.className = "co " + dir + (horiz ? " h" : " v");
+  P2C.text(P2C.$("#lbl"), p.label);
+  P2C.show(P2C.$("#ring"), !!p.pulse);
+  // The arrow in (along, across) units, tip at along = 100; mapped per direction.
+  function pt(u, v) {
+    if (dir === "right") return [u, v];
+    if (dir === "left") return [100 - u, v];
+    if (dir === "down") return [v, u];
+    return [v, 100 - u];
+  }
+  function xy(u, v) { var q = pt(u, v); return q[0] + "," + q[1]; }
+  var svg = P2C.clear(P2C.$("#svg"));
+  svg.setAttribute("viewBox", horiz ? "0 0 100 36" : "0 0 36 100");
+  svg.setAttribute("preserveAspectRatio", { left: "xMinYMid meet", right: "xMaxYMid meet", up: "xMidYMin meet", down: "xMidYMax meet" }[dir]);
+  P2C.svg("path", { d: "M" + xy(4, 18) + " L" + xy(76, 18), "class": "shaft", "stroke-width": 7 }, svg);
+  P2C.svg("path", { d: "M" + xy(100, 18) + " L" + xy(68, 4) + " L" + xy(68, 32) + " Z", "class": "head" }, svg);
+  var tip = P2C.$("#tip");
+  tip.style.left = dir === "left" ? "0" : dir === "right" ? "100%" : "50%";
+  tip.style.top = dir === "up" ? "0" : dir === "down" ? "100%" : "50%";
+});
+</script>

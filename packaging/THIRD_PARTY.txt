@@ -28,6 +28,10 @@ Chromium Embedded Framework (libcef.dll and related files)
 FFmpeg (ffmpeg.exe, build by BtbN/FFmpeg-Builds)
   GPL. https://ffmpeg.org
 
+qrcode (Rust crate, QR codes for overlay templates)
+  Copyright kennytm and contributors. MIT License or Apache License 2.0.
+  https://github.com/kennytm/qrcode-rust
+
 Virtual camera driver (p2c_vcam_win_source.dll), based on VCamSample:
 
   MIT License

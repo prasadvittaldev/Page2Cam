@@ -115,11 +115,13 @@ pub const SCENE_JS: &str = r#""use strict";
       box.appendChild(t);
     } else if (l.kind === "ticker") {
       buildTicker(e, l, box);
-    } else if (l.kind === "html") {
+    } else if (l.kind === "html" || l.kind === "template") {
       var f = el("iframe", "fill");
       f.setAttribute("sandbox", "allow-scripts");
       f.setAttribute("scrolling", "no");
       f.src = "layer/" + encodeURIComponent(l.id) + "?v=" + l.v;
+      // Params that changed while the frame loaded reach it now.
+      if (l.kind === "template") f.addEventListener("load", function () { post(e); });
       box.appendChild(f);
     } else if (l.kind === "image") {
       var i = el("img", "fill"); i.alt = ""; i.src = "asset/" + encodeURIComponent(l.asset);
@@ -139,6 +141,15 @@ pub const SCENE_JS: &str = r#""use strict";
       y.setAttribute("allow", "autoplay; encrypted-media");
       y.setAttribute("referrerpolicy", "strict-origin-when-cross-origin");
       box.appendChild(y);
+    }
+  }
+
+  // A template frame gets new params as a message (no reload: timers and
+  // animations keep running). Its origin is opaque, hence "*".
+  function post(e) {
+    var f = e.el.querySelector("iframe");
+    if (f && f.contentWindow && e.layer && e.layer.params) {
+      f.contentWindow.postMessage({ p2c: "params", params: e.layer.params }, "*");
     }
   }
 
@@ -187,8 +198,11 @@ pub const SCENE_JS: &str = r#""use strict";
         e = els[l.id] = { el: el("div", "layer"), v: null, layer: l, hideTimer: 0, raf: 0, shown: false };
         document.body.appendChild(e.el);
       }
-      if (e.v !== l.v) { build(e, l); e.v = l.v; }
+      var rebuild = e.v !== l.v, repost = !rebuild && l.kind === "template" && e.pv !== l.pv;
       e.layer = l;
+      if (rebuild) { build(e, l); e.v = l.v; }
+      if (rebuild || repost) e.pv = l.pv;
+      if (repost) post(e);
       place(e, l);
       if (l.visible) show(e, l); else hide(e, l, false);
     });
@@ -218,6 +232,45 @@ pub fn layer_page(fragment: &str) -> String {
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <style>html,body{{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:transparent}}</style>\
          </head><body>{fragment}</body></html>"
+    )
+}
+
+/// The document a template layer runs in (inside the same sandboxed frame
+/// as `html` layers): the `P2C` runtime, the parameters as inert JSON data
+/// (`<` escaped, so no value can end the script element), then the
+/// template's HTML.
+pub fn template_page(
+    t: &crate::template::Template,
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let json = serde_json::Value::Object(params.clone())
+        .to_string()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <style>html,body{{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:transparent}}</style>\
+         <script type=\"application/json\" id=\"p2c-params\">{json}</script>\
+         <script>{runtime}</script></head><body>{html}</body></html>",
+        runtime = crate::template::RUNTIME_JS,
+        html = t.html,
+    )
+}
+
+/// What a template layer shows when its template was deleted.
+pub fn missing_page(template: &str) -> String {
+    let safe: String = template
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><style>\
+         html,body{{margin:0;width:100%;height:100%;overflow:hidden;background:transparent}}\
+         div{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;\
+         border:2px dashed rgba(255,255,255,.6);background:rgba(0,0,0,.45);color:#fff;\
+         font:600 14px 'Segoe UI',Arial,sans-serif;text-align:center}}</style></head>\
+         <body><div>Template \u{201c}{safe}\u{201d} is missing</div></body></html>"
     )
 }
 
@@ -253,6 +306,18 @@ mod tests {
         let p = layer_page("<b>x</b>");
         assert!(p.contains("<body><b>x</b></body>"));
         assert!(p.contains("background:transparent"));
+    }
+
+    #[test]
+    fn template_frames_get_params_by_message() {
+        assert!(SCENE_JS.contains(r#"l.kind === "html" || l.kind === "template""#));
+        assert!(SCENE_JS.contains(r#"postMessage({ p2c: "params", params: e.layer.params }, "*")"#));
+        assert!(SCENE_JS.contains(r#"f.addEventListener("load""#));
+        let t = crate::builtin("lower-third").unwrap();
+        let p = template_page(t, &t.effective(&serde_json::Map::new()));
+        assert!(p.contains(r#"<script type="application/json" id="p2c-params">"#));
+        assert!(p.find("p2c-params").unwrap() < p.find("window.P2C").unwrap());
+        assert!(missing_page("a\"<b>").contains("ab"));
     }
 
     #[test]

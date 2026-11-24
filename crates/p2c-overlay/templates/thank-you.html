@@ -1,0 +1,71 @@
+<style>
+  .card{position:absolute;inset:0;overflow:hidden;background:var(--bg);
+    background-image:radial-gradient(circle at 15% 20%,rgba(255,255,255,.08),transparent 45%),radial-gradient(circle at 90% 85%,rgba(0,0,0,.25),transparent 50%)}
+  .theme-minimal .card{background-color:rgba(0,0,0,.72)}
+  .card .in{position:absolute;left:8vw;right:8vw;top:8vh;bottom:8vh;display:flex;align-items:center;gap:6vw}
+  .card .main{flex:1;min-width:0;display:flex;flex-direction:column;align-items:flex-start}
+  .card.noqr .main{align-items:center;text-align:center}
+  .card h1{margin:0;max-width:100%;font-size:13vh;font-weight:800;letter-spacing:-.01em;line-height:1.1}
+  .card .rule{width:12vh;height:1vh;border-radius:.5vh;background:var(--accent);margin:3.5vh 0}
+  .card .sub{max-width:100%;font-size:4.5vh;color:var(--muted)}
+  .card .hs{display:flex;flex-wrap:wrap;gap:2vh 3vw;margin-top:5vh;max-width:100%}
+  .card.noqr .hs{justify-content:center}
+  .card .h{display:flex;align-items:center;min-width:0;max-width:100%;font-size:4vh;font-weight:600}
+  .card .chip{flex:none;min-width:2.6em;margin-right:.5em;padding:.12em .35em;border-radius:.25em;text-align:center;font-size:.72em;font-weight:800;letter-spacing:.04em;color:#fff;background:var(--accent);text-shadow:none;box-shadow:inset 0 0 0 .08em rgba(255,255,255,.3)}
+  .theme-minimal .card .chip.plain{color:#000}
+  .card .qr{flex:none;display:flex;flex-direction:column;align-items:center;width:38vh}
+  .card .qr svg{width:38vh;height:38vh;border-radius:2vh}
+  .card .cap{margin-top:2vh;max-width:100%;font-size:3.4vh;color:var(--muted)}
+</style>
+<div class="card" id="card">
+  <div class="in">
+    <div class="main"><h1 id="h"></h1><div class="rule"></div><div class="sub" id="sub"></div><div class="hs" id="hs"></div></div>
+    <div class="qr" id="qr"><svg id="code"></svg><div class="cap p2c-ellipsis" id="cap"></div></div>
+  </div>
+</div>
+<script>
+var PLAT = {
+  youtube: ["YT", "#ff0033"], x: ["X", "#000000"], instagram: ["IG", "#d62976"], linkedin: ["in", "#0a66c2"],
+  github: ["GH", "#24292f"], tiktok: ["TT", "#000000"], twitch: ["TW", "#9146ff"], facebook: ["FB", "#1877f2"],
+  bluesky: ["BSKY", "#0085ff"], mastodon: ["MA", "#6364ff"], discord: ["DC", "#5865f2"], threads: ["TH", "#000000"],
+  web: ["WEB", ""], website: ["WEB", ""], site: ["WEB", ""], email: ["MAIL", ""], mail: ["MAIL", ""]
+};
+function platform(name) {
+  var s = String(name === undefined || name === null ? "" : name).trim();
+  if (!s) return null;
+  var k = s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (k.indexOf("twitter") === 0) k = "x";
+  if (PLAT[k]) return PLAT[k];
+  return [s.slice(0, 4).toUpperCase(), ""];
+}
+P2C.onParams(function (p) {
+  var card = P2C.$("#card");
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.show(P2C.$("#h"), !!p.title);
+  P2C.text(P2C.$("#sub"), p.subtitle);
+  P2C.show(P2C.$("#sub"), !!p.subtitle);
+  card.style.backgroundColor = p.background || "";
+
+  var hs = P2C.$("#hs");
+  P2C.clear(hs);
+  var rows = (Array.isArray(p.handles) ? p.handles : []).filter(function (r) {
+    return Array.isArray(r) && (r[0] || r[1]);
+  });
+  rows.forEach(function (r) {
+    var item = P2C.el("div", "h", null, hs);
+    var pl = platform(r[0]);
+    if (pl) {
+      var chip = P2C.el("span", "chip" + (pl[1] ? "" : " plain"), pl[0], item);
+      if (pl[1]) chip.style.background = pl[1];
+    }
+    P2C.el("span", "p2c-ellipsis", r[1] === undefined || r[1] === null ? "" : r[1], item);
+  });
+  P2C.show(hs, rows.length > 0);
+
+  var hasQr = P2C.qr(P2C.$("#code"), p.link);
+  P2C.show(P2C.$("#qr"), hasQr);
+  card.classList.toggle("noqr", !hasQr);
+  P2C.text(P2C.$("#cap"), p.link_caption);
+  P2C.show(P2C.$("#cap"), hasQr && !!p.link_caption);
+});
+</script>

@@ -129,6 +129,25 @@ impl Assets {
         self.store(id, &bytes, want)
     }
 
+    /// A copy of stored file `name` owned by `owner` (a name prefix of
+    /// `[a-z0-9-]`); the copy's name.
+    pub fn copy(&self, name: &str, owner: &str) -> Result<String> {
+        ensure!(is_asset_name(name), "not a stored file name: {name:?}");
+        let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("bin");
+        let src = self.dir.join(name);
+        ensure!(src.is_file(), "the stored file {name} is gone");
+        let new = format!("{owner}-{}.{ext}", random_suffix());
+        ensure!(is_asset_name(&new), "bad owner name {owner:?}");
+        std::fs::copy(&src, self.dir.join(&new))
+            .with_context(|| format!("copying {}", src.display()))?;
+        Ok(new)
+    }
+
+    /// The path of a stored file (for re-adding it as a layer's media).
+    pub fn path_of(&self, name: &str) -> Option<PathBuf> {
+        is_asset_name(name).then(|| self.dir.join(name))
+    }
+
     /// A stored file and its content type (`None` for unknown names).
     pub fn read(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
         if !is_asset_name(name) {

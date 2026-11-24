@@ -1,0 +1,77 @@
+<style>
+  .pc{position:absolute;inset:0;display:flex;flex-direction:column;border-radius:2.5vh;overflow:hidden;border-bottom:1vh solid var(--accent)}
+  .theme-minimal .pc{border-bottom-color:transparent}
+  .pc .pic{position:relative;flex:1 1 auto;min-height:0;background:linear-gradient(160deg,#f6f8fb,#dde3ea)}
+  .pc .pic img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+  .badge{display:inline-block;background:var(--accent);color:#fff;font-weight:800;font-size:3.6vh;padding:.25em .6em;border-radius:.4em;text-shadow:none;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+  .pc .pic .badge{position:absolute;left:2.5vh;top:2.5vh;max-width:80%}
+  .theme-minimal .badge{background:#fff;color:#111}
+  .pc .body{flex:none;padding:2.5vh 3vh 2.5vh;display:flex;flex-direction:column;gap:1.3vh;min-width:0}
+  .pc .nm{font-size:4.2vh;font-weight:700;line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .pc .prices{display:flex;align-items:baseline;gap:2vh;min-width:0}
+  .pc .price{font-size:7vh;font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .pc .old{font-size:3.6vh;color:var(--muted);text-decoration:line-through;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .pc .offer{display:flex;align-items:center;gap:1vh;font-size:3vh;font-weight:600;font-variant-numeric:tabular-nums}
+  .pc .offer::before{content:"";flex:none;width:1.3vh;height:1.3vh;border-radius:50%;background:var(--accent)}
+  .pc .stock{display:flex;flex-direction:column;gap:.8vh}
+  .pc .st{font-size:2.8vh;color:var(--muted);font-weight:600}
+  .pc .st.low{color:#ffb347}
+  .pc .track{height:1.1vh;border-radius:1vh;background:var(--line);overflow:hidden}
+  .pc .bar{height:100%;width:0;border-radius:1vh;background:var(--accent);transition:width .9s ease}
+  .pc .bar.low{background:#ff8a3d}
+  .pc .cta{margin-top:.5vh;text-align:center;font-size:3vh;font-weight:700;padding:.55em .8em;border-radius:.5em;background:var(--bg2);color:var(--fg2)}
+  .theme-minimal .pc .cta{background:rgba(255,255,255,.16);color:#fff}
+</style>
+<div class="pc p2c-panel">
+  <div class="pic" id="pic"><img id="img" alt=""><div class="badge" id="badge"></div></div>
+  <div class="body">
+    <div><span class="badge" id="badge2"></span></div>
+    <div class="nm" id="nm"></div>
+    <div class="prices"><span class="price" id="price"></span><span class="old" id="old"></span></div>
+    <div class="offer" id="offer"><span class="p2c-ellipsis" id="ot"></span></div>
+    <div class="stock" id="stock"><div class="st p2c-ellipsis" id="st"></div><div class="track"><div class="bar" id="bar"></div></div></div>
+    <div class="cta p2c-ellipsis" id="cta"></div>
+  </div>
+</div>
+<script>
+var end = NaN, key = "";
+P2C.onParams(function (p) {
+  var hasPic = P2C.img(P2C.$("#img"), p.picture);
+  P2C.show(P2C.$("#pic"), hasPic);
+  P2C.text(P2C.$("#badge"), p.badge);
+  P2C.text(P2C.$("#badge2"), p.badge);
+  P2C.show(P2C.$("#badge"), !!p.badge && hasPic);
+  P2C.show(P2C.$("#badge2").parentNode, !!p.badge && !hasPic);
+  P2C.text(P2C.$("#nm"), p.name);
+  P2C.text(P2C.$("#price"), p.price);
+  P2C.text(P2C.$("#old"), p.old_price);
+  P2C.show(P2C.$("#old"), !!p.old_price);
+  P2C.text(P2C.$("#cta"), p.cta);
+  P2C.show(P2C.$("#cta"), !!p.cta);
+
+  var total = Number(p.stock_total) || 0, left = Math.max(0, Math.round(Number(p.stock_left) || 0));
+  P2C.show(P2C.$("#stock"), total > 0);
+  if (total > 0) {
+    var low = left <= Math.max(10, total * 0.25);
+    var st = P2C.$("#st"), bar = P2C.$("#bar");
+    P2C.text(st, left <= 0 ? "Sold out" : low ? "Only " + P2C.fmtNum(left) + " left" : P2C.fmtNum(left) + " left");
+    st.classList.toggle("low", low);
+    bar.classList.toggle("low", low);
+    bar.style.width = (Math.max(0, Math.min(1, left / total)) * 100).toFixed(1) + "%";
+  }
+
+  var k = p.offer_until + "|" + p.offer_duration;
+  if (k !== key) {
+    key = k;
+    var at = P2C.when(p.offer_until);
+    end = isFinite(at) ? at : (p.offer_duration > 0 ? Date.now() + p.offer_duration * 1000 : NaN);
+  }
+  P2C.show(P2C.$("#offer"), isFinite(end));
+  if (!isFinite(end)) { P2C.stop("tick"); return; }
+  P2C.every("tick", 250, function () {
+    var s = Math.ceil((end - Date.now()) / 1000);
+    var label = P2C.params.offer_text || "";
+    P2C.text(P2C.$("#ot"), s > 0 ? (label ? label + " " : "") + P2C.fmtTime(s) : "Offer ended");
+  });
+});
+</script>

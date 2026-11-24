@@ -40,6 +40,8 @@ pub enum Cmd {
         gen: u64,
         result: Result<Health, String>,
     },
+    /// "Check for updates" finished: the newer version, or the error.
+    UpdateChecked(Result<Option<String>, String>),
     /// A message from a worker thread (shown as a balloon).
     Notify(String),
     /// Windows is ending the session: stop the engine gracefully (short
@@ -222,6 +224,8 @@ struct Controller {
     next_sys: Instant,
     updater: Arc<Updater>,
     offered: Option<String>,
+    /// "Check for updates" is running.
+    checking: bool,
     autostart: bool,
     exe: PathBuf,
     tx: Sender<Cmd>,
@@ -281,6 +285,7 @@ pub fn run(rx: Receiver<Cmd>, tx: Sender<Cmd>, ui: Arc<Ui>) {
         next_sys: Instant::now(),
         updater: super::update::start(),
         offered: None,
+        checking: false,
         autostart: super::autostart::enabled(&exe),
         exe,
         tx,
@@ -391,6 +396,7 @@ impl Controller {
                 }
             }
             Cmd::Poll { gen, result } => self.poll_result(gen, result, now),
+            Cmd::UpdateChecked(result) => self.update_checked(result),
             Cmd::Notify(text) => self.ui.balloon(text, true),
             Cmd::AgentBalloon(text) => self.ui.balloon(text, false),
             Cmd::EndSession(done) => {
@@ -419,6 +425,7 @@ impl Controller {
             MenuId::ForceRestart => self.feed(Event::ForceRestartClicked, now),
             MenuId::OpenPage => self.open_page(),
             MenuId::Update => self.update(),
+            MenuId::CheckUpdates => self.check_updates(),
             MenuId::Autostart => {
                 let on = !super::autostart::enabled(&self.exe);
                 match super::autostart::set_enabled(&self.exe, on) {
@@ -660,6 +667,45 @@ impl Controller {
         open_url(&url);
     }
 
+    /// "Check for updates": ask GitHub now, on a worker thread.
+    fn check_updates(&mut self) {
+        if self.checking {
+            return;
+        }
+        self.checking = true;
+        let updater = self.updater.clone();
+        let tx = self.tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("p2c-tray-check".into())
+            .spawn(move || {
+                let r = updater.check_now().map_err(|e| format!("{e:#}"));
+                let _ = tx.send(Cmd::UpdateChecked(r));
+            });
+        if spawned.is_err() {
+            self.checking = false;
+        }
+    }
+
+    fn update_checked(&mut self, result: Result<Option<String>, String>) {
+        self.checking = false;
+        match result {
+            // The menu now offers "Update now"; refresh_ui shows the balloon.
+            Ok(Some(v)) => tracing::info!(version = %v, "update check: newer version found"),
+            Ok(None) => {
+                tracing::info!("update check: up to date");
+                self.ui.balloon(
+                    format!("Page2Cam {} is up to date.", self.updater.current()),
+                    false,
+                );
+            }
+            Err(e) => {
+                tracing::warn!("update check failed: {e}");
+                self.ui
+                    .balloon(format!("Couldn't check for updates: {e}"), true);
+            }
+        }
+    }
+
     fn update(&mut self) {
         let info = self.updater.info();
         if info.state != "available" {
@@ -733,19 +779,24 @@ impl Controller {
         if offer.as_ref().map(|o| &o.version) != self.offered.as_ref() {
             self.offered = offer.as_ref().map(|o| o.version.clone());
             if let Some(o) = &offer {
-                self.ui.balloon(
-                    format!(
-                        "Page2Cam {} is available. Install it from the tray menu.",
-                        o.version
-                    ),
-                    false,
-                );
+                let how = if o.can_install {
+                    "Choose \"Update now\" in the tray menu."
+                } else {
+                    "Download it from the tray menu."
+                };
+                self.ui
+                    .balloon(format!("Page2Cam {} is available. {how}", o.version), false);
             }
         }
+        let update_menu = crate::menu::UpdateMenu {
+            current: self.updater.current().to_string(),
+            offer,
+            checking: self.checking,
+        };
         let entries = if self.quitting.is_some() {
             crate::menu::quitting(&menu_tip)
         } else {
-            crate::menu::entries(&state, &menu_tip, offer.as_ref(), self.autostart, agents_on)
+            crate::menu::entries(&state, &menu_tip, &update_menu, self.autostart, agents_on)
         };
         let badge = agent_active.is_some();
         let mut s = self.ui.state.lock();

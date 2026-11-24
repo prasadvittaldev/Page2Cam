@@ -1,0 +1,22 @@
+{
+  "name": "Release notes",
+  "category": "software",
+  "description": "\"What's new\" panel for a version: date and three optional lists (new, improved, fixed) under coloured labels.",
+  "rect": [0.58, 0.08, 0.37, 0.72],
+  "params": [
+    {"name": "version", "type": "text", "required": true, "help": "Version, e.g. v2.4.0"},
+    {"name": "title", "type": "text", "default": "What's new", "help": "Small heading above the version"},
+    {"name": "date", "type": "text", "default": "", "help": "Release date as shown, e.g. 24 Nov 2026 (empty: none)"},
+    {"name": "new", "type": "list", "default": [], "max_items": 8, "help": "New features, one short line each (empty: section hidden)"},
+    {"name": "improved", "type": "list", "default": [], "max_items": 8, "help": "Improvements, one short line each (empty: section hidden)"},
+    {"name": "fixed", "type": "list", "default": [], "max_items": 8, "help": "Fixes, one short line each (empty: section hidden). About 12 lines fit in all"}
+  ],
+  "example": {
+    "version": "v2.4.0",
+    "date": "24 Nov 2026",
+    "new": ["Overlay templates with live parameters", "Scenes: switch several layers at once"],
+    "improved": ["Faster cut-out on laptop GPUs", "Smoother tickers at 30 fps"],
+    "fixed": ["Webcam reconnects after sleep"]
+  },
+  "update": {"fixed": ["Webcam reconnects after sleep", "Stream key no longer asked twice"]}
+}

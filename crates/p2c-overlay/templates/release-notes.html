@@ -1,0 +1,40 @@
+<style>
+  .rn{position:absolute;inset:0;display:flex;flex-direction:column;padding:4vh 4vh 3vh;border-radius:2vh;border-top:1.2vh solid var(--accent)}
+  .theme-minimal .rn{border-top-color:transparent}
+  .rn .kick{flex:none;font-size:3.4vh;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);max-width:100%}
+  .rn .top{flex:none;display:flex;align-items:baseline;gap:2.5vh;min-width:0;margin:.5vh 0 2.5vh;padding-bottom:2vh;border-bottom:.25vh solid var(--line)}
+  .rn .ver{font-size:8vh;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:0 1 auto}
+  .rn .date{font-size:3.4vh;color:var(--muted);white-space:nowrap;flex:none}
+  .rn .secs{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;gap:.8em}
+  .rn .sec{display:flex;flex-direction:column;gap:.35em}
+  .rn .lbl{align-self:flex-start;font-size:.72em;font-weight:800;text-transform:uppercase;letter-spacing:.08em;padding:.2em .7em;border-radius:.4em;color:#fff;text-shadow:none}
+  .rn .lbl.new{background:#238636}.rn .lbl.improved{background:#1f6feb}.rn .lbl.fixed{background:#8957e5}
+  .rn .it{display:flex;gap:.6em;align-items:baseline;min-width:0}
+  .rn .it::before{content:"";flex:none;width:.4em;height:.4em;border-radius:50%;background:var(--muted);transform:translateY(-.15em)}
+  .rn .it span{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+</style>
+<div class="rn p2c-panel"><div class="kick p2c-ellipsis" id="kick"></div><div class="top"><span class="ver" id="ver"></span><span class="date" id="date"></span></div><div class="secs" id="secs"></div></div>
+<script>
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#kick"), p.title);
+  P2C.show(P2C.$("#kick"), !!p.title);
+  P2C.text(P2C.$("#ver"), p.version);
+  P2C.text(P2C.$("#date"), p.date);
+  P2C.show(P2C.$("#date"), !!p.date);
+  var parts = [["new", "New", p["new"]], ["improved", "Improved", p.improved], ["fixed", "Fixed", p.fixed]];
+  var box = P2C.clear(P2C.$("#secs"));
+  var weight = 0;
+  parts.forEach(function (s) {
+    var items = (s[2] || []).filter(function (x) { return String(x).trim(); });
+    if (!items.length) return;
+    weight += 1.9 + items.length * 1.25;
+    var sec = P2C.el("div", "sec", null, box);
+    P2C.el("div", "lbl " + s[0], s[1], sec);
+    items.forEach(function (x) {
+      var it = P2C.el("div", "it", null, sec);
+      P2C.el("span", "", x, it);
+    });
+  });
+  box.style.fontSize = Math.min(4, 62 / Math.max(1, weight)).toFixed(2) + "vh";
+});
+</script>

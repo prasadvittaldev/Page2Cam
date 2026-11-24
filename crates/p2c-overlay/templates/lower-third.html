@@ -1,0 +1,20 @@
+<style>
+  .lt{position:absolute;left:0;top:0;bottom:0;display:flex;align-items:stretch;max-width:100%}
+  .lt img{height:100%;aspect-ratio:1;object-fit:contain;background:var(--bg);padding:1.2vh}
+  .lt .txt{display:flex;flex-direction:column;justify-content:center;min-width:0}
+  .lt .main,.lt .sub{padding:0 3vh;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .lt .main{background:var(--bg);color:var(--fg);font-weight:700;font-size:38vh;border-left:4vh solid var(--accent);line-height:1.3}
+  .lt .sub{background:var(--bg2);color:var(--fg2);font-size:24vh;border-left:4vh solid var(--accent);line-height:1.35}
+  .theme-minimal .lt .main,.theme-minimal .lt .sub{background:transparent;border-left-color:transparent}
+  .lt.one .main{font-size:52vh}
+</style>
+<div class="lt" id="lt"><img id="logo" alt=""><div class="txt"><div class="main" id="main"></div><div class="sub" id="sub"></div></div></div>
+<script>
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#main"), p.title);
+  P2C.text(P2C.$("#sub"), p.subtitle);
+  P2C.show(P2C.$("#sub"), !!p.subtitle);
+  P2C.$("#lt").classList.toggle("one", !p.subtitle);
+  P2C.img(P2C.$("#logo"), p.logo);
+});
+</script>

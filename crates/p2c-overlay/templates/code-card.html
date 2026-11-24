@@ -1,0 +1,23 @@
+<style>
+  .cc{position:absolute;inset:0;display:flex;flex-direction:column;background:#1e2430;border-radius:2vh;overflow:hidden;border:0.3vh solid rgba(255,255,255,.12);text-shadow:none}
+  .cc .bar{display:flex;align-items:center;gap:1.2vh;padding:0 2.5vh;height:7vh;background:#151a23;color:#9aa7b8;font-size:3.8vh}
+  .cc .dot{width:2vh;height:2vh;border-radius:50%}
+  .cc .fn{margin-left:1.5vh}
+  .cc pre{flex:1;margin:0;padding:3vh 3.5vh;font-family:var(--mono);font-size:5vh;line-height:1.45;color:#e6edf3;white-space:pre;overflow:hidden}
+  .cc .caret{display:inline-block;width:.55em;height:1.1em;vertical-align:text-bottom;background:var(--accent)}
+</style>
+<div class="cc"><div class="bar"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="fn p2c-ellipsis" id="fn"></span></div><pre id="pre"></pre></div>
+<script>
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#fn"), p.filename);
+  var pre = P2C.$("#pre");
+  P2C.stop("type");
+  if (!p.typing) { P2C.code(pre, p.code, p.language); return; }
+  var n = 0;
+  P2C.every("type", 45, function () {
+    n = Math.min(p.code.length, n + 1);
+    P2C.code(pre, p.code.slice(0, n), p.language);
+    if (n < p.code.length) P2C.el("span", "caret", null, pre); else P2C.stop("type");
+  });
+});
+</script>

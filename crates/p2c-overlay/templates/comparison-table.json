@@ -1,0 +1,26 @@
+{
+  "name": "Comparison table",
+  "category": "data",
+  "description": "Compares two or three options feature by feature; yes/no cells become check marks and crosses, one column can be highlighted.",
+  "rect": [0.5, 0.1, 0.45, 0.55],
+  "params": [
+    {"name": "title", "type": "text", "default": "", "help": "Heading (empty: none)"},
+    {"name": "headers", "type": "list", "default": [], "max_items": 4, "help": "Header row: first the feature column's heading, then one name per option, e.g. [\"Feature\", \"Free\", \"Pro\"] (empty: no header row)"},
+    {"name": "rows", "type": "table", "columns": ["feature", "a", "b", "c"], "max_items": 10, "required": true, "help": "Up to 10 rows: feature, then a value per option (b and c optional). \"yes\" shows a check mark, \"no\" a cross, anything else as text"},
+    {"name": "highlight", "type": "choice", "default": "none", "options": ["none", "a", "b", "c"], "help": "Option column to highlight (a, b or c), e.g. the recommended plan"}
+  ],
+  "example": {
+    "title": "Plans compared",
+    "headers": ["Feature", "Free", "Pro", "Team"],
+    "rows": [
+      ["Virtual camera", "yes", "yes", "yes"],
+      ["Live streaming", "no", "yes", "yes"],
+      ["Overlay layers", "3", "Unlimited", "Unlimited"],
+      ["Agent control", "no", "yes", "yes"],
+      ["Shared templates", "no", "no", "yes"],
+      ["Price per month", "$0", "$12", "$29"]
+    ],
+    "highlight": "b"
+  },
+  "update": {"highlight": "c", "title": "Best for teams"}
+}

@@ -1,0 +1,21 @@
+{
+  "name": "Terminal",
+  "category": "software",
+  "description": "A terminal window with a prompt, a command and its output; can type the command out and then reveal the output line by line.",
+  "rect": [0.5, 0.08, 0.45, 0.5],
+  "params": [
+    {"name": "command", "type": "text", "required": true, "help": "The command after the prompt"},
+    {"name": "prompt", "type": "text", "default": "$", "help": "Prompt before the command, e.g. $ or ~/app $"},
+    {"name": "output", "type": "longtext", "default": "", "help": "Output lines (about 12 fit; the last lines stay visible). Lines starting with error or warning are coloured"},
+    {"name": "title", "type": "text", "default": "", "help": "Window title, e.g. bash"},
+    {"name": "typing", "type": "bool", "default": false, "help": "Type the command out, then reveal the output line by line (restarts when the command or output changes)"}
+  ],
+  "example": {
+    "prompt": "~/page2cam $",
+    "command": "cargo build --release",
+    "output": "   Compiling p2c-overlay v0.7.0\n   Compiling page2cam v0.7.0\n    Finished `release` profile [optimized] target(s) in 41.2s",
+    "title": "bash",
+    "typing": true
+  },
+  "update": {"command": "cargo test -p p2c-overlay", "output": "running 42 tests\n........................................\ntest result: ok. 42 passed; 0 failed"}
+}

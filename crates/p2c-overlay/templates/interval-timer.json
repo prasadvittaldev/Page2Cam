@@ -1,0 +1,15 @@
+{
+  "name": "Interval timer",
+  "category": "time",
+  "description": "Fitness intervals: WORK and REST phases for a number of rounds, with the round, the time left and a phase colour; shows Done at the end.",
+  "rect": [0.78, 0.05, 0.19, 0.2],
+  "params": [
+    {"name": "work", "type": "duration", "default": 40, "help": "Work time per round (seconds or m:ss)"},
+    {"name": "rest", "type": "duration", "default": 20, "help": "Rest time between rounds (seconds or m:ss; 0: none)"},
+    {"name": "rounds", "type": "number", "min": 1, "max": 99, "default": 8, "help": "Number of rounds"},
+    {"name": "label", "type": "text", "default": "", "help": "Small line at the top, e.g. the workout's name (empty: none)"},
+    {"name": "done_text", "type": "text", "default": "Done", "help": "Shown when all rounds are over"}
+  ],
+  "example": {"work": 40, "rest": 20, "rounds": 8, "label": "HIIT"},
+  "update": {"work": 30, "rounds": 6, "label": "Core"}
+}

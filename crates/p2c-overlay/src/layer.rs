@@ -19,7 +19,9 @@ pub const MAX_NAME: usize = 80;
 pub const MAX_HIDE_AFTER_S: u32 = 3600;
 
 /// Layer kinds.
-pub const KINDS: &[&str] = &["title", "ticker", "html", "image", "video", "youtube"];
+pub const KINDS: &[&str] = &[
+    "title", "ticker", "html", "template", "image", "video", "youtube",
+];
 /// Style presets for titles and tickers.
 pub const PRESETS: &[&str] = &["news", "minimal", "brand"];
 /// Enter/exit animations.
@@ -88,6 +90,16 @@ pub enum Content {
     },
     /// Any HTML/CSS/JS fragment, run in a sandboxed frame.
     Html { html: String },
+    /// A template (built-in or the user's) with its parameters, run in a
+    /// sandboxed frame; parameter changes reach it without a reload.
+    Template {
+        /// The template id (`list_templates`).
+        template: String,
+        /// The given parameters (checked against the template; the others
+        /// take its defaults).
+        #[serde(default)]
+        params: Map<String, Value>,
+    },
     /// A stored picture (PNG/JPEG/WebP/GIF; transparency kept).
     Image {
         /// Stored file name (set by the engine from an upload).
@@ -124,6 +136,7 @@ impl Content {
             Content::Title { .. } => "title",
             Content::Ticker { .. } => "ticker",
             Content::Html { .. } => "html",
+            Content::Template { .. } => "template",
             Content::Image { .. } => "image",
             Content::Video { .. } => "video",
             Content::Youtube { .. } => "youtube",
@@ -187,6 +200,7 @@ pub fn kind_fields(kind: &str) -> &'static [&'static str] {
         "title" => &["text", "subtitle", "style", "colour", "background"],
         "ticker" => &["items", "speed", "style", "colour", "background"],
         "html" => &["html"],
+        "template" => &["template", "params"],
         "image" => &["path", "data_base64"],
         "video" => &["path", "url", "loop", "muted"],
         "youtube" => &["link", "start_s", "loop", "muted"],
@@ -317,6 +331,17 @@ impl Layer {
                 ensure!(!html.trim().is_empty(), "an html layer needs html");
                 ensure!(html.len() <= MAX_HTML, "html is larger than 256 KB");
             }
+            Content::Template { template, params } => {
+                ensure!(
+                    crate::template::valid_id(template),
+                    "a template layer needs template (an id from list_templates)"
+                );
+                let size = serde_json::to_string(params).map_or(0, |s| s.len());
+                ensure!(
+                    size <= crate::template::MAX_PARAMS_BYTES,
+                    "params are larger than 2 MB"
+                );
+            }
             Content::Image { .. } => {}
             Content::Video { asset, url, .. } => {
                 if let Some(u) = url.as_deref() {
@@ -352,6 +377,7 @@ impl Layer {
                 cut(&format!("{} items: {}", items.len(), items.join(" | ")))
             }
             Content::Html { html } => format!("{} bytes of HTML", html.len()),
+            Content::Template { template, .. } => format!("template {template}"),
             Content::Image { asset } => format!("image {asset}"),
             Content::Video { asset, url, .. } => match (asset, url) {
                 (Some(a), _) => format!("video file {a}"),

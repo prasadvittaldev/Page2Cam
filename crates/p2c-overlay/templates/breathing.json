@@ -1,0 +1,20 @@
+{
+  "name": "Breathing guide",
+  "category": "calm",
+  "description": "A calm circle that slowly grows while breathing in, rests while holding and shrinks while breathing out, with the phase written inside.",
+  "rect": [0.35, 0.2333, 0.3, 0.5333],
+  "params": [
+    {"name": "title", "type": "text", "default": "", "help": "Line above the circle, e.g. Breathe with me (empty: none)"},
+    {"name": "inhale", "type": "number", "default": 4, "min": 1, "max": 20, "help": "Seconds breathing in"},
+    {"name": "hold", "type": "number", "default": 4, "min": 0, "max": 20, "help": "Seconds holding after breathing in (0: no hold)"},
+    {"name": "exhale", "type": "number", "default": 6, "min": 1, "max": 20, "help": "Seconds breathing out"},
+    {"name": "hold_after", "type": "number", "default": 0, "min": 0, "max": 20, "help": "Seconds resting after breathing out (0: none)"},
+    {"name": "cycles", "type": "number", "default": 0, "min": 0, "max": 100, "help": "Breaths to guide, then the done text (0: endless). Changing a timing or this restarts the count"},
+    {"name": "inhale_text", "type": "text", "default": "Breathe in", "help": "Text while breathing in"},
+    {"name": "hold_text", "type": "text", "default": "Hold", "help": "Text while holding"},
+    {"name": "exhale_text", "type": "text", "default": "Breathe out", "help": "Text while breathing out"},
+    {"name": "done_text", "type": "text", "default": "Well done", "help": "Text after the last breath"}
+  ],
+  "example": {"title": "Breathe with me", "cycles": 5},
+  "update": {"title": "One more minute, slowly"}
+}

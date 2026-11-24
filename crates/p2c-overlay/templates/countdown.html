@@ -1,0 +1,24 @@
+<style>
+  .cd{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:6vh;border-bottom:5vh solid var(--accent)}
+  .cd .lbl{font-size:20vh;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;max-width:94%}
+  .cd .t{font-size:50vh;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.05}
+  .theme-minimal .cd{border-bottom-color:transparent}
+</style>
+<div class="cd p2c-panel"><div class="lbl p2c-ellipsis" id="lbl"></div><div class="t" id="t"></div></div>
+<script>
+var end = 0, key = "";
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#lbl"), p.label);
+  P2C.show(P2C.$("#lbl"), !!p.label);
+  var k = p.until + "|" + p.duration;
+  if (k !== key) {
+    key = k;
+    var at = P2C.when(p.until);
+    end = isFinite(at) ? at : Date.now() + p.duration * 1000;
+  }
+  P2C.every("tick", 250, function () {
+    var left = Math.ceil((end - Date.now()) / 1000);
+    P2C.text(P2C.$("#t"), left > 0 ? P2C.fmtTime(left) : P2C.params.done_text);
+  });
+});
+</script>

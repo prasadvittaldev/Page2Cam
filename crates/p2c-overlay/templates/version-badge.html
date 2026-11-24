@@ -1,0 +1,21 @@
+<style>
+  .vb{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;gap:2.5vh;padding:5vh 6vh 5vh 7vh;border-radius:3vh;border-left:3vh solid var(--accent);overflow:hidden;
+    background-image:radial-gradient(circle at 100% 0%,color-mix(in srgb,var(--accent) 30%,transparent),transparent 60%)}
+  .theme-minimal .vb{border-left-color:rgba(255,255,255,.85);background-image:none}
+  .vb .k{font-size:10vh;font-weight:800;text-transform:uppercase;letter-spacing:.12em;padding:.2em .6em;border-radius:.35em;background:var(--accent);color:#fff;text-shadow:none;max-width:100%}
+  .theme-minimal .vb .k{background:rgba(255,255,255,.9);color:#111}
+  .vb .v{font-size:38vh;font-weight:800;line-height:1;letter-spacing:-.02em;max-width:100%;font-variant-numeric:tabular-nums}
+  .vb .t{font-size:10vh;color:var(--muted);max-width:100%}
+  .vb.notag .v{font-size:46vh}
+</style>
+<div class="vb p2c-panel" id="vb"><div class="k p2c-ellipsis" id="k"></div><div class="v p2c-ellipsis" id="v"></div><div class="t p2c-ellipsis" id="t"></div></div>
+<script>
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#k"), p.kicker);
+  P2C.show(P2C.$("#k"), !!p.kicker);
+  P2C.text(P2C.$("#v"), p.version);
+  P2C.text(P2C.$("#t"), p.tagline);
+  P2C.show(P2C.$("#t"), !!p.tagline);
+  P2C.$("#vb").classList.toggle("notag", !p.tagline);
+});
+</script>

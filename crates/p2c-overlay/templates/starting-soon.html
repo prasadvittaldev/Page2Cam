@@ -1,0 +1,29 @@
+<style>
+  .card{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;background:var(--bg);padding:5vh 5vw;
+    background-image:radial-gradient(circle at 20% 15%,rgba(255,255,255,.08),transparent 45%),radial-gradient(circle at 85% 90%,rgba(0,0,0,.25),transparent 50%)}
+  .theme-minimal .card{background-color:rgba(0,0,0,.72)}
+  .card h1{margin:0;font-size:11vh;font-weight:800;letter-spacing:-.01em;max-width:100%}
+  .card .sub{margin-top:2.5vh;font-size:4.5vh;color:var(--muted);max-width:80%}
+  .card .t{margin-top:5vh;font-size:9vh;font-weight:700;font-variant-numeric:tabular-nums;color:var(--fg);border-bottom:.8vh solid var(--accent);padding:0 2vw}
+</style>
+<div class="card" id="card"><h1 id="h"></h1><div class="sub" id="sub"></div><div class="t" id="t"></div></div>
+<script>
+var end = NaN, key = "";
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.text(P2C.$("#sub"), p.subtitle);
+  P2C.show(P2C.$("#sub"), !!p.subtitle);
+  P2C.$("#card").style.backgroundColor = p.background || "";
+  var k = p.until + "|" + p.duration;
+  if (k !== key) {
+    key = k;
+    var at = P2C.when(p.until);
+    end = isFinite(at) ? at : (p.duration > 0 ? Date.now() + p.duration * 1000 : NaN);
+  }
+  P2C.show(P2C.$("#t"), isFinite(end));
+  P2C.every("tick", 250, function () {
+    if (!isFinite(end)) return;
+    P2C.text(P2C.$("#t"), P2C.fmtTime(Math.max(0, Math.ceil((end - Date.now()) / 1000))));
+  });
+});
+</script>

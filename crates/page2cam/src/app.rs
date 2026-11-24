@@ -787,11 +787,86 @@ impl p2c_admin::Overlays for App {
     fn overlay_state(&self, since: Option<u64>) -> Option<serde_json::Value> {
         self.overlay.state(since)
     }
-    fn overlay_layer_html(&self, id: &str) -> Option<String> {
-        self.overlay.html_of(id)
+    fn overlay_layer_page(&self, id: &str) -> Option<String> {
+        self.overlay.layer_page(id)
     }
     fn overlay_asset(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
         self.overlay.asset(name)
+    }
+    fn templates(&self, category: Option<String>) -> serde_json::Value {
+        self.overlay.templates(category.as_deref())
+    }
+    fn template(&self, id: &str) -> Option<serde_json::Value> {
+        self.overlay.template(id)
+    }
+    fn save_template(&self, def: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        self.overlay.save_template(def)
+    }
+    fn delete_template(&self, id: &str) -> anyhow::Result<()> {
+        self.overlay.delete_template(id)
+    }
+    fn scenes(&self) -> serde_json::Value {
+        self.overlay.scenes()
+    }
+    fn save_scene(
+        &self,
+        name: &str,
+        background: bool,
+        webcam: bool,
+    ) -> anyhow::Result<serde_json::Value> {
+        let bg = background
+            .then(|| serde_json::to_value(Controls::background(self)).ok())
+            .flatten();
+        let cam = webcam
+            .then(|| serde_json::to_value(p2c_admin::PipDto::from(Controls::pip(self))).ok())
+            .flatten();
+        self.overlay.save_scene(name, bg, cam)
+    }
+    /// The layers come back first; then the saved background and webcam
+    /// (a failure there is reported, the layers stay).
+    fn load_scene(&self, id: &str, replace: bool) -> anyhow::Result<serde_json::Value> {
+        let (scene, r) = self.overlay.load_scene(id, replace)?;
+        let mut notes: Vec<String> = Vec::new();
+        let mut full = None;
+        if let Some(bg) = scene.background {
+            match serde_json::from_value::<BackgroundDto>(bg)
+                .map_err(anyhow::Error::from)
+                .and_then(|b| {
+                    let f = b.full.clone();
+                    Controls::set_background(self, b).map(|()| f)
+                }) {
+                Ok(f) => {
+                    notes.push("background restored".into());
+                    full = Some(f);
+                }
+                Err(e) => notes.push(format!("background not restored: {e:#}")),
+            }
+        }
+        if let Some(cam) = scene.webcam {
+            match serde_json::from_value::<p2c_admin::PipDto>(cam)
+                .map_err(anyhow::Error::from)
+                .and_then(PipLayout::try_from)
+            {
+                Ok(l) => {
+                    Controls::set_pip(self, l);
+                    notes.push("webcam overlay restored".into());
+                }
+                Err(e) => notes.push(format!("webcam overlay not restored: {e:#}")),
+            }
+        }
+        tracing::info!(
+            scene = id,
+            added = r.added.len(),
+            skipped = r.skipped.len(),
+            "scene loaded"
+        );
+        Ok(serde_json::json!({
+            "scene": scene.id, "added": r.added, "skipped": r.skipped, "notes": notes,
+            "background_full": full,
+        }))
+    }
+    fn delete_scene(&self, id: &str) -> anyhow::Result<()> {
+        self.overlay.delete_scene(id)
     }
 }
 

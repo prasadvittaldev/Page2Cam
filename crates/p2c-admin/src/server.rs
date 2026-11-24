@@ -157,6 +157,14 @@ pub(crate) fn router(st: State) -> Router {
                 // Pictures and video files (videos up to 200 MB).
                 .layer(axum::extract::DefaultBodyLimit::max(MAX_LAYER_ASSET_BYTES)),
         )
+        .route("/api/templates", get(templates_get).post(template_save))
+        .route(
+            "/api/templates/{id}",
+            get(template_get).delete(template_delete),
+        )
+        .route("/api/scenes", get(scenes_get).post(scene_save))
+        .route("/api/scenes/{id}/load", post(scene_load))
+        .route("/api/scenes/{id}", axum::routing::delete(scene_delete))
         .route("/ov/{id}/scene.html", get(ov_scene))
         .route("/ov/{id}/scene.js", get(ov_scene_js))
         .route("/ov/{id}/state", get(ov_state))
@@ -905,6 +913,113 @@ async fn layer_asset(
     overlay_call(&st, move |c| c.set_layer_asset(&id, body.to_vec())).await
 }
 
+#[derive(Deserialize)]
+struct CategoryQuery {
+    category: Option<String>,
+}
+
+/// `GET /api/templates[?category=]`: summaries and the categories.
+async fn templates_get(
+    AxState(st): AxState<State>,
+    q: Result<axum::extract::Query<CategoryQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let cat = q.ok().and_then(|q| q.0.category).filter(|c| !c.is_empty());
+    let c = st.controls.clone();
+    match tokio::task::spawn_blocking(move || c.templates(cat)).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// `GET /api/templates/<id>`: one template in full.
+async fn template_get(
+    AxState(st): AxState<State>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match st.controls.template(&id) {
+        Some(v) => Json(v).into_response(),
+        None => json_error(
+            StatusCode::NOT_FOUND,
+            &format!("no template {id:?} (GET /api/templates lists them)"),
+        ),
+    }
+}
+
+/// `POST /api/templates`: save a user template (a definition, `{from_layer}`
+/// or `{copy_of}`).
+async fn template_save(AxState(st): AxState<State>, Json(b): Json<serde_json::Value>) -> Response {
+    overlay_call(&st, move |c| c.save_template(b)).await
+}
+
+/// `DELETE /api/templates/<id>`.
+async fn template_delete(
+    AxState(st): AxState<State>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    overlay_call(&st, move |c| {
+        c.delete_template(&id)
+            .map(|()| serde_json::json!({ "removed": id }))
+    })
+    .await
+}
+
+/// `GET /api/scenes`.
+async fn scenes_get(AxState(st): AxState<State>) -> Json<serde_json::Value> {
+    Json(st.controls.scenes())
+}
+
+#[derive(Deserialize)]
+struct SceneSaveBody {
+    name: String,
+    #[serde(default)]
+    include_background: bool,
+    #[serde(default)]
+    include_webcam: bool,
+}
+
+/// `POST /api/scenes` `{name, include_background?, include_webcam?}`.
+async fn scene_save(AxState(st): AxState<State>, Json(b): Json<SceneSaveBody>) -> Response {
+    overlay_call(&st, move |c| {
+        c.save_scene(&b.name, b.include_background, b.include_webcam)
+    })
+    .await
+}
+
+#[derive(Deserialize, Default)]
+struct SceneLoadBody {
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// `POST /api/scenes/<id>/load` `{mode: "replace" | "add"}` (default replace).
+async fn scene_load(
+    AxState(st): AxState<State>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Option<Json<SceneLoadBody>>,
+) -> Response {
+    let mode = body
+        .and_then(|b| b.0.mode)
+        .unwrap_or_else(|| "replace".into());
+    let replace = match mode.as_str() {
+        "replace" => true,
+        "add" => false,
+        _ => return json_error(StatusCode::BAD_REQUEST, "mode must be replace or add"),
+    };
+    overlay_call(&st, move |c| c.load_scene(&id, replace)).await
+}
+
+/// `DELETE /api/scenes/<id>`.
+async fn scene_delete(
+    AxState(st): AxState<State>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    overlay_call(&st, move |c| {
+        c.delete_scene(&id)
+            .map(|()| serde_json::json!({ "removed": id }))
+    })
+    .await
+}
+
 /// `GET /ov/<id>/scene.html` (id checked by the guard; no token).
 async fn ov_scene() -> Response {
     (
@@ -958,8 +1073,8 @@ async fn ov_layer(
     AxState(st): AxState<State>,
     axum::extract::Path((_, layer)): axum::extract::Path<(String, String)>,
 ) -> Response {
-    match st.controls.overlay_layer_html(&layer) {
-        Some(frag) => (
+    match st.controls.overlay_layer_page(&layer) {
+        Some(page) => (
             [
                 (header::CACHE_CONTROL, "no-store"),
                 (
@@ -967,7 +1082,7 @@ async fn ov_layer(
                     p2c_overlay::scene::LAYER_CSP,
                 ),
             ],
-            Html(p2c_overlay::scene::layer_page(&frag)),
+            Html(page),
         )
             .into_response(),
         None => (StatusCode::NOT_FOUND, "no such layer").into_response(),
@@ -1190,6 +1305,7 @@ mod tests {
         /// A real layer list over a temporary asset folder.
         pub struct OvFake {
             pub set: Mutex<p2c_overlay::LayerSet>,
+            pub scenes: Mutex<p2c_overlay::SceneStore>,
             pub assets: p2c_overlay::Assets,
             _dir: tempfile::TempDir,
         }
@@ -1199,6 +1315,7 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 OvFake {
                     set: Mutex::default(),
+                    scenes: Mutex::default(),
                     assets: p2c_overlay::Assets::new(dir.path().join("assets")),
                     _dir: dir,
                 }
@@ -1207,8 +1324,7 @@ mod tests {
 
         impl Overlays for Fake {
             fn layers(&self) -> Vec<serde_json::Value> {
-                let s = self.ov.set.lock().unwrap();
-                s.layers().iter().map(|l| l.to_json()).collect()
+                self.ov.set.lock().unwrap().layers_json()
             }
             fn add_layer(&self, spec: serde_json::Value) -> anyhow::Result<serde_json::Value> {
                 let mut s = self.ov.set.lock().unwrap();
@@ -1247,11 +1363,64 @@ mod tests {
                 let s = self.ov.set.lock().unwrap();
                 (since != Some(s.rev())).then(|| s.state_json())
             }
-            fn overlay_layer_html(&self, id: &str) -> Option<String> {
-                self.ov.set.lock().unwrap().html_of(id).map(str::to_string)
+            fn overlay_layer_page(&self, id: &str) -> Option<String> {
+                self.ov.set.lock().unwrap().layer_page(id)
             }
             fn overlay_asset(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
                 self.ov.assets.read(name)
+            }
+            fn templates(&self, category: Option<String>) -> serde_json::Value {
+                let s = self.ov.set.lock().unwrap();
+                s.templates().list_json(category.as_deref())
+            }
+            fn template(&self, id: &str) -> Option<serde_json::Value> {
+                self.ov.set.lock().unwrap().templates().full_json(id)
+            }
+            fn save_template(&self, def: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+                let t = self.ov.set.lock().unwrap().save_template(def)?;
+                Ok(t.to_json(true))
+            }
+            fn delete_template(&self, id: &str) -> anyhow::Result<()> {
+                self.ov.set.lock().unwrap().delete_template(id)
+            }
+            fn scenes(&self) -> serde_json::Value {
+                serde_json::json!({ "scenes": self.ov.scenes.lock().unwrap().list() })
+            }
+            fn save_scene(
+                &self,
+                name: &str,
+                _background: bool,
+                _webcam: bool,
+            ) -> anyhow::Result<serde_json::Value> {
+                let layers = self.ov.set.lock().unwrap().scene_layers();
+                let s = self.ov.scenes.lock().unwrap().save(
+                    name,
+                    layers,
+                    None,
+                    None,
+                    &self.ov.assets,
+                )?;
+                Ok(s.summary())
+            }
+            fn load_scene(&self, id: &str, replace: bool) -> anyhow::Result<serde_json::Value> {
+                let sc = self
+                    .ov
+                    .scenes
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("no scene {id:?}"))?;
+                let r = self.ov.set.lock().unwrap().load_scene(
+                    &sc,
+                    replace,
+                    &self.ov.assets,
+                    std::time::Instant::now(),
+                )?;
+                Ok(serde_json::json!({ "added": r.added, "skipped": r.skipped }))
+            }
+            fn delete_scene(&self, id: &str) -> anyhow::Result<()> {
+                self.ov.scenes.lock().unwrap().delete(id, &self.ov.assets)
             }
         }
 
@@ -2783,6 +2952,134 @@ mod tests {
             code,
             serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn template_routes() {
+        let fake = Arc::new(Fake::default());
+        let a = app(fake.clone());
+        let (c, v) = call_json(&a, "GET", "/api/templates", None).await;
+        assert_eq!(c, StatusCode::OK);
+        assert!(v["templates"].as_array().unwrap().len() >= 6);
+        assert!(v["categories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == "software"));
+        let (_, v) = call_json(&a, "GET", "/api/templates?category=time", None).await;
+        assert!(v["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["category"] == "time"));
+        let (c, v) = call_json(&a, "GET", "/api/templates/lower-third", None).await;
+        assert_eq!(c, StatusCode::OK);
+        assert!(v["html"].as_str().unwrap().contains("P2C.onParams"));
+        assert!(v["all_params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "theme"));
+        let (c, _) = call_json(&a, "GET", "/api/templates/nope", None).await;
+        assert_eq!(c, StatusCode::NOT_FOUND);
+        // Save, use, delete.
+        let (c, v) = call_json(
+            &a,
+            "POST",
+            "/api/templates",
+            Some(r#"{"copy_of":"lower-third","id":"my-lt","name":"My lower third"}"#),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        assert_eq!(v["builtin"], false);
+        let (c, v) = call_json(
+            &a,
+            "POST",
+            "/api/layers",
+            Some(r#"{"kind":"template","template":"my-lt","params":{"title":"Sam"}}"#),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let (c, v) = call_json(
+            &a,
+            "POST",
+            "/api/templates",
+            Some(r#"{"id":"lower-third","name":"x","html":"<b>"}"#),
+        )
+        .await;
+        assert_eq!(c, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap().contains("built-in"));
+        let (c, _) = call_json(&a, "DELETE", "/api/templates/my-lt", None).await;
+        assert_eq!(c, StatusCode::OK);
+        let (_, v) = call_json(&a, "GET", "/api/layers", None).await;
+        assert_eq!(v["layers"][0]["template_missing"], true);
+        let (c, _) = call_json(&a, "DELETE", "/api/templates/lower-third", None).await;
+        assert_eq!(c, StatusCode::BAD_REQUEST);
+        // Token needed.
+        let r = a
+            .clone()
+            .oneshot(req("GET", "/api/templates", "127.0.0.1:8765", None, None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn scene_routes() {
+        let fake = Arc::new(Fake::default());
+        let a = app(fake.clone());
+        call_json(
+            &a,
+            "POST",
+            "/api/layers",
+            Some(r#"{"kind":"title","text":"Hi","id":"t"}"#),
+        )
+        .await;
+        let (c, v) = call_json(&a, "POST", "/api/scenes", Some(r#"{"name":"Intro"}"#)).await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        assert_eq!(v["id"], "intro");
+        let (_, v) = call_json(&a, "GET", "/api/scenes", None).await;
+        assert_eq!(v["scenes"][0]["name"], "Intro");
+        call_json(
+            &a,
+            "POST",
+            "/api/layers",
+            Some(r#"{"kind":"title","text":"Other","id":"o"}"#),
+        )
+        .await;
+        let (c, v) = call_json(
+            &a,
+            "POST",
+            "/api/scenes/intro/load",
+            Some(r#"{"mode":"replace"}"#),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        assert_eq!(v["added"], serde_json::json!(["t"]));
+        let (c, v) = call_json(
+            &a,
+            "POST",
+            "/api/scenes/intro/load",
+            Some(r#"{"mode":"add"}"#),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let (_, v) = call_json(&a, "GET", "/api/layers", None).await;
+        assert_eq!(v["layers"].as_array().unwrap().len(), 2);
+        let (c, _) = call_json(
+            &a,
+            "POST",
+            "/api/scenes/intro/load",
+            Some(r#"{"mode":"mix"}"#),
+        )
+        .await;
+        assert_eq!(c, StatusCode::BAD_REQUEST);
+        let (c, _) = call_json(&a, "POST", "/api/scenes/nope/load", Some("{}")).await;
+        assert_eq!(c, StatusCode::BAD_REQUEST);
+        let (c, _) = call_json(&a, "DELETE", "/api/scenes/intro", None).await;
+        assert_eq!(c, StatusCode::OK);
+        let (c, _) = call_json(&a, "DELETE", "/api/scenes/intro", None).await;
+        assert_eq!(c, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

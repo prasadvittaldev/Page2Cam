@@ -4,16 +4,82 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
 use crate::redact::redact;
-use crate::tools::{parse_call, tool_defs, Backend, BackendReply};
+use crate::tools::{parse_call, tool_defs, Backend, BackendCall, BackendReply};
 
 /// The protocol version we prefer.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// Versions we answer with when the client asks for them.
 pub const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26"];
 
-const INSTRUCTIONS: &str = "Page2Cam turns a web page plus the user's webcam into a virtual camera \
-(Teams, Zoom, Meet) and a live stream. Call status first; start it if stopped. The person in a call \
-sees what snapshot shows. Changes are visible live to the people in the user's call.";
+/// The `initialize` capabilities.
+fn capabilities() -> Value {
+    json!({
+        "tools": { "listChanged": false },
+        "resources": { "listChanged": false },
+        "prompts": { "listChanged": false },
+    })
+}
+
+/// Answers that need neither Page2Cam nor the tray: the guide's resources
+/// and prompts, and the `guide` tool. `None` for anything else (and for
+/// notifications). The stdio bridge uses it while the tray can't be reached.
+pub fn offline(msg: &Value) -> Option<Value> {
+    let id = msg.get("id")?.clone();
+    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+    Some(match msg["method"].as_str()? {
+        "resources/list" => {
+            let list: Vec<Value> = p2c_guide::resources()
+                .into_iter()
+                .map(|r| {
+                    json!({ "uri": r.uri, "name": r.name, "title": r.title,
+                    "description": r.description, "mimeType": "text/markdown" })
+                })
+                .collect();
+            result(id, json!({ "resources": list }))
+        }
+        "resources/templates/list" => result(id, json!({ "resourceTemplates": [] })),
+        "resources/read" => {
+            let uri = params["uri"].as_str().unwrap_or("");
+            match p2c_guide::read_resource(uri) {
+                Some(text) => result(
+                    id,
+                    json!({ "contents": [{ "uri": uri, "mimeType": "text/markdown", "text": text }] }),
+                ),
+                None => error(id, -32002, &format!("resource not found: {uri}")),
+            }
+        }
+        "prompts/list" => result(id, json!({ "prompts": p2c_guide::prompts() })),
+        "prompts/get" => {
+            let name = params["name"].as_str().unwrap_or("");
+            let args = params["arguments"].as_object().cloned().unwrap_or_default();
+            match p2c_guide::prompt(name, &args) {
+                Some((description, text)) => result(
+                    id,
+                    json!({ "description": description,
+                        "messages": [{ "role": "user", "content": { "type": "text", "text": text } }] }),
+                ),
+                None => error(id, -32602, &format!("unknown prompt: {name}")),
+            }
+        }
+        "tools/call" if params["name"] == "guide" => {
+            let empty = Map::new();
+            let args = params["arguments"].as_object().unwrap_or(&empty);
+            match parse_call("guide", args) {
+                Ok(BackendCall::Guide(t)) => result(id, guide_answer(t.as_deref())),
+                Err(Some(m)) => result(id, tool_error(&m)),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn guide_answer(topic: Option<&str>) -> Value {
+    match p2c_guide::topic(topic.unwrap_or("")) {
+        Ok((_, text)) => json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
+        Err(e) => tool_error(&e),
+    }
+}
 
 /// Who is calling (from `initialize`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,15 +146,23 @@ impl<B: Backend> Server<B> {
                     id,
                     json!({
                         "protocolVersion": version,
-                        "capabilities": { "tools": { "listChanged": false } },
+                        "capabilities": capabilities(),
                         "serverInfo": { "name": "page2cam", "version": env!("CARGO_PKG_VERSION") },
-                        "instructions": INSTRUCTIONS,
+                        "instructions": p2c_guide::instructions(),
                     }),
                 )
             }
             "ping" => result(id, json!({})),
             "tools/list" => result(id, json!({ "tools": tool_defs() })),
-            "tools/call" => self.call(id, &params, client),
+            "tools/call" if params["name"] != "guide" => self.call(id, &params, client),
+            "tools/call"
+            | "resources/list"
+            | "resources/templates/list"
+            | "resources/read"
+            | "prompts/list"
+            | "prompts/get" => {
+                return offline(msg).or_else(|| Some(error(id, -32603, "internal error")))
+            }
             _ => error(id, -32601, &format!("method not found: {method}")),
         })
     }
@@ -244,8 +318,17 @@ mod tests {
             "remove_layer",
             "clear_layers",
             "reorder_layers",
+            "guide",
+            "list_templates",
+            "get_template",
+            "save_template",
+            "delete_template",
+            "list_scenes",
+            "save_scene",
+            "load_scene",
+            "delete_scene",
         ];
-        assert_eq!(want.len(), 37);
+        assert_eq!(want.len(), 46);
         let mut names = tool_names();
         names.sort();
         let mut w: Vec<String> = want.iter().map(|s| s.to_string()).collect();
@@ -258,7 +341,7 @@ mod tests {
             )
             .unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 37);
+        assert_eq!(tools.len(), 46);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert!(
@@ -683,6 +766,230 @@ mod tests {
     }
 
     #[test]
+    fn guide_is_answered_without_the_backend() {
+        let s = server();
+        let r = call(&s, "guide", json!({}));
+        assert_eq!(r["result"]["isError"], false);
+        assert!(r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Playbooks"));
+        let r = call(&s, "guide", json!({ "topic": "lower-third" }));
+        assert!(r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("add_layer"));
+        let r = call(&s, "guide", json!({ "topic": "zzqxv" }));
+        assert_eq!(r["result"]["isError"], true);
+        let r = call(&s, "guide", json!({ "subject": "x" }));
+        assert_eq!(r["result"]["isError"], true);
+        assert!(s.backend().calls.borrow().is_empty());
+        // Offline (the bridge while the tray can't be reached).
+        let r = offline(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "guide", "arguments": { "topic": "scenes" } } }))
+        .unwrap();
+        assert!(r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("save_scene"));
+        assert!(
+            offline(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "status" } }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resources_and_prompts() {
+        let s = server();
+        let mut c = ClientInfo::default();
+        let rq = |m: &str, p: Value| json!({ "jsonrpc": "2.0", "id": 9, "method": m, "params": p });
+        let init = s.handle(&rq("initialize", json!({})), &mut c).unwrap();
+        let caps = &init["result"]["capabilities"];
+        assert!(caps["resources"].is_object() && caps["prompts"].is_object());
+        let instr = init["result"]["instructions"].as_str().unwrap();
+        assert!(instr.contains("guide") && instr.lines().count() <= 60);
+        let r = s.handle(&rq("resources/list", json!({})), &mut c).unwrap();
+        let list = r["result"]["resources"].as_array().unwrap();
+        assert!(list
+            .iter()
+            .any(|x| x["uri"] == "page2cam://playbooks/webinar"));
+        let r = s
+            .handle(
+                &rq(
+                    "resources/read",
+                    json!({ "uri": "page2cam://templates/countdown" }),
+                ),
+                &mut c,
+            )
+            .unwrap();
+        assert!(r["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Countdown"));
+        let r = s
+            .handle(
+                &rq("resources/read", json!({ "uri": "file:///C:/x" })),
+                &mut c,
+            )
+            .unwrap();
+        assert_eq!(r["error"]["code"], -32002);
+        let r = s.handle(&rq("prompts/list", json!({})), &mut c).unwrap();
+        assert!(r["result"]["prompts"].as_array().unwrap().len() >= 26);
+        let r = s
+            .handle(
+                &rq(
+                    "prompts/get",
+                    json!({ "name": "webinar", "arguments": { "topic": "Q4 plans" } }),
+                ),
+                &mut c,
+            )
+            .unwrap();
+        let text = r["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("Q4 plans") && text.contains("guide"));
+        let r = s
+            .handle(&rq("prompts/get", json!({ "name": "nope" })), &mut c)
+            .unwrap();
+        assert_eq!(r["error"]["code"], -32602);
+        let r = s
+            .handle(&rq("resources/templates/list", json!({})), &mut c)
+            .unwrap();
+        assert_eq!(r["result"]["resourceTemplates"], json!([]));
+    }
+
+    #[test]
+    fn template_and_scene_tools() {
+        use BackendCall as C;
+        let table: Vec<(&str, Value, C)> = vec![
+            ("list_templates", json!({}), C::ListTemplates(None)),
+            (
+                "list_templates",
+                json!({ "category": "time" }),
+                C::ListTemplates(Some("time".into())),
+            ),
+            (
+                "get_template",
+                json!({ "id": "countdown", "include_html": true }),
+                C::GetTemplate {
+                    id: "countdown".into(),
+                    include_html: true,
+                },
+            ),
+            (
+                "delete_template",
+                json!({ "id": "mine" }),
+                C::DeleteTemplate("mine".into()),
+            ),
+            (
+                "save_template",
+                json!({ "from_layer": "chart", "name": "Chart" }),
+                C::SaveTemplate(json!({ "from_layer": "chart", "name": "Chart" })),
+            ),
+            ("list_scenes", json!({}), C::ListScenes),
+            (
+                "save_scene",
+                json!({ "name": " Intro ", "include_webcam": true }),
+                C::SaveScene {
+                    name: "Intro".into(),
+                    include_background: false,
+                    include_webcam: true,
+                },
+            ),
+            (
+                "load_scene",
+                json!({ "id": "intro" }),
+                C::LoadScene {
+                    id: "intro".into(),
+                    replace: true,
+                },
+            ),
+            (
+                "load_scene",
+                json!({ "id": "intro", "mode": "add" }),
+                C::LoadScene {
+                    id: "intro".into(),
+                    replace: false,
+                },
+            ),
+            (
+                "delete_scene",
+                json!({ "id": "intro" }),
+                C::DeleteScene("intro".into()),
+            ),
+        ];
+        for (name, args, want) in table {
+            let s = server();
+            let r = call(&s, name, args);
+            assert_eq!(r["result"]["isError"], false, "{name}: {r}");
+            assert_eq!(s.backend().calls.borrow()[0].1, want, "{name}");
+        }
+        for (name, args) in [
+            ("save_template", json!({})),
+            ("save_template", json!({ "id": "x", "name": "X" })),
+            (
+                "save_template",
+                json!({ "from_layer": "a", "copy_of": "b" }),
+            ),
+            ("save_template", json!({ "id": "../x", "copy_of": "b" })),
+            (
+                "save_template",
+                json!({ "id": "x", "name": "X", "html": "<b>", "evil": 1 }),
+            ),
+            ("load_scene", json!({ "id": "a", "mode": "mix" })),
+            ("save_scene", json!({ "name": "" })),
+            ("get_template", json!({ "id": "a/b" })),
+            ("list_templates", json!({ "category": "../x" })),
+            (
+                "add_layer",
+                json!({ "kind": "template", "template": "a b" }),
+            ),
+            (
+                "add_layer",
+                json!({ "kind": "template", "template": "x", "params": [1] }),
+            ),
+            (
+                "add_layer",
+                json!({ "kind": "template", "template": "x", "params": { "logo": { "url": "x" } } }),
+            ),
+            (
+                "add_layer",
+                json!({ "kind": "template", "template": "x", "params": { "logo": { "path": "\\\\evil\\s\\a.png" } } }),
+            ),
+        ] {
+            let s = server();
+            let r = call(&s, name, args.clone());
+            assert_eq!(r["result"]["isError"], true, "{name} {args}: {r}");
+            assert!(s.backend().calls.borrow().is_empty());
+        }
+        // A picture path in params is embedded.
+        let dir = std::env::temp_dir().join(format!("p2c-mcp-tpl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("logo.png");
+        std::fs::write(&f, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let s = server();
+        let r = call(
+            &s,
+            "add_layer",
+            json!({ "kind": "template", "template": "lower-third",
+                "params": { "title": "A", "logo": { "path": f.to_str().unwrap() } } }),
+        );
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        match &s.backend().calls.borrow()[0].1 {
+            C::AddLayer(v) => {
+                assert!(v["params"]["logo"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("data:image/png;base64,"));
+                assert_eq!(v["template"], "lower-third");
+            }
+            c => panic!("{c:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn snapshot_returns_image_content() {
         let s = server();
         *s.backend().reply.borrow_mut() =
@@ -760,7 +1067,7 @@ mod tests {
         let mut c = ClientInfo::default();
         let r = s
             .handle(
-                &json!({ "jsonrpc": "2.0", "id": "a", "method": "resources/list" }),
+                &json!({ "jsonrpc": "2.0", "id": "a", "method": "sampling/createMessage" }),
                 &mut c,
             )
             .unwrap();

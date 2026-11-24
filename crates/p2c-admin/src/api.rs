@@ -444,12 +444,52 @@ pub trait Overlays {
     fn overlay_state(&self, _since: Option<u64>) -> Option<serde_json::Value> {
         None
     }
-    /// The fragment of an HTML layer.
-    fn overlay_layer_html(&self, _id: &str) -> Option<String> {
+    /// The document an HTML or template layer's frame loads.
+    fn overlay_layer_page(&self, _id: &str) -> Option<String> {
         None
     }
     /// A stored overlay file and its content type.
     fn overlay_asset(&self, _name: &str) -> Option<(Vec<u8>, &'static str)> {
         None
+    }
+    /// `{templates: [summary…], categories: [{id, label}…]}`, optionally of
+    /// one category.
+    fn templates(&self, _category: Option<String>) -> serde_json::Value {
+        serde_json::json!({ "templates": [], "categories": [] })
+    }
+    /// One template in full (params with types, example, HTML).
+    fn template(&self, _id: &str) -> Option<serde_json::Value> {
+        None
+    }
+    /// Save a user template: a definition, `{from_layer}` or `{copy_of}`.
+    fn save_template(&self, _def: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("templates are not available")
+    }
+    /// Delete a user template.
+    fn delete_template(&self, _id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("templates are not available")
+    }
+    /// `{scenes: [summary…]}`.
+    fn scenes(&self) -> serde_json::Value {
+        serde_json::json!({ "scenes": [] })
+    }
+    /// Save the current layers (and optionally background and webcam) as a
+    /// scene.
+    fn save_scene(
+        &self,
+        _name: &str,
+        _background: bool,
+        _webcam: bool,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("scenes are not available")
+    }
+    /// Load a scene (`replace`: remove the other layers first);
+    /// `{added, skipped, …}`.
+    fn load_scene(&self, _id: &str, _replace: bool) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("scenes are not available")
+    }
+    /// Delete a scene.
+    fn delete_scene(&self, _id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("scenes are not available")
     }
 }

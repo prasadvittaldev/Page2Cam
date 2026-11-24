@@ -1,0 +1,14 @@
+{
+  "name": "Code card",
+  "category": "software",
+  "description": "A syntax-highlighted code snippet in an editor-style card, optionally typed out.",
+  "rect": [0.5, 0.08, 0.45, 0.55],
+  "params": [
+    {"name": "code", "type": "longtext", "required": true, "help": "The code (keep it short: about 15 lines fit)"},
+    {"name": "language", "type": "choice", "default": "js", "options": ["js", "ts", "py", "rust", "go", "java", "cs", "sql", "sh", "json", "text"], "help": "Language for highlighting"},
+    {"name": "filename", "type": "text", "default": "", "help": "Title bar text, e.g. main.rs"},
+    {"name": "typing", "type": "bool", "default": false, "help": "Type the code out character by character"}
+  ],
+  "example": {"code": "fn main() {\n    let name = \"Page2Cam\";\n    println!(\"Hello from {name}!\");\n}", "language": "rust", "filename": "main.rs"},
+  "update": {"code": "fn main() {\n    let name = \"Page2Cam 2.0\";\n    println!(\"Hello from {name}!\");\n}\n// shipped"}
+}

@@ -1,0 +1,13 @@
+{
+  "name": "Stopwatch",
+  "category": "time",
+  "description": "Counts up from when it is shown; can be paused and resumed without losing the time, or restarted from a given offset.",
+  "rect": [0.82, 0.05, 0.15, 0.12],
+  "params": [
+    {"name": "label", "type": "text", "default": "Elapsed", "help": "Small line above the time (empty: none)"},
+    {"name": "running", "type": "bool", "default": true, "help": "false pauses (the time is kept), true resumes"},
+    {"name": "start_at", "type": "duration", "default": 0, "help": "Start from this time (seconds or m:ss). Changing it restarts the stopwatch from that value"}
+  ],
+  "example": {"label": "Elapsed", "start_at": 0},
+  "update": {"label": "Q&A", "start_at": "10:00"}
+}

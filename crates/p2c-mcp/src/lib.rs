@@ -8,7 +8,7 @@ mod protocol;
 mod redact;
 mod tools;
 
-pub use protocol::{ClientInfo, Server, PROTOCOL_VERSION, SUPPORTED_VERSIONS};
+pub use protocol::{offline, ClientInfo, Server, PROTOCOL_VERSION, SUPPORTED_VERSIONS};
 pub use redact::redact;
 pub use tools::{
     tool_defs, tool_names, Backend, BackendCall, BackendReply, Nav, MAX_HTML_BYTES, MAX_IMAGE_BYTES,

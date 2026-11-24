@@ -1,0 +1,35 @@
+{
+  "name": "Status card",
+  "category": "software",
+  "description": "Service status panel: a coloured overall status, the incident title, a timeline of updates (newest first) and optional per-component states.",
+  "rect": [0.64, 0.08, 0.31, 0.66],
+  "params": [
+    {"name": "service", "type": "text", "default": "", "help": "Service or product name above the status (empty: none)"},
+    {"name": "status", "type": "choice", "default": "operational", "options": ["operational", "degraded", "partial-outage", "major-outage", "maintenance"], "help": "Overall status: green operational, amber degraded, orange partial-outage, red major-outage, blue maintenance"},
+    {"name": "headline", "type": "text", "default": "", "help": "Status line text (empty: from the status, e.g. All systems operational)"},
+    {"name": "incident", "type": "text", "default": "", "help": "Incident title (empty: none)"},
+    {"name": "updates", "type": "table", "columns": ["time", "text"], "max_items": 6, "default": [], "help": "Up to 6 rows, newest first: time (e.g. 14:32), text"},
+    {"name": "components", "type": "table", "columns": ["name", "status"], "max_items": 8, "default": [], "help": "Up to 8 rows: component name, status (operational, degraded, partial-outage, major-outage or maintenance; other text is shown grey)"}
+  ],
+  "example": {
+    "service": "Acme API",
+    "status": "degraded",
+    "incident": "Elevated error rates on EU checkout",
+    "updates": [
+      ["14:32", "Fix deployed, monitoring recovery."],
+      ["14:05", "Cause identified: a faulty cache node."],
+      ["13:48", "Investigating increased errors on EU checkout."]
+    ],
+    "components": [["API", "operational"], ["Checkout (EU)", "degraded"], ["Dashboard", "operational"], ["Webhooks", "operational"]]
+  },
+  "update": {
+    "status": "operational",
+    "updates": [
+      ["14:55", "Resolved: error rates are back to normal."],
+      ["14:32", "Fix deployed, monitoring recovery."],
+      ["14:05", "Cause identified: a faulty cache node."],
+      ["13:48", "Investigating increased errors on EU checkout."]
+    ],
+    "components": [["API", "operational"], ["Checkout (EU)", "operational"], ["Dashboard", "operational"], ["Webhooks", "operational"]]
+  }
+}

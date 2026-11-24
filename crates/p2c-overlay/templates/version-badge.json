@@ -1,0 +1,13 @@
+{
+  "name": "Version badge",
+  "category": "software",
+  "description": "A badge announcing a release: a small \"Now shipping\" kicker, the version in large type and an optional tagline.",
+  "rect": [0.7, 0.06, 0.25, 0.2],
+  "params": [
+    {"name": "version", "type": "text", "required": true, "help": "Version, e.g. v2.0 (short)"},
+    {"name": "kicker", "type": "text", "default": "Now shipping", "help": "Small line above the version (empty: none)"},
+    {"name": "tagline", "type": "text", "default": "", "help": "Line under the version, e.g. the headline feature (empty: none)"}
+  ],
+  "example": {"version": "v2.0", "tagline": "Overlay templates for every show"},
+  "update": {"version": "v2.1", "tagline": "Now with scenes and playbooks"}
+}

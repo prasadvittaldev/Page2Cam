@@ -10,7 +10,9 @@ use base64::Engine;
 use serde_json::{json, Map, Value};
 
 use crate::assets::{Assets, MediaKind};
-use crate::layer::{default_rect, from_json, merge, Layer, KINDS};
+use crate::layer::{default_rect, from_json, merge, Content, Layer, KINDS};
+use crate::store::TemplateLib;
+use crate::template::Template;
 
 /// Most layers at once.
 pub const MAX_LAYERS: usize = 32;
@@ -24,6 +26,17 @@ pub struct LayerSet {
     rev: u64,
     /// When each visible layer was last shown (for `hide_after_s`).
     shown_at: HashMap<String, Instant>,
+    /// Where template layers find their templates.
+    lib: TemplateLib,
+}
+
+/// What loading a scene did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SceneLoad {
+    /// Ids of the layers added, back to front.
+    pub added: Vec<String>,
+    /// `"<layer id>: <why>"` for each layer left out.
+    pub skipped: Vec<String>,
 }
 
 /// `name` as an id: lower case `[a-z0-9-]`, at most [`MAX_ID`] long;
@@ -91,17 +104,72 @@ fn store_media(assets: &Assets, id: &str, kind: &str, media: Media) -> Result<St
     }
 }
 
-fn content_hash(l: &Layer) -> String {
+fn hash_of(s: &str) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_string(&l.content)
-        .unwrap_or_default()
-        .hash(&mut h);
+    s.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+fn content_hash(l: &Layer) -> String {
+    hash_of(&serde_json::to_string(&l.content).unwrap_or_default())
+}
+
+/// Merge a partial `params` change into `old` (`null` removes a value, so
+/// it takes the template's default again).
+fn merge_params(old: &Map<String, Value>, patch: &Value) -> Result<Map<String, Value>> {
+    let p = patch
+        .as_object()
+        .ok_or_else(|| anyhow!("params must be an object of parameter values"))?;
+    let mut m = old.clone();
+    for (k, v) in p {
+        if v.is_null() {
+            m.remove(k);
+        } else {
+            m.insert(k.clone(), v.clone());
+        }
+    }
+    Ok(m)
 }
 
 impl LayerSet {
     pub fn new() -> LayerSet {
         LayerSet::default()
+    }
+
+    /// Use `lib` for template layers (built-ins only until this is called).
+    pub fn set_templates(&mut self, lib: TemplateLib) {
+        self.lib = lib;
+        self.touch();
+    }
+
+    /// The template library template layers use.
+    pub fn templates(&self) -> &TemplateLib {
+        &self.lib
+    }
+
+    fn template(&self, id: &str) -> Result<Template> {
+        self.lib
+            .get(id)
+            .ok_or_else(|| anyhow!("unknown template {id:?} (list_templates shows the ids)"))
+    }
+
+    /// For a template layer `m` (layer fields): check `params` against the
+    /// template and store the checked values.
+    fn check_template_fields(&self, m: &mut Map<String, Value>) -> Result<Template> {
+        let id = m
+            .get("template")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("a template layer needs template (an id from list_templates)"))?
+            .to_string();
+        let t = self.template(&id)?;
+        let given = match m.get("params") {
+            None | Some(Value::Null) => Map::new(),
+            Some(Value::Object(p)) => p.clone(),
+            Some(_) => bail!("params must be an object of parameter values"),
+        };
+        let checked = t.check_params(&given)?;
+        m.insert("params".into(), Value::Object(checked));
+        Ok(t)
     }
 
     /// Layers as loaded at start-up: all hidden (nothing appears in a call
@@ -121,6 +189,7 @@ impl LayerSet {
             layers,
             rev: 1,
             shown_at: HashMap::new(),
+            lib: TemplateLib::default(),
         }
     }
 
@@ -264,8 +333,23 @@ impl LayerSet {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let id = self.new_id(wanted.as_deref(), &name, &kind)?;
-        let (x, y, w, h) = default_rect(&kind);
+        let tpl = if kind == "template" {
+            let t = m.get("template").and_then(Value::as_str).ok_or_else(|| {
+                anyhow!("a template layer needs template (an id from list_templates)")
+            })?;
+            Some(self.template(t)?)
+        } else {
+            None
+        };
+        // A template layer without a name is named after its template.
+        let hint = match (&tpl, name.trim().is_empty()) {
+            (Some(t), true) => t.id.clone(),
+            _ => name.clone(),
+        };
+        let id = self.new_id(wanted.as_deref(), &hint, &kind)?;
+        let (x, y, w, h) = tpl
+            .as_ref()
+            .map_or_else(|| default_rect(&kind), Template::geometry);
         let z = self.layers.iter().map(|l| l.z).max().map_or(0, |z| z + 1);
         let mut base = json!({
             "id": id, "name": name, "kind": kind,
@@ -299,6 +383,9 @@ impl LayerSet {
             _ => {}
         }
         merge(&mut base, &m)?;
+        if tpl.is_some() {
+            self.check_template_fields(&mut base)?;
+        }
         // Validate everything else before copying any file.
         if let Some(Media::Path(_) | Media::Bytes(_)) = &media {
             let mut probe = base.clone();
@@ -344,7 +431,28 @@ impl LayerSet {
             .as_object()
             .cloned()
             .expect("layer is an object");
+        if let Content::Template {
+            template, params, ..
+        } = &old.content
+        {
+            // A new template starts from its own defaults; params merge.
+            let changed = m
+                .get("template")
+                .is_some_and(|t| t.as_str() != Some(template.as_str()));
+            let start = if changed { Map::new() } else { params.clone() };
+            if let Some(p) = m.get("params") {
+                let merged = merge_params(&start, p)?;
+                m.insert("params".into(), Value::Object(merged));
+            } else if changed {
+                m.insert("params".into(), Value::Object(Map::new()));
+            }
+        }
         merge(&mut base, &m)?;
+        if old.content.kind() == "template"
+            && (m.contains_key("params") || m.contains_key("template"))
+        {
+            self.check_template_fields(&mut base)?;
+        }
         // Check the rest first, then store the file.
         let mut layer = from_json(Value::Object(base.clone()))?;
         if let Some(media) = media {
@@ -505,7 +613,28 @@ impl LayerSet {
                 let mut v = l.to_json();
                 if let Some(o) = v.as_object_mut() {
                     o.remove("html");
-                    o.insert("v".into(), json!(content_hash(l)));
+                    match &l.content {
+                        Content::Template { template, params } => {
+                            // `v` reloads the frame (another template, or its
+                            // HTML changed); `pv` only posts the params.
+                            let t = self.lib.get(template);
+                            let eff = t
+                                .as_ref()
+                                .map_or_else(|| params.clone(), |t| t.effective(params));
+                            let html = t.as_ref().map_or("", |t| t.html.as_str());
+                            let missing = if t.is_none() { "missing" } else { "" };
+                            o.insert(
+                                "v".into(),
+                                json!(hash_of(&format!("template\0{template}\0{missing}\0{html}"))),
+                            );
+                            let eff = Value::Object(eff);
+                            o.insert("pv".into(), json!(hash_of(&eff.to_string())));
+                            o.insert("params".into(), eff);
+                        }
+                        _ => {
+                            o.insert("v".into(), json!(content_hash(l)));
+                        }
+                    }
                 }
                 v
             })
@@ -513,12 +642,184 @@ impl LayerSet {
         json!({ "rev": self.rev, "layers": layers })
     }
 
+    /// A layer as callers see it: its fields, and `template_missing: true`
+    /// for a template layer whose template is gone.
+    pub fn layer_json(&self, l: &Layer) -> Value {
+        let mut v = l.to_json();
+        if let Content::Template { template, .. } = &l.content {
+            if self.lib.get(template).is_none() {
+                v["template_missing"] = json!(true);
+            }
+        }
+        v
+    }
+
+    /// Every layer as [`LayerSet::layer_json`], back to front.
+    pub fn layers_json(&self) -> Vec<Value> {
+        self.layers()
+            .into_iter()
+            .map(|l| self.layer_json(l))
+            .collect()
+    }
+
     /// The HTML fragment of an `html` layer.
     pub fn html_of(&self, id: &str) -> Option<&str> {
         match &self.get(id)?.content {
-            crate::layer::Content::Html { html } => Some(html),
+            Content::Html { html } => Some(html),
             _ => None,
         }
+    }
+
+    /// The document an `html` or `template` layer's frame loads.
+    pub fn layer_page(&self, id: &str) -> Option<String> {
+        match &self.get(id)?.content {
+            Content::Html { html } => Some(crate::scene::layer_page(html)),
+            Content::Template { template, params } => Some(match self.lib.get(template) {
+                Some(t) => crate::scene::template_page(&t, &t.effective(params)),
+                None => crate::scene::missing_page(template),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Every layer as a scene keeps it (visible or not), back to front.
+    pub fn scene_layers(&self) -> Vec<Value> {
+        self.layers().into_iter().map(Layer::to_json).collect()
+    }
+
+    /// Bring back a scene's layers (shown as saved). `replace` removes every
+    /// layer first; otherwise they are added in front, with new ids where
+    /// theirs are taken. Layers that can't come back (template or file
+    /// gone, too many layers) are skipped and named.
+    pub fn load_scene(
+        &mut self,
+        scene: &crate::scenes::Scene,
+        replace: bool,
+        assets: &Assets,
+        now: Instant,
+    ) -> Result<SceneLoad> {
+        if replace {
+            let ids: Vec<String> = self.layers.iter().map(|l| l.id.clone()).collect();
+            for id in ids {
+                self.remove(&id, assets)?;
+            }
+        }
+        let mut out = SceneLoad::default();
+        for l in &scene.layers {
+            let Some(mut m) = l.as_object().cloned() else {
+                continue;
+            };
+            let id = m
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            if let Some(t) = m.get("template").and_then(Value::as_str) {
+                if self.lib.get(t).is_none() {
+                    out.skipped
+                        .push(format!("{id}: template {t:?} no longer exists"));
+                    continue;
+                }
+            }
+            if let Some(a) = m
+                .remove("asset")
+                .and_then(|a| a.as_str().map(str::to_string))
+            {
+                match assets.path_of(&a).filter(|p| p.is_file()) {
+                    Some(p) => {
+                        m.insert("path".into(), json!(p.to_string_lossy()));
+                    }
+                    None => {
+                        out.skipped
+                            .push(format!("{id}: its picture or video file is gone"));
+                        continue;
+                    }
+                }
+            }
+            if self.get(&id).is_some() {
+                m.remove("id");
+            }
+            if !replace {
+                m.remove("z");
+            }
+            match self.add(Value::Object(m), assets, now) {
+                Ok(l) => out.added.push(l.id),
+                Err(e) => out.skipped.push(format!("{id}: {e:#}")),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Save a user template from a request: a full definition, or
+    /// `{from_layer: <html layer id>, id?, name?, …}`, or
+    /// `{copy_of: <template id>, id, name?, …fields to change}`.
+    pub fn save_template(&mut self, req: Value) -> Result<Template> {
+        let mut m = match req {
+            Value::Object(m) => m,
+            _ => bail!("a template is a JSON object"),
+        };
+        if let Some(layer) = m.remove("from_layer") {
+            let lid = layer
+                .as_str()
+                .ok_or_else(|| anyhow!("from_layer must be a layer id"))?;
+            let l = self
+                .get(lid)
+                .ok_or_else(|| anyhow!("no layer {lid:?} (list_layers shows the ids)"))?;
+            let html = match &l.content {
+                Content::Html { html } => html.clone(),
+                _ => bail!(
+                    "from_layer must be an html layer ({lid:?} is a {} layer)",
+                    l.content.kind()
+                ),
+            };
+            let name = m
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if l.name.is_empty() {
+                        l.id.clone()
+                    } else {
+                        l.name.clone()
+                    }
+                });
+            if !m.contains_key("id") {
+                let id = sanitize_id(&name).unwrap_or_else(|| "my-template".into());
+                m.insert("id".into(), json!(id));
+            }
+            m.insert("name".into(), json!(name));
+            m.insert("html".into(), json!(html));
+            m.entry("rect").or_insert(json!([l.x, l.y, l.w, l.h]));
+            m.entry("category").or_insert(json!("mine"));
+        } else if let Some(src) = m.remove("copy_of") {
+            let sid = src
+                .as_str()
+                .ok_or_else(|| anyhow!("copy_of must be a template id"))?;
+            let t = self.template(sid)?;
+            ensure!(m.contains_key("id"), "give the copy an id (a-z, 0-9 and -)");
+            let mut base = match serde_json::to_value(&t)? {
+                Value::Object(b) => b,
+                _ => unreachable!("a template serializes to an object"),
+            };
+            base.insert("name".into(), json!(format!("{} (copy)", t.name)));
+            base.insert("category".into(), json!("mine"));
+            for (k, v) in m {
+                base.insert(k, v);
+            }
+            m = base;
+        }
+        let t = self.lib.save(Value::Object(m))?;
+        // Layers using it reload (their `v` covers the template HTML).
+        self.touch();
+        Ok(t)
+    }
+
+    /// Delete a user template; layers using it show "template missing".
+    pub fn delete_template(&mut self, id: &str) -> Result<()> {
+        self.lib.delete(id)?;
+        self.touch();
+        Ok(())
     }
 }
 
@@ -762,6 +1063,195 @@ mod tests {
         assert_ne!(s.state_json()["layers"][0]["v"], v1.as_str());
         assert_eq!(s.html_of("h"), Some("<b>y</b>"));
         assert_eq!(st["rev"], 1);
+    }
+
+    #[test]
+    fn template_layer_add_update_partial_params() {
+        let (_d, a, mut s, now) = setup();
+        let l = s
+            .add(
+                json!({"kind": "template", "template": "lower-third",
+                    "params": {"title": "Alex", "subtitle": "CTO", "theme": "news"}}),
+                &a,
+                now,
+            )
+            .unwrap();
+        assert_eq!(l.id, "lower-third");
+        assert_eq!(
+            (l.x, l.y, l.w, l.h),
+            (0.05, 0.74, 0.5, 0.15),
+            "the template's rect"
+        );
+        let l = s
+            .update(
+                &l.id,
+                json!({"params": {"subtitle": null, "title": "Sam"}}),
+                &a,
+                now,
+            )
+            .unwrap();
+        match &l.content {
+            Content::Template { params, .. } => {
+                assert_eq!(params["title"], "Sam");
+                assert_eq!(params["theme"], "news", "untouched params stay");
+                assert!(params.get("subtitle").is_none(), "null resets to default");
+            }
+            c => panic!("{c:?}"),
+        }
+        for (spec, msg) in [
+            (json!({"kind": "template"}), "needs template"),
+            (
+                json!({"kind": "template", "template": "nope"}),
+                "unknown template",
+            ),
+            (
+                json!({"kind": "template", "template": "lower-third"}),
+                "\"title\" is required",
+            ),
+            (
+                json!({"kind": "template", "template": "lower-third", "params": {"title": "x", "size": 3}}),
+                "unknown param \"size\"",
+            ),
+            (
+                json!({"kind": "template", "template": "lower-third", "params": [1]}),
+                "object",
+            ),
+        ] {
+            let e = s.add(spec.clone(), &a, now).unwrap_err().to_string();
+            assert!(e.contains(msg), "{spec}: {e}");
+        }
+        let e = s
+            .update("lower-third", json!({"params": {"title": ""}}), &a, now)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("required"), "{e}");
+        // Another template: its own defaults, params checked against it.
+        let l = s
+            .update(
+                "lower-third",
+                json!({"template": "countdown", "params": {"label": "Back in"}}),
+                &a,
+                now,
+            )
+            .unwrap();
+        assert!(
+            matches!(&l.content, Content::Template { template, .. } if template == "countdown")
+        );
+        // A full-frame template covers the output.
+        let c = s
+            .add(
+                json!({"kind": "template", "template": "starting-soon"}),
+                &a,
+                now,
+            )
+            .unwrap();
+        assert_eq!((c.x, c.y, c.w, c.h), (0.0, 0.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn params_change_keeps_v() {
+        let (_d, a, mut s, now) = setup();
+        s.add(
+            json!({"kind": "template", "template": "countdown", "id": "c", "params": {"duration": 60}}),
+            &a,
+            now,
+        )
+        .unwrap();
+        let st = s.state_json();
+        let l = &st["layers"][0];
+        assert_eq!(l["params"]["duration"], 60);
+        assert_eq!(l["params"]["label"], "Starting in", "defaults filled");
+        let (v, pv) = (l["v"].clone(), l["pv"].clone());
+        s.update("c", json!({"params": {"duration": 30}}), &a, now)
+            .unwrap();
+        let st = s.state_json();
+        assert_eq!(st["layers"][0]["v"], v, "same frame");
+        assert_ne!(st["layers"][0]["pv"], pv, "new params");
+        s.update("c", json!({"x": 0.1}), &a, now).unwrap();
+        assert_eq!(s.state_json()["layers"][0]["v"], v);
+    }
+
+    #[test]
+    fn layer_page_escapes_params() {
+        let (_d, a, mut s, now) = setup();
+        s.add(
+            json!({"kind": "template", "template": "lower-third", "id": "t",
+                "params": {"title": "</script><script>alert(1)</script>"}}),
+            &a,
+            now,
+        )
+        .unwrap();
+        let p = s.layer_page("t").unwrap();
+        assert_eq!(
+            p.matches("</script>").count(),
+            3,
+            "runtime, params, template: {p}"
+        );
+        assert!(p.contains("\\u003c/script\\u003e"));
+        assert!(p.contains("P2C.onParams"));
+        s.add(json!({"kind": "title", "text": "x", "id": "x"}), &a, now)
+            .unwrap();
+        assert!(s.layer_page("x").is_none());
+    }
+
+    #[test]
+    fn missing_template_is_reported() {
+        let (_d, a, mut s, now) = setup();
+        let lib = TemplateLib::builtin_only();
+        lib.save(json!({"id": "mine", "name": "Mine", "html": "<i>x</i><script>P2C.onParams(function(){})</script>"}))
+            .unwrap();
+        s.set_templates(lib.clone());
+        s.add(
+            json!({"kind": "template", "template": "mine", "id": "m"}),
+            &a,
+            now,
+        )
+        .unwrap();
+        assert!(s.layers_json()[0].get("template_missing").is_none());
+        lib.delete("mine").unwrap();
+        assert_eq!(s.layers_json()[0]["template_missing"], true);
+        assert!(s.layer_page("m").unwrap().contains("missing"));
+        let st = s.state_json();
+        assert!(st["layers"][0]["v"].is_string());
+        // Hiding and moving still work; changing params says why not.
+        s.update("m", json!({"visible": false, "x": 0.2}), &a, now)
+            .unwrap();
+        let e = s
+            .update("m", json!({"params": {"a": 1}}), &a, now)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unknown template"), "{e}");
+    }
+
+    #[test]
+    fn templates_saved_from_layers_and_copies() {
+        let (_d, a, mut s, now) = setup();
+        s.add(
+            json!({"kind": "html", "id": "chart", "name": "Sales chart", "html": "<b>x</b>"}),
+            &a,
+            now,
+        )
+        .unwrap();
+        let t = s.save_template(json!({"from_layer": "chart"})).unwrap();
+        assert_eq!(
+            (t.id.as_str(), t.name.as_str()),
+            ("sales-chart", "Sales chart")
+        );
+        assert_eq!(t.html, "<b>x</b>");
+        let c = s
+            .save_template(json!({"copy_of": "lower-third", "id": "my-lt", "description": "mine"}))
+            .unwrap();
+        assert_eq!(c.html, crate::builtin("lower-third").unwrap().html);
+        assert_eq!(c.category, "mine");
+        assert!(!c.builtin);
+        assert!(s.save_template(json!({"copy_of": "lower-third"})).is_err());
+        assert!(s.save_template(json!({"from_layer": "nope"})).is_err());
+        s.add(
+            json!({"kind": "template", "template": "my-lt", "params": {"title": "x"}}),
+            &a,
+            now,
+        )
+        .unwrap();
     }
 
     #[test]

@@ -143,6 +143,37 @@
     border-radius: 6px; padding: 6px 9px;
   }
   .ovadd select { background: var(--well); border: 1px solid var(--line); border-radius: 6px; padding: 6px; }
+  /* Overlays tabs: Layers, Templates, Scenes. */
+  .ovtabs { margin-bottom: 10px; }
+  .seg .btn[aria-selected=true] { background: var(--brand); color: #fff; border-color: var(--brand); }
+  .tplbar { display: flex; gap: 6px; margin-bottom: 8px; }
+  .tplbar select, .tplbar input, .tform input[type=text], .tform input[type=number], .tform select,
+  .tform textarea, .tpled input, .tpled select, .tpled textarea, .scnsave input[type=text] {
+    width: 100%; min-width: 0; background: var(--well); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px;
+  }
+  .tplbar select { width: auto; max-width: 45%; }
+  textarea { font: inherit; color: inherit; resize: vertical; }
+  .mono { font-family: ui-monospace, Consolas, "Cascadia Mono", monospace; font-size: 12px; }
+  .tplist { max-height: 280px; overflow-y: auto; }
+  .tplist li { padding: 0; }
+  .tcard {
+    display: grid; gap: 1px; width: 100%; min-width: 0; text-align: left; background: none; border: 0;
+    padding: 5px 8px; cursor: pointer; border-radius: 6px;
+  }
+  .tcard .top { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+  .tcard .ds { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tag { font-size: 11px; background: var(--brand-soft); color: var(--brand-dark); border-radius: 3px; padding: 0 5px; white-space: nowrap; }
+  .tph { font-size: 14px; margin: 10px 0 2px; }
+  .tform .tfield, .tpled .tfield { margin: 8px 0; }
+  .tform label, .tpled label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  .tform .tfhelp { margin: 2px 0 0; font-size: 12px; }
+  .tfrow { display: flex; gap: 8px; align-items: center; }
+  .tform .tfrow label { display: inline; font-weight: 400; margin: 0; }
+  .tform input[type=color] { width: 48px; height: 28px; padding: 0 2px; border: 1px solid var(--line); border-radius: 6px; background: var(--well); }
+  .btnrow { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .scnlist li { flex-wrap: wrap; cursor: default; }
+  .scnlist .meta { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; flex: 1 1 100%; }
+  .scnsave { display: grid; gap: 6px; margin-top: 10px; }
   .seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 0; }
   .seg .btn { border-radius: 0; font-size: 13px; padding: 5px 6px; }
   .seg .btn:first-child { border-radius: 6px 0 0 6px; }
@@ -396,8 +427,15 @@
     <section class="panel" id="ovPanel" aria-labelledby="h-ov">
       <h2 id="h-ov">Overlays</h2>
       <p class="sub" style="margin-top:0">Titles, tickers and graphics drawn over everything, you included. Agents can add charts, videos and more. Click one to place it in the preview.</p>
+      <div class="seg ovtabs" role="tablist" aria-label="Overlay views">
+        <button class="btn" role="tab" id="ovTabLayers" data-ovtab="layers" aria-controls="ovPaneLayers" aria-selected="true">Layers</button>
+        <button class="btn" role="tab" id="ovTabTemplates" data-ovtab="templates" aria-controls="ovPaneTemplates" aria-selected="false" tabindex="-1">Templates</button>
+        <button class="btn" role="tab" id="ovTabScenes" data-ovtab="scenes" aria-controls="ovPaneScenes" aria-selected="false" tabindex="-1">Scenes</button>
+      </div>
+      <div id="ovPaneLayers" role="tabpanel" aria-labelledby="ovTabLayers">
       <ul class="ovlist" id="ovList" aria-label="Overlay layers, front first"></ul>
       <p class="sub" id="ovEmpty">No overlays yet.</p>
+      <div id="ovParams" aria-live="polite"></div>
       <div class="seg" role="group" aria-label="Quick add">
         <button class="btn" data-ovkind="title" aria-pressed="true">Title</button>
         <button class="btn" data-ovkind="ticker" aria-pressed="false">Ticker</button>
@@ -414,6 +452,61 @@
       <div class="row" style="margin-top:8px">
         <span class="sub" style="margin:0">Hide every overlay at once</span>
         <button class="btn" id="ovHideAll">Hide all</button>
+      </div>
+      </div>
+      <div id="ovPaneTemplates" role="tabpanel" aria-labelledby="ovTabTemplates" hidden>
+        <div class="tplbar">
+          <select id="tplCat" aria-label="Template category"><option value="">All</option></select>
+          <input id="tplSearch" type="search" spellcheck="false" autocomplete="off" aria-label="Search templates" placeholder="Search">
+        </div>
+        <div class="btnrow">
+          <button class="btn" id="tplNew" title="Write a template of your own">New</button>
+          <button class="btn" id="tplImport" title="Load a .p2c-template.json file">Import…</button>
+          <input type="file" id="tplImportFile" accept=".json,application/json" hidden>
+        </div>
+        <ul class="ovlist tplist" id="tplList" aria-label="Templates"></ul>
+        <p class="sub" id="tplEmpty" hidden>No templates match.</p>
+        <div id="tplDetail" hidden>
+          <h3 class="tph" id="tplName"></h3>
+          <p class="sub" id="tplDesc" style="margin-top:0"></p>
+          <div class="tform" id="tplForm"></div>
+          <div class="btnrow">
+            <button class="btn primary" id="tplAdd">Add</button>
+            <button class="btn" id="tplEdit">Edit</button>
+            <button class="btn" id="tplDup" title="Make an editable copy of your own">Duplicate</button>
+            <button class="btn" id="tplExport" title="Download as a file to share">Export</button>
+            <button class="btn" id="tplDelete">Delete</button>
+          </div>
+        </div>
+        <div class="tpled" id="tplEditor" hidden>
+          <h3 class="tph" id="tplEdTitle">New template</h3>
+          <div class="tfield"><label for="tplEdId">Id (a-z, 0-9 and -)</label><input type="text" id="tplEdId" spellcheck="false" autocomplete="off"></div>
+          <div class="tfield"><label for="tplEdName">Name</label><input type="text" id="tplEdName" autocomplete="off"></div>
+          <div class="tfield"><label for="tplEdCat">Category</label><select id="tplEdCat"></select></div>
+          <div class="tfield"><label for="tplEdDesc">Description</label><input type="text" id="tplEdDesc" autocomplete="off"></div>
+          <div class="tfield"><label for="tplEdParams">Parameters (JSON list)</label><textarea class="mono" id="tplEdParams" rows="5" spellcheck="false"></textarea></div>
+          <div class="tfield"><label for="tplEdExample">Example values (JSON object)</label><textarea class="mono" id="tplEdExample" rows="3" spellcheck="false"></textarea></div>
+          <div class="tfield"><label for="tplEdHtml">HTML</label><textarea class="mono" id="tplEdHtml" rows="10" spellcheck="false"></textarea></div>
+          <div class="btnrow">
+            <button class="btn primary" id="tplEdSave">Save</button>
+            <button class="btn" id="tplEdCancel">Cancel</button>
+          </div>
+        </div>
+        <div class="state" id="tplState" role="status"></div>
+      </div>
+      <div id="ovPaneScenes" role="tabpanel" aria-labelledby="ovTabScenes" hidden>
+        <p class="sub" style="margin-top:0">A scene keeps the overlays (and, if you like, the background and webcam placement) to bring back in one click.</p>
+        <ul class="ovlist scnlist" id="scnList" aria-label="Saved scenes"></ul>
+        <p class="sub" id="scnEmpty" hidden>No scenes saved yet.</p>
+        <div class="scnsave">
+          <input type="text" id="scnName" autocomplete="off" aria-label="Scene name" placeholder="Scene name">
+          <div class="row" style="margin:0">
+            <input type="checkbox" id="scnBg" checked><label for="scnBg">Background</label>
+            <input type="checkbox" id="scnCam" checked><label for="scnCam">Webcam</label>
+            <button class="btn primary" id="scnSave">Save current</button>
+          </div>
+        </div>
+        <div class="state" id="scnState" role="status"></div>
       </div>
       <div class="state" id="ovState"></div>
     </section>
@@ -1249,6 +1342,7 @@
       ul.appendChild(li);
     });
     layoutOvSel();
+    renderOvParams();
   }
   function layoutOvSel() {
     const el = $("ovsel"), l = layers.find((x) => x.id === ovSel);
@@ -1331,6 +1425,479 @@
     loadLayers();
   });
   new ResizeObserver(layoutOvSel).observe(screen);
+
+  // ---------- overlay tabs, templates, scenes ----------
+  // Names, descriptions, help texts and values come from users and agents:
+  // they go in as text (textContent / value), never as markup.
+  function mk(tag, props, ...kids) {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(props || {})) {
+      if (v === undefined || v === null) continue;
+      if (k === "text") e.textContent = v;
+      else if (k === "class") e.className = v;
+      else if (k === "for" || k === "role" || k.startsWith("aria-")) e.setAttribute(k, v);
+      else e[k] = v;
+    }
+    e.append(...kids.filter(Boolean));
+    return e;
+  }
+  const apiDelete = (path) => fetch(path, { method: "DELETE", headers: { "x-p2c-token": token } });
+  const NOT_RESPONDING = "error: Page2Cam is not responding.";
+  const quote = (s) => "“" + s + "”";
+
+  const OV_TABS = ["layers", "templates", "scenes"];
+  const ovTabBtns = [...document.querySelectorAll("[data-ovtab]")];
+  function showOvTab(name, focus) {
+    if (!OV_TABS.includes(name)) name = "layers";
+    for (const b of ovTabBtns) {
+      const on = b.dataset.ovtab === name;
+      b.setAttribute("aria-selected", String(on));
+      b.tabIndex = on ? 0 : -1;
+      $(b.getAttribute("aria-controls")).hidden = !on;
+      if (on && focus) b.focus();
+    }
+    store.set("ovTab", name);
+    if (name === "templates") loadTemplates(false);
+    if (name === "scenes") loadScenes();
+  }
+  ovTabBtns.forEach((b, i) => {
+    b.addEventListener("click", () => showOvTab(b.dataset.ovtab));
+    b.addEventListener("keydown", (e) => {
+      const n = ovTabBtns.length;
+      const j = e.key === "ArrowRight" ? (i + 1) % n : e.key === "ArrowLeft" ? (i + n - 1) % n
+        : e.key === "Home" ? 0 : e.key === "End" ? n - 1 : -1;
+      if (j < 0) return;
+      e.preventDefault();
+      showOvTab(ovTabBtns[j].dataset.ovtab, true);
+    });
+  });
+
+  // Full templates (GET /api/templates/<id>), kept until one is saved or deleted.
+  const tplCache = new Map();
+  async function getTemplate(id) {
+    if (tplCache.has(id)) return tplCache.get(id);
+    const r = await api("/api/templates/" + encodeURIComponent(id));
+    if (!r.ok) throw new Error(await errorText(r));
+    const t = await r.json();
+    tplCache.set(id, t);
+    return t;
+  }
+
+  // A form for a template's parameters, built from `all_params`. A field shows
+  // values[name], else (useExample) the template's example, else the default.
+  // onChange(name) is called as a field changes.
+  const MAX_TPL_PICTURE = 1024 * 1024, MAX_TPL_URI = 1024 * 1024 + 64 * 1024;
+  let tfSeq = 0;
+  const lines = (s) => s.split("\n").map((x) => x.trim()).filter(Boolean);
+  function paramForm(box, tpl, values, useExample, onChange) {
+    const fields = [];
+    box.replaceChildren();
+    for (const p of tpl.all_params || []) {
+      const id = "tf" + (++tfSeq), helpId = id + "h";
+      const pick = [values ? values[p.name] : undefined, useExample && tpl.example ? tpl.example[p.name] : undefined, p.default]
+        .find((x) => x !== undefined && x !== null);
+      const v = pick === undefined ? "" : pick;
+      const text = (ph) => mk("input", {
+        type: "text", id, placeholder: ph, autocomplete: "off",
+        value: typeof v === "object" ? JSON.stringify(v) : String(v),
+      });
+      let ctl, get, extra = null, help = p.help || "";
+      switch (p.type) {
+        case "longtext":
+          ctl = mk("textarea", { id, rows: 3, value: String(v) });
+          get = () => ctl.value;
+          break;
+        case "number":
+          ctl = mk("input", { type: "number", id, step: "any", min: p.min, max: p.max, value: v === "" ? "" : String(v) });
+          get = () => (ctl.value === "" ? null : Number(ctl.value));
+          break;
+        case "bool":
+          ctl = mk("input", { type: "checkbox", id, checked: v === true });
+          get = () => ctl.checked;
+          break;
+        case "colour": {
+          const hex = /^#[0-9a-f]{6}$/i.test(v) ? v : "";
+          ctl = mk("input", { type: "color", id, value: hex || "#0b63f0" });
+          const theme = mk("input", { type: "checkbox", id: id + "t", checked: !hex });
+          ctl.addEventListener("input", () => { theme.checked = false; });
+          extra = mk("span", { class: "tfrow" }, theme, mk("label", { for: id + "t", text: "Theme colour" }));
+          get = () => (theme.checked ? "" : ctl.value);
+          break;
+        }
+        case "choice": {
+          const opts = (p.options || []).map(String);
+          ctl = mk("select", { id }, ...opts.map((o) => new Option(o, o)));
+          if (v !== "" && !opts.includes(String(v))) ctl.add(new Option(String(v), String(v)));
+          if (v !== "") ctl.value = String(v);
+          get = () => ctl.value;
+          break;
+        }
+        case "list":
+          ctl = mk("textarea", { id, rows: 3, value: Array.isArray(v) ? v.join("\n") : String(v) });
+          get = () => lines(ctl.value);
+          help = (help ? help + " " : "") + "One entry per line.";
+          break;
+        case "table":
+          ctl = mk("textarea", {
+            id, rows: 4,
+            value: Array.isArray(v) ? v.map((r) => (Array.isArray(r) ? r : [r]).join(" | ")).join("\n") : String(v),
+          });
+          get = () => lines(ctl.value).map((r) => r.split("|").map((c) => c.trim()));
+          help = (help ? help + " " : "") + "One row per line, cells separated by |"
+            + (p.columns && p.columns.length ? ": " + p.columns.join(" | ") : ".");
+          break;
+        case "datetime":
+          ctl = text("18:30 or 2026-12-31T18:30");
+          get = () => ctl.value.trim();
+          break;
+        case "duration":
+          ctl = text("Seconds, or m:ss");
+          get = () => {
+            const s = ctl.value.trim();
+            return s === "" ? null : /^\d+(\.\d+)?$/.test(s) ? Number(s) : s;
+          };
+          break;
+        case "asset": {
+          ctl = text("https://… or pick a picture");
+          const file = mk("input", { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif,image/svg+xml", hidden: true });
+          const pickBtn = mk("button", { class: "btn", type: "button", text: "Picture…", "aria-label": "Pick a picture for " + p.name });
+          const note = mk("span", { class: "state err" });
+          pickBtn.addEventListener("click", () => file.click());
+          file.addEventListener("change", () => {
+            const f = file.files[0];
+            file.value = ""; note.textContent = "";
+            if (!f) return;
+            if (f.size > MAX_TPL_PICTURE) { note.textContent = "The picture is larger than 1 MB."; return; }
+            const rd = new FileReader();
+            rd.onload = () => {
+              if (rd.result.length > MAX_TPL_URI) { note.textContent = "The picture is too large (keep it under about 750 KB)."; return; }
+              ctl.value = rd.result;
+              if (onChange) onChange(p.name);
+            };
+            rd.onerror = () => { note.textContent = "Could not read the picture."; };
+            rd.readAsDataURL(f);
+          });
+          extra = mk("span", { class: "tfrow" }, pickBtn, file, note);
+          get = () => ctl.value.trim();
+          break;
+        }
+        default: // text, url, qr
+          ctl = text(p.type === "url" ? "https://…" : undefined);
+          get = () => ctl.value;
+      }
+      if (help) ctl.setAttribute("aria-describedby", helpId);
+      const wrap = mk("div", { class: "tfield" });
+      if (p.type === "bool") wrap.append(mk("span", { class: "tfrow" }, ctl, mk("label", { for: id, text: p.name })));
+      else wrap.append(mk("label", { for: id, text: p.name + (p.required ? " *" : "") }), ctl);
+      if (extra) wrap.append(extra);
+      if (help) wrap.append(mk("p", { class: "sub tfhelp", id: helpId, text: help }));
+      if (onChange) {
+        wrap.addEventListener("input", () => onChange(p.name));
+        wrap.addEventListener("change", () => onChange(p.name));
+      }
+      box.append(wrap);
+      fields.push({ name: p.name, get });
+    }
+    return {
+      get: (name) => { const f = fields.find((x) => x.name === name); return f ? f.get() : undefined; },
+      // Empty numbers/durations are left out (the default applies).
+      values: () => Object.fromEntries(fields.map((f) => [f.name, f.get()]).filter((e) => e[1] !== null)),
+    };
+  }
+
+  // POST /api/templates: the saved template, or null (the error shown in stateId).
+  async function saveTemplate(body, stateId) {
+    try {
+      const r = await api("/api/templates", body);
+      if (!r.ok) { setState(stateId, "error: " + await errorText(r)); return null; }
+      const t = await r.json();
+      tplCache.set(t.id, t);
+      tplAll = null; ovFormKey = "";
+      return t;
+    } catch { setState(stateId, NOT_RESPONDING); return null; }
+  }
+
+  // ---- selected layer: live parameters ----
+  // Under the list: a template layer's parameters (sent ~300 ms after a
+  // change), or "Save as template" for an HTML layer. Rebuilt only when the
+  // selection or its template changes, so the 1.5 s reload never interrupts typing.
+  let ovFormKey = "", ovForm = null, ovPendId = null, ovPendTimer = 0;
+  const ovPend = new Set();
+  function flushOvParams() {
+    clearTimeout(ovPendTimer);
+    const id = ovPendId, form = ovForm;
+    ovPendId = null;
+    if (!id || !form || !ovPend.size) { ovPend.clear(); return; }
+    const params = {};
+    for (const n of ovPend) params[n] = form.get(n);
+    ovPend.clear();
+    ovChange(id, { params });
+  }
+  function queueOvParam(id, name) {
+    if (ovPendId && ovPendId !== id) flushOvParams();
+    ovPendId = id; ovPend.add(name);
+    clearTimeout(ovPendTimer);
+    ovPendTimer = setTimeout(flushOvParams, 300);
+  }
+  function renderOvParams() {
+    const l = layers.find((x) => x.id === ovSel);
+    const key = l ? [l.id, l.kind, l.template || "", l.template_missing ? 1 : 0].join("\n") : "";
+    if (key === ovFormKey) return;
+    flushOvParams();
+    ovFormKey = key; ovForm = null;
+    const box = $("ovParams");
+    box.replaceChildren();
+    if (!l) return;
+    if (l.kind === "html") {
+      const b = mk("button", { class: "btn", type: "button", text: "Save as template", title: "Keep this HTML overlay as a template of your own" });
+      b.addEventListener("click", () => saveLayerAsTemplate(l));
+      box.append(mk("div", { class: "btnrow" }, b));
+      return;
+    }
+    if (l.kind !== "template") return;
+    if (l.template_missing) {
+      box.append(mk("p", { class: "state err", text: "Template missing: " + (l.template || "") }));
+      return;
+    }
+    box.append(mk("p", { class: "sub", text: "Loading the parameters…" }));
+    getTemplate(l.template).then((t) => {
+      if (ovFormKey !== key) return;
+      const form = mk("div", { class: "tform" });
+      box.replaceChildren(mk("p", { class: "sub", text: t.name + ": changes show live" }), form);
+      ovForm = paramForm(form, t, l.params || {}, false, (name) => queueOvParam(l.id, name));
+    }).catch((e) => {
+      if (ovFormKey === key) box.replaceChildren(mk("p", { class: "state err", text: "error: " + e.message }));
+    });
+  }
+  async function saveLayerAsTemplate(l) {
+    const name = prompt("Name of the new template", layerLabel(l));
+    if (!name || !name.trim()) return;
+    const t = await saveTemplate({ from_layer: l.id, name: name.trim() }, "ovState");
+    if (t) setState("ovState", "Saved as template " + quote(t.name) + " (see Templates).");
+  }
+
+  // ---- Templates tab ----
+  let tplAll = null, tplCats = [], tplSelId = null, tplCur = null, tplForm = null, tplEditBase = {};
+  const catLabel = (id) => (tplCats.find((c) => c.id === id) || { label: id }).label;
+  async function loadTemplates(force) {
+    if (tplAll && !force) { renderTplList(); return; }
+    try {
+      const r = await api("/api/templates");
+      if (!r.ok) { setState("tplState", "error: " + await errorText(r)); return; }
+      const j = await r.json();
+      tplAll = j.templates || []; tplCats = j.categories || [];
+    } catch { setState("tplState", NOT_RESPONDING); return; }
+    const sel = $("tplCat"), keep = sel.value;
+    sel.replaceChildren(new Option("All", ""), ...tplCats.map((c) => new Option(c.label, c.id)));
+    sel.value = tplCats.some((c) => c.id === keep) ? keep : "";
+    $("tplEdCat").replaceChildren(...tplCats.map((c) => new Option(c.label, c.id)));
+    renderTplList();
+  }
+  function renderTplList() {
+    const cat = $("tplCat").value, q = $("tplSearch").value.trim().toLowerCase();
+    const list = (tplAll || []).filter((t) => (!cat || t.category === cat)
+      && (!q || [t.name, t.description, t.id].some((s) => (s || "").toLowerCase().includes(q))));
+    $("tplEmpty").hidden = !tplAll || list.length > 0;
+    $("tplList").replaceChildren(...list.map((t) => {
+      const b = mk("button", { class: "tcard", type: "button", title: t.id, "aria-pressed": String(t.id === tplSelId) },
+        mk("span", { class: "top" },
+          mk("span", { class: "nm", text: t.name }),
+          mk("span", { class: "kd", text: catLabel(t.category) }),
+          t.builtin ? null : mk("span", { class: "tag", text: "mine" })),
+        mk("span", { class: "ds", text: t.description || "" }));
+      b.addEventListener("click", () => selectTemplate(t.id));
+      return mk("li", { class: t.id === tplSelId ? "sel" : "" }, b);
+    }));
+  }
+  $("tplCat").addEventListener("change", renderTplList);
+  $("tplSearch").addEventListener("input", renderTplList);
+  async function selectTemplate(id) {
+    tplSelId = id;
+    $("tplEditor").hidden = true;
+    renderTplList();
+    let t;
+    try { t = await getTemplate(id); } catch (e) {
+      setState("tplState", "error: " + e.message); $("tplDetail").hidden = true; return;
+    }
+    if (tplSelId !== id) return;
+    tplCur = t;
+    setState("tplState", "");
+    $("tplName").textContent = t.name;
+    $("tplDesc").textContent = t.description || "";
+    tplForm = paramForm($("tplForm"), t, null, true, null);
+    const mine = !t.builtin;
+    ["tplEdit", "tplDelete", "tplExport"].forEach((b) => { $(b).hidden = !mine; });
+    $("tplDup").hidden = mine;
+    $("tplDetail").hidden = false;
+  }
+  async function showSaved(t, verb) {
+    await loadTemplates(true);
+    await selectTemplate(t.id);
+    setState("tplState", verb + " " + quote(t.name) + ".");
+  }
+  $("tplAdd").addEventListener("click", async () => {
+    if (!tplCur || !tplForm) return;
+    try {
+      const r = await api("/api/layers", { kind: "template", template: tplCur.id, params: tplForm.values() });
+      if (!r.ok) { setState("tplState", "error: " + await errorText(r)); return; }
+      ovSel = (await r.json()).id;
+    } catch { setState("tplState", NOT_RESPONDING); return; }
+    setState("tplState", "");
+    showOvTab("layers", true);
+    loadLayers();
+  });
+  $("tplDup").addEventListener("click", async () => {
+    if (!tplCur) return;
+    const id = prompt("Id for your copy (a-z, 0-9 and -)", tplCur.id + "-mine");
+    if (!id || !id.trim()) return;
+    const t = await saveTemplate({ copy_of: tplCur.id, id: id.trim(), name: tplCur.name + " (copy)" }, "tplState");
+    if (t) await showSaved(t, "Copied as");
+  });
+  $("tplExport").addEventListener("click", () => {
+    if (!tplCur) return;
+    const def = { format: "page2cam-template/1", ...tplCur };
+    delete def.all_params; delete def.builtin;
+    const url = URL.createObjectURL(new Blob([JSON.stringify(def, null, 2)], { type: "application/json" }));
+    const a = mk("a", { href: url, download: tplCur.id + ".p2c-template.json" });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  });
+  $("tplDelete").addEventListener("click", async () => {
+    if (!tplCur || !confirm("Delete the template " + quote(tplCur.name) + "? Overlays made from it show “Template missing”.")) return;
+    const id = tplCur.id;
+    try {
+      const r = await apiDelete("/api/templates/" + encodeURIComponent(id));
+      if (!r.ok) { setState("tplState", "error: " + await errorText(r)); return; }
+    } catch { setState("tplState", NOT_RESPONDING); return; }
+    tplCache.delete(id); tplCur = null; tplSelId = null;
+    $("tplDetail").hidden = true;
+    await loadTemplates(true);
+    setState("tplState", "Deleted.");
+    loadLayers();
+  });
+  // A starting point for New (P2C.* is the template runtime the scene provides).
+  const NEW_TPL = {
+    id: "", name: "", category: "mine", description: "",
+    params: [{ name: "text", type: "text", default: "Hello", help: "The text to show" }],
+    example: { text: "Hello" },
+    html: "<style>\n  .box{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:40vh}\n</style>\n"
+      + "<div class=\"box p2c-panel\" id=\"t\"></div>\n<script>\nP2C.onParams(function (p) {\n  P2C.text(P2C.$(\"#t\"), p.text);\n});\n<\/script>\n",
+  };
+  function openEditor(t) {
+    const d = t || NEW_TPL;
+    tplEditBase = t ? { rect: t.rect, update: t.update, full_frame: t.full_frame } : {};
+    $("tplEdTitle").textContent = t ? "Edit " + quote(t.name) : "New template";
+    $("tplEdId").value = d.id;
+    $("tplEdName").value = d.name;
+    const cat = $("tplEdCat");
+    if (![...cat.options].some((o) => o.value === d.category)) cat.add(new Option(d.category, d.category));
+    cat.value = d.category;
+    $("tplEdDesc").value = d.description || "";
+    $("tplEdParams").value = JSON.stringify(d.params || [], null, 2);
+    $("tplEdExample").value = JSON.stringify(d.example || {}, null, 2);
+    $("tplEdHtml").value = d.html || "";
+    $("tplDetail").hidden = true;
+    $("tplEditor").hidden = false;
+    setState("tplState", "");
+    $("tplEdId").focus();
+  }
+  $("tplNew").addEventListener("click", () => openEditor(null));
+  $("tplEdit").addEventListener("click", () => { if (tplCur) openEditor(tplCur); });
+  $("tplEdCancel").addEventListener("click", () => { $("tplEditor").hidden = true; $("tplDetail").hidden = !tplCur; });
+  $("tplEdSave").addEventListener("click", async () => {
+    const parse = (id, what, empty) => {
+      try { return JSON.parse($(id).value.trim() || empty); } catch (e) {
+        setState("tplState", "error: " + what + " are not valid JSON: " + e.message); return undefined;
+      }
+    };
+    const params = parse("tplEdParams", "Parameters", "[]");
+    if (params === undefined) return;
+    const example = parse("tplEdExample", "Example values", "{}");
+    if (example === undefined) return;
+    const t = await saveTemplate({
+      ...tplEditBase, id: $("tplEdId").value.trim(), name: $("tplEdName").value.trim(),
+      category: $("tplEdCat").value || "mine", description: $("tplEdDesc").value.trim(),
+      params, example, html: $("tplEdHtml").value,
+    }, "tplState");
+    if (t) await showSaved(t, "Saved");
+  });
+  $("tplImport").addEventListener("click", () => $("tplImportFile").click());
+  $("tplImportFile").addEventListener("change", async () => {
+    const f = $("tplImportFile").files[0];
+    $("tplImportFile").value = "";
+    if (!f) return;
+    let def;
+    try { def = JSON.parse(await f.text()); } catch {
+      setState("tplState", "error: " + f.name + " is not a template file (JSON)."); return;
+    }
+    const t = await saveTemplate(def, "tplState");
+    if (t) await showSaved(t, "Imported");
+  });
+
+  // ---- Scenes tab ----
+  async function loadScenes() {
+    try {
+      const r = await api("/api/scenes");
+      if (!r.ok) { setState("scnState", "error: " + await errorText(r)); return; }
+      renderScenes((await r.json()).scenes || []);
+    } catch { setState("scnState", NOT_RESPONDING); }
+  }
+  function renderScenes(list) {
+    $("scnEmpty").hidden = list.length > 0;
+    $("scnList").replaceChildren(...list.map((s) => {
+      const act = (text, label, title, fn) => {
+        const b = mk("button", { class: "btn", type: "button", text, title, "aria-label": label });
+        b.addEventListener("click", fn);
+        return b;
+      };
+      return mk("li", {},
+        mk("span", { class: "nm", text: s.name, title: s.id }),
+        act("Load", "Load " + s.name, "Replace the overlays with this scene", () => loadScene(s, "replace")),
+        act("Add", "Add " + s.name, "Add this scene's overlays to the ones you have", () => loadScene(s, "add")),
+        act("×", "Delete " + s.name, "Delete this scene", () => deleteScene(s)),
+        mk("span", { class: "meta" },
+          mk("span", { class: "kd", text: s.layers + (s.layers === 1 ? " layer" : " layers") }),
+          s.has_background ? mk("span", { class: "tag", text: "background" }) : null,
+          s.has_webcam ? mk("span", { class: "tag", text: "webcam" }) : null));
+    }));
+  }
+  async function loadScene(s, mode) {
+    setState("scnState", "Loading " + quote(s.name) + "…");
+    let res;
+    try {
+      const r = await api("/api/scenes/" + encodeURIComponent(s.id) + "/load", { mode });
+      if (!r.ok) { setState("scnState", "error: " + await errorText(r)); return; }
+      res = await r.json();
+    } catch { setState("scnState", NOT_RESPONDING); return; }
+    const added = (res.added || []).length, skipped = res.skipped || [];
+    const parts = [(mode === "add" ? "Added " : "Loaded ") + added + (added === 1 ? " overlay" : " overlays") + " from " + quote(s.name)];
+    if (skipped.length) parts.push("Skipped: " + skipped.join("; "));
+    parts.push(...(res.notes || []));
+    setState("scnState", parts.join(". ") + ".");
+    $("scnState").classList.toggle("err", skipped.length > 0);
+    loadLayers(); refresh(); loadBg();
+  }
+  async function deleteScene(s) {
+    if (!confirm("Delete the scene " + quote(s.name) + "?")) return;
+    try {
+      const r = await apiDelete("/api/scenes/" + encodeURIComponent(s.id));
+      setState("scnState", r.ok ? "" : "error: " + await errorText(r));
+    } catch { setState("scnState", NOT_RESPONDING); }
+    loadScenes();
+  }
+  $("scnSave").addEventListener("click", async () => {
+    const name = $("scnName").value.trim();
+    if (!name) { $("scnName").focus(); return; }
+    try {
+      const r = await api("/api/scenes", { name, include_background: $("scnBg").checked, include_webcam: $("scnCam").checked });
+      if (!r.ok) { setState("scnState", "error: " + await errorText(r)); return; }
+    } catch { setState("scnState", NOT_RESPONDING); return; }
+    $("scnName").value = "";
+    setState("scnState", "Saved " + quote(name) + ".");
+    loadScenes();
+  });
+  $("scnName").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("scnSave").click(); } });
+  showOvTab(store.get("ovTab", "layers"));
 
   refresh();
   loadLayers();

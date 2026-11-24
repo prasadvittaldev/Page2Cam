@@ -1,0 +1,16 @@
+{
+  "name": "Speaker intro",
+  "category": "cards",
+  "description": "Full-frame speaker introduction: photo (or initials), name, role, company and a short bio.",
+  "full_frame": true,
+  "params": [
+    {"name": "name", "type": "text", "required": true, "help": "The speaker's name"},
+    {"name": "role", "type": "text", "default": "", "help": "Title or role, e.g. Principal Engineer"},
+    {"name": "company", "type": "text", "default": "", "help": "Company or organisation, shown small above the name (empty: none)"},
+    {"name": "bio", "type": "longtext", "default": "", "help": "A short bio, 1 to 3 sentences; about 300 characters are shown"},
+    {"name": "photo", "type": "asset", "default": "", "help": "Portrait: an https address or a data:image URI (empty: the initials in a circle)"},
+    {"name": "background", "type": "colour", "default": "", "help": "Card colour #rrggbb (empty: the look's)"}
+  ],
+  "example": {"name": "Dr. Maya Chen", "role": "Principal Engineer", "company": "Example Labs", "bio": "Maya leads the real-time video team at Example Labs. She has spent ten years building streaming systems and loves making complex tech feel simple."},
+  "update": {"name": "Jordan Patel", "role": "Head of Design", "bio": "Jordan shapes how millions of people use Example products every day."}
+}

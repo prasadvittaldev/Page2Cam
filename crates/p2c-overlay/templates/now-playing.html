@@ -1,0 +1,42 @@
+<style>
+  .np{position:absolute;inset:0;display:flex;align-items:stretch;gap:7vh;padding:9vh;border-radius:12vh}
+  .np .art{flex:none;height:100%;aspect-ratio:1;border-radius:7vh;overflow:hidden;position:relative;background:var(--accent);display:flex;align-items:center;justify-content:center}
+  .theme-minimal .np .art{background:rgba(255,255,255,.2)}
+  .np .art img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  .np .note{font-size:44vh;line-height:1;color:#fff;text-shadow:none}
+  .np .txt{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center}
+  .np .lbl{font-size:13vh;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--accent)}
+  .theme-minimal .np .lbl{color:var(--muted)}
+  .np .ti{font-size:26vh;font-weight:700;line-height:1.2}
+  .np .ar{font-size:18vh;color:var(--muted);line-height:1.25}
+  .np .pr{margin-top:4vh;height:5vh;border-radius:2.5vh;background:var(--line);overflow:hidden;flex:none}
+  .np .fill{height:100%;width:0;border-radius:2.5vh;background:var(--accent)}
+  .theme-minimal .np .fill{background:#fff}
+</style>
+<div class="np p2c-panel">
+  <div class="art"><span class="note" id="note">&#9835;</span><img id="cover" alt=""></div>
+  <div class="txt"><div class="lbl p2c-ellipsis" id="lbl"></div><div class="ti p2c-ellipsis" id="ti"></div><div class="ar p2c-ellipsis" id="ar"></div>
+    <div class="pr" id="pr"><div class="fill" id="fill"></div></div></div>
+</div>
+<script>
+var shownProgress = NaN;
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#lbl"), p.label);
+  P2C.show(P2C.$("#lbl"), !!p.label);
+  P2C.text(P2C.$("#ti"), p.title);
+  P2C.text(P2C.$("#ar"), p.artist);
+  P2C.show(P2C.$("#ar"), !!p.artist);
+  var has = P2C.img(P2C.$("#cover"), p.cover);
+  P2C.show(P2C.$("#note"), !has);
+  var v = P2C.num(p.progress);
+  var on = isFinite(v) && v >= 0;
+  P2C.show(P2C.$("#pr"), on);
+  if (!on) { shownProgress = NaN; return; }
+  v = Math.min(100, v);
+  var from = isFinite(shownProgress) ? shownProgress : v;
+  P2C.tween("progress", from, v, 900, function (x) {
+    shownProgress = x;
+    P2C.$("#fill").style.width = x.toFixed(2) + "%";
+  });
+});
+</script>

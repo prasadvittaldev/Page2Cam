@@ -1,0 +1,12 @@
+{
+  "name": "Lyrics card",
+  "category": "lists",
+  "description": "Centred lines of lyrics, a verse or scripture in the lower part of the picture, with an optional reference line (song title, John 3:16).",
+  "rect": [0.1, 0.64, 0.8, 0.28],
+  "params": [
+    {"name": "lines", "type": "longtext", "required": true, "help": "The lines to show, one per line (newline-separated), at most 6 lines; keep each line short"},
+    {"name": "reference", "type": "text", "default": "", "help": "Small line under the text: a song title, a verse reference like John 3:16 (empty: none)"}
+  ],
+  "example": {"lines": "Amazing grace, how sweet the sound\nThat saved a wretch like me", "reference": "Amazing Grace, verse 1"},
+  "update": {"lines": "I once was lost, but now am found\nWas blind, but now I see", "reference": "Amazing Grace, verse 1"}
+}

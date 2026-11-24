@@ -1,0 +1,55 @@
+{
+  "name": "Architecture diagram",
+  "category": "software",
+  "description": "Boxes and arrows laid out automatically: nodes in numbered columns from left to right, edges as arrows with optional labels.",
+  "rect": [0.45, 0.08, 0.5, 0.6],
+  "params": [
+    {"name": "title", "type": "text", "default": "", "help": "Heading (empty: none)"},
+    {"name": "nodes", "type": "table", "columns": ["id", "label", "column"], "max_items": 24, "required": true, "help": "Up to 24 rows: id (short, unique), label (shown), column 1 to 6 (left to right; nodes of a column are spaced evenly top to bottom in row order)"},
+    {"name": "edges", "type": "table", "columns": ["from", "to", "label"], "max_items": 40, "default": [], "help": "Up to 40 arrows: from id, to id, label (optional, keep it short). Unknown ids are ignored"},
+    {"name": "highlight", "type": "text", "default": "", "help": "Id of a node to fill with the accent colour, e.g. the one being discussed (empty: none)"}
+  ],
+  "example": {
+    "title": "Checkout architecture",
+    "nodes": [
+      ["web", "Web app", 1],
+      ["mobile", "Mobile app", 1],
+      ["gw", "API gateway", 2],
+      ["auth", "Auth service", 3],
+      ["orders", "Orders service", 3],
+      ["db", "Postgres", 4],
+      ["queue", "Event queue", 4]
+    ],
+    "edges": [
+      ["web", "gw", ""],
+      ["mobile", "gw", ""],
+      ["gw", "auth", "JWT"],
+      ["gw", "orders", "REST"],
+      ["orders", "db", "SQL"],
+      ["orders", "queue", "events"]
+    ],
+    "highlight": "orders"
+  },
+  "update": {
+    "nodes": [
+      ["web", "Web app", 1],
+      ["mobile", "Mobile app", 1],
+      ["gw", "API gateway", 2],
+      ["auth", "Auth service", 3],
+      ["orders", "Orders service", 3],
+      ["cache", "Redis cache", 4],
+      ["db", "Postgres", 4],
+      ["queue", "Event queue", 4]
+    ],
+    "edges": [
+      ["web", "gw", ""],
+      ["mobile", "gw", ""],
+      ["gw", "auth", "JWT"],
+      ["gw", "orders", "REST"],
+      ["orders", "cache", "reads"],
+      ["orders", "db", "SQL"],
+      ["orders", "queue", "events"]
+    ],
+    "highlight": "cache"
+  }
+}

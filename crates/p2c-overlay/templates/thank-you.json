@@ -1,0 +1,16 @@
+{
+  "name": "Thank you",
+  "category": "cards",
+  "description": "Full-frame closing card: a big thank-you, a line under it, optional social handles and an optional QR code for a link.",
+  "full_frame": true,
+  "params": [
+    {"name": "title", "type": "text", "default": "Thank you", "help": "Big heading"},
+    {"name": "subtitle", "type": "text", "default": "", "help": "Line under it, e.g. Slides and recording: example.com/talk (empty: none)"},
+    {"name": "handles", "type": "table", "columns": ["platform", "handle"], "max_items": 6, "default": [], "help": "Optional rows of [platform, handle], e.g. [[\"YouTube\", \"@examplechannel\"], [\"Web\", \"example.com\"]]"},
+    {"name": "link", "type": "qr", "default": "", "help": "Optional text or link shown as a QR code at the right (empty: no code)"},
+    {"name": "link_caption", "type": "text", "default": "", "help": "Short line under the QR code, e.g. the short link"},
+    {"name": "background", "type": "colour", "default": "", "help": "Card colour #rrggbb (empty: the look's)"}
+  ],
+  "example": {"title": "Thank you!", "subtitle": "Slides and recording on our site", "handles": [["YouTube", "@examplechannel"], ["LinkedIn", "Example Co"], ["Web", "example.com"]], "link": "https://example.com/talk", "link_caption": "example.com/talk"},
+  "update": {"title": "Thanks for watching", "subtitle": "See you next week"}
+}

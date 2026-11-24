@@ -1,0 +1,60 @@
+<style>
+  .tm{position:absolute;inset:0;display:flex;flex-direction:column;background:#0f1319;border-radius:2vh;overflow:hidden;border:.3vh solid rgba(255,255,255,.14);text-shadow:none}
+  .tm .bar{position:relative;flex:none;display:flex;align-items:center;gap:1.2vh;padding:0 2.5vh;height:7vh;background:#1a1f28;color:#9aa7b8;font-size:3.6vh}
+  .tm .dot{flex:none;width:2vh;height:2vh;border-radius:50%}
+  .tm .ttl{position:absolute;left:18%;right:18%;text-align:center}
+  .tm .scr{flex:1;min-height:0;overflow:hidden;padding:2.5vh 3.5vh}
+  .tm .ln{font-family:var(--mono);font-size:4.6vh;line-height:1.45;white-space:pre-wrap;word-break:break-all;color:#b6c2cf}
+  .tm .pr{color:#7ee787;font-weight:700}
+  .tm .cmd{color:#ffffff}
+  .tm .ln.err{color:#ff7b72}
+  .tm .ln.warn{color:#e3b341}
+  .tm .caret{display:inline-block;width:.6em;height:1.1em;vertical-align:text-bottom;background:#c9d1d9;opacity:.85}
+</style>
+<div class="tm"><div class="bar"><span class="dot" style="background:#ff5f57"></span><span class="dot" style="background:#febc2e"></span><span class="dot" style="background:#28c840"></span><span class="ttl p2c-ellipsis" id="ttl"></span></div><div class="scr" id="scr"></div></div>
+<script>
+var key = "";
+function drawTerm(prompt, cmd, lines, c, l, done) {
+  var scr = P2C.clear(P2C.$("#scr"));
+  var first = P2C.el("div", "ln", null, scr);
+  if (prompt) P2C.el("span", "pr", prompt + " ", first);
+  P2C.el("span", "cmd", cmd.slice(0, c), first);
+  if (c < cmd.length || (!done && l === 0)) P2C.el("span", "caret", null, first);
+  for (var i = 0; i < l && i < lines.length; i++) {
+    var s = lines[i];
+    var low = s.trim().toLowerCase();
+    var cls = low.indexOf("error") === 0 ? " err" : low.indexOf("warning") === 0 ? " warn" : "";
+    P2C.el("div", "ln" + cls, s === "" ? " " : s, scr);
+  }
+  if (done) {
+    var last = P2C.el("div", "ln", null, scr);
+    if (prompt) P2C.el("span", "pr", prompt + " ", last);
+    P2C.el("span", "caret", null, last);
+  }
+  scr.scrollTop = scr.scrollHeight;
+}
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#ttl"), p.title);
+  var prompt = String(p.prompt || ""), cmd = String(p.command || ""), out = String(p.output || "");
+  var lines = out ? out.replace(/\r/g, "").split("\n") : [];
+  var k = [prompt, cmd, out, p.typing].join("\u0001");
+  if (k === key) return;
+  key = k;
+  P2C.stop("type");
+  if (!p.typing) { drawTerm(prompt, cmd, lines, cmd.length, lines.length, true); return; }
+  var c = 0, l = 0, wait = 0;
+  P2C.every("type", 55, function () {
+    if (c < cmd.length) { c++; drawTerm(prompt, cmd, lines, c, 0, false); return; }
+    wait++;
+    if (wait < 9) return;
+    if (l < lines.length) {
+      if ((wait - 9) % 3 !== 0) return;
+      l++;
+      drawTerm(prompt, cmd, lines, c, l, false);
+      return;
+    }
+    drawTerm(prompt, cmd, lines, c, l, true);
+    P2C.stop("type");
+  });
+});
+</script>

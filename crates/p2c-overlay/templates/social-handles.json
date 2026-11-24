@@ -1,0 +1,12 @@
+{
+  "name": "Social handles",
+  "category": "basics",
+  "description": "Where to find you: one handle per line (or in a row), each with a short coloured platform label.",
+  "rect": [0.03, 0.6, 0.27, 0.3],
+  "params": [
+    {"name": "handles", "type": "table", "columns": ["platform", "handle"], "max_items": 8, "required": true, "help": "Rows of [platform, handle], e.g. [[\"YouTube\", \"@examplechannel\"], [\"LinkedIn\", \"Example Co\"]]. Known: YouTube, X, Instagram, LinkedIn, GitHub, TikTok, Twitch, Facebook, Bluesky, Mastodon, Discord, Web, Email"},
+    {"name": "layout", "type": "choice", "options": ["column", "row"], "default": "column", "help": "column: one per line (a tall box); row: side by side (a wide, low box)"}
+  ],
+  "example": {"handles": [["YouTube", "@examplechannel"], ["X", "@example"], ["LinkedIn", "Example Co"], ["GitHub", "example/project"]]},
+  "update": {"handles": [["Instagram", "@example.studio"], ["TikTok", "@example"], ["Web", "example.com"]]}
+}

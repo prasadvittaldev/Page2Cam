@@ -1,0 +1,40 @@
+<style>
+  .card{position:absolute;inset:0;overflow:hidden;background:var(--bg)}
+  .theme-minimal .card{background-color:rgba(0,0,0,.72)}
+  .card .glow{position:absolute;left:-30%;top:-30%;width:160%;height:160%;opacity:.28;
+    background:radial-gradient(circle at 30% 35%,var(--accent),transparent 32%),radial-gradient(circle at 72% 68%,var(--accent),transparent 28%);
+    animation:brbdrift 40s ease-in-out infinite alternate}
+  .theme-minimal .card .glow{opacity:.12}
+  @keyframes brbdrift{from{transform:translate(-4%,-3%)}to{transform:translate(4%,3%)}}
+  .card .in{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:5vh 5vw}
+  .card .icon{display:flex;gap:2.2vh;margin-bottom:4vh}
+  .card .icon i{display:block;width:2.4vh;height:8vh;border-radius:1.2vh;background:var(--accent)}
+  .card h1{margin:0;max-width:100%;font-size:12vh;font-weight:800;letter-spacing:-.01em}
+  .card .sub{margin-top:2.5vh;max-width:80%;font-size:4.5vh;color:var(--muted)}
+  .card .t{margin-top:5vh;padding:1vh 3vw;border:.4vh solid var(--line);border-radius:6vh;font-size:7vh;font-weight:700;font-variant-numeric:tabular-nums;background:rgba(0,0,0,.18)}
+</style>
+<div class="card" id="card">
+  <div class="glow"></div>
+  <div class="in"><div class="icon"><i></i><i></i></div><h1 id="h"></h1><div class="sub" id="sub"></div><div class="t" id="t"></div></div>
+</div>
+<script>
+var brbEnd = NaN, brbKey = null;
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.show(P2C.$("#h"), !!p.title);
+  P2C.text(P2C.$("#sub"), p.subtitle);
+  P2C.show(P2C.$("#sub"), !!p.subtitle);
+  P2C.$("#card").style.backgroundColor = p.background || "";
+  var k = String(p.duration);
+  if (k !== brbKey) {
+    brbKey = k;
+    var d = P2C.num(p.duration);
+    brbEnd = isFinite(d) && d > 0 ? Date.now() + d * 1000 : NaN;
+  }
+  P2C.show(P2C.$("#t"), isFinite(brbEnd));
+  if (!isFinite(brbEnd)) { P2C.stop("tick"); return; }
+  P2C.every("tick", 250, function () {
+    P2C.text(P2C.$("#t"), P2C.fmtTime(Math.max(0, Math.ceil((brbEnd - Date.now()) / 1000))));
+  });
+});
+</script>

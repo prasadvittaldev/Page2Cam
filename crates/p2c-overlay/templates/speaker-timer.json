@@ -1,0 +1,13 @@
+{
+  "name": "Speaker timer",
+  "category": "time",
+  "description": "A per-speaker countdown: turns amber near the end, red at zero, then counts the overtime as +m:ss.",
+  "rect": [0.78, 0.05, 0.19, 0.16],
+  "params": [
+    {"name": "speaker", "type": "text", "required": true, "help": "Who is speaking now. Changing it restarts the timer"},
+    {"name": "duration", "type": "duration", "default": 300, "help": "Speaking time (seconds or m:ss, e.g. 5:00). Changing it restarts the timer"},
+    {"name": "warn_at", "type": "number", "min": 0, "max": 3600, "default": 60, "help": "Turn amber when this many seconds are left"}
+  ],
+  "example": {"speaker": "Dana Lee", "duration": "5:00", "warn_at": 60},
+  "update": {"speaker": "Sam Ortiz", "duration": "3:00"}
+}

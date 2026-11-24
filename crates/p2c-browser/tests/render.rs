@@ -124,7 +124,7 @@ fn serve_scene() -> String {
     )
     .unwrap();
     let state = set.state_json().to_string();
-    let html = p2c_overlay::scene::layer_page(set.html_of("chart").unwrap());
+    let html = set.layer_page("chart").unwrap();
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -185,6 +185,234 @@ fn scene_draws_layers(overlay: &BrowserHandle, slot: &FrameSlot) -> Result<(), S
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(format!("scene: {last}"))
+}
+
+/// What the template step's server serves and saw.
+#[derive(Default)]
+struct TplServer {
+    state: String,
+    pages: std::collections::HashMap<String, String>,
+    /// Requests per layer page (a reload asks again).
+    hits: std::collections::HashMap<String, u32>,
+    /// Errors the frames reported (`window.onerror`, rejections, console.error).
+    errors: Vec<String>,
+}
+
+/// Put in front of every layer page: reports script errors to `/report`.
+const ERROR_HOOK: &str = "<script>(function(){function r(m){new Image().src='/report?m='+\
+    encodeURIComponent(String(m).slice(0,300));}\
+    window.addEventListener('error',function(e){r('error: '+e.message+' line '+e.lineno);});\
+    window.addEventListener('unhandledrejection',function(e){r('rejection: '+e.reason);});\
+    var ce=console.error;console.error=function(){r('console.error: '+Array.prototype.join.call(arguments,' '));\
+    ce.apply(console,arguments);};})();</script>";
+
+/// The real scene page with a swappable state, layer pages with the error
+/// hook, and `/report`.
+fn serve_templates(srv: std::sync::Arc<std::sync::Mutex<TplServer>>) -> String {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            let srv = srv.clone();
+            std::thread::spawn(move || {
+                let mut s = s;
+                let mut buf = [0u8; 8192];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let full = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (path, query) = full.split_once('?').unwrap_or((full.as_str(), ""));
+                let mut g = srv.lock().unwrap();
+                let (ctype, csp, body) = if path == "/ov/x/scene.html" {
+                    (
+                        "text/html",
+                        p2c_overlay::scene::SCENE_CSP,
+                        p2c_overlay::scene::SCENE_HTML.to_string(),
+                    )
+                } else if path == "/ov/x/scene.js" {
+                    (
+                        "text/javascript",
+                        "",
+                        p2c_overlay::scene::SCENE_JS.to_string(),
+                    )
+                } else if path == "/ov/x/state" {
+                    ("application/json", "", g.state.clone())
+                } else if let Some(id) = path.strip_prefix("/ov/x/layer/") {
+                    *g.hits.entry(id.to_string()).or_default() += 1;
+                    let page = g.pages.get(id).cloned().unwrap_or_default();
+                    let page = page.replacen("<head>", &format!("<head>{ERROR_HOOK}"), 1);
+                    ("text/html", p2c_overlay::scene::LAYER_CSP, page)
+                } else if path == "/report" {
+                    let m = query.strip_prefix("m=").unwrap_or(query);
+                    g.errors.push(m.replace("%20", " "));
+                    ("text/plain", "", String::new())
+                } else {
+                    ("text/plain", "", String::new())
+                };
+                drop(g);
+                let csp = if csp.is_empty() {
+                    String::new()
+                } else {
+                    format!("Content-Security-Policy: {csp}\r\n")
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n{csp}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}/ov/x/scene.html")
+}
+
+/// The pixel rectangle of a layer (inclusive-exclusive), at the frame size.
+fn rect_px(l: &p2c_overlay::Layer, w: u32, h: u32) -> (u32, u32, u32, u32) {
+    let x0 = (l.x * w as f32).round() as u32;
+    let y0 = (l.y * h as f32).round() as u32;
+    let x1 = ((l.x + l.w) * w as f32).round().min(w as f32) as u32;
+    let y1 = ((l.y + l.h) * h as f32).round().min(h as f32) as u32;
+    (x0, y0, x1, y1)
+}
+
+/// Drawn pixels inside `r` and the first drawn pixel found outside it
+/// (2 px of slack for edges), sampled every 2 px.
+fn coverage(f: &Frame, (x0, y0, x1, y1): (u32, u32, u32, u32)) -> (u32, Option<(u32, u32)>) {
+    let (mut inside, mut outside) = (0, None);
+    for y in (0..f.height).step_by(2) {
+        for x in (0..f.width).step_by(2) {
+            let a = f.pixel(x, y)[3];
+            let near = x + 2 >= x0 && x < x1 + 2 && y + 2 >= y0 && y < y1 + 2;
+            if x >= x0 && x < x1 && y >= y0 && y < y1 {
+                if a > 0 {
+                    inside += 1;
+                }
+            } else if !near && a > 0 && outside.is_none() {
+                outside = Some((x, y));
+            }
+        }
+    }
+    (inside, outside)
+}
+
+/// The rectangle's pixels (every 2 px).
+fn rect_pixels(f: &Frame, (x0, y0, x1, y1): (u32, u32, u32, u32)) -> Vec<[u8; 4]> {
+    let mut v = Vec::new();
+    for y in (y0..y1.min(f.height)).step_by(2) {
+        for x in (x0..x1.min(f.width)).step_by(2) {
+            v.push(f.pixel(x, y));
+        }
+    }
+    v
+}
+
+/// Every built-in template with its example params on the real scene page:
+/// no script errors, drawn inside its rectangle and nothing outside; then
+/// its `update` example reaches the frame by message: the pixels change
+/// and the frame is not loaded again.
+fn templates_render(overlay: &BrowserHandle, slot: &FrameSlot) -> Result<(), String> {
+    use std::sync::{Arc, Mutex};
+    let srv = Arc::new(Mutex::new(TplServer {
+        state: r#"{"rev":1,"layers":[]}"#.into(),
+        ..TplServer::default()
+    }));
+    overlay.navigate(&serve_templates(srv.clone()));
+    std::thread::sleep(Duration::from_millis(800));
+    let d = tempfile::tempdir().unwrap();
+    let assets = p2c_overlay::Assets::new(d.path());
+    let mut failures = Vec::new();
+    for (n, t) in p2c_overlay::builtins().iter().enumerate() {
+        let mut set = p2c_overlay::LayerSet::new();
+        let now = Instant::now();
+        let id = t.id.clone();
+        let layer = set
+            .add(
+                serde_json::json!({"kind": "template", "template": t.id, "id": id,
+                    "params": t.example, "enter": "none", "exit": "none"}),
+                &assets,
+                now,
+            )
+            .map_err(|e| format!("{}: {e:#}", t.id))?;
+        {
+            let mut g = srv.lock().unwrap();
+            g.pages.insert(id.clone(), set.layer_page(&id).unwrap());
+            let mut st = set.state_json();
+            st["rev"] = serde_json::json!(n as u64 * 10 + 2);
+            g.state = st.to_string();
+        }
+        // Drawn inside, nothing outside.
+        let start = Instant::now();
+        let mut last = String::from("no frame");
+        let mut drawn = None;
+        while start.elapsed() < Duration::from_secs(10) {
+            if let Some(f) = slot.latest() {
+                let r = rect_px(&layer, f.width, f.height);
+                let (inside, outside) = coverage(&f, r);
+                if inside >= 20 && outside.is_none() {
+                    drawn = Some(r);
+                    break;
+                }
+                last = format!("{inside} drawn pixels inside, drawn outside at {outside:?}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let Some(r) = drawn else {
+            failures.push(format!("{}: {last}", t.id));
+            continue;
+        };
+        // Let enter transitions and tweens settle.
+        std::thread::sleep(Duration::from_millis(900));
+        let before = slot
+            .latest()
+            .map(|f| rect_pixels(&f, r))
+            .unwrap_or_default();
+        let hits = srv.lock().unwrap().hits.get(&id).copied().unwrap_or(0);
+        set.update(&id, serde_json::json!({"params": t.update}), &assets, now)
+            .map_err(|e| format!("{} update: {e:#}", t.id))?;
+        {
+            let mut g = srv.lock().unwrap();
+            let mut st = set.state_json();
+            st["rev"] = serde_json::json!(n as u64 * 10 + 3);
+            g.state = st.to_string();
+        }
+        let start = Instant::now();
+        let mut changed = false;
+        while start.elapsed() < Duration::from_secs(5) && !changed {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Some(f) = slot.latest() {
+                let now_px = rect_pixels(&f, r);
+                let diff = now_px
+                    .iter()
+                    .zip(&before)
+                    .filter(|(a, b)| !close(**a, **b))
+                    .count();
+                changed = diff >= 3;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let g = srv.lock().unwrap();
+        let hits_after = g.hits.get(&id).copied().unwrap_or(0);
+        if !changed {
+            failures.push(format!("{}: the update changed no pixels", t.id));
+        }
+        if hits_after != hits {
+            failures.push(format!("{}: the update reloaded the frame", t.id));
+        }
+        if !g.errors.is_empty() {
+            failures.push(format!("{}: script errors {:?}", t.id, g.errors));
+        }
+        drop(g);
+        srv.lock().unwrap().errors.clear();
+    }
+    if failures.is_empty() {
+        println!(
+            "test templates_render ({} built-ins, live updates) ... ok",
+            p2c_overlay::builtins().len()
+        );
+        Ok(())
+    } else {
+        Err(format!("templates:\n  {}", failures.join("\n  ")))
+    }
 }
 
 /// The page renders at a new view size (the quality throttle's resolution
@@ -432,6 +660,9 @@ mod gpu {
 }
 
 fn scenario(h: &BrowserHandle, slot: &FrameSlot, audio: &AudioRing) -> Result<(), String> {
+    // Load the page again: the earlier steps (GPU, recreate_cpu, resizes)
+    // took longer than its 500 ms red phase.
+    h.navigate(&format!("data:text/html,{PAGE}"));
     wait_for(slot, "red right half", |f| close(f.pixel(540, 180), RED))?;
     println!("test renders_solid_color ... ok");
     wait_for(slot, "blue right half with green left", |f| {
@@ -585,7 +816,11 @@ fn main() {
                     let o = h.overlay().ok_or("no overlay browser")?;
                     scene_draws_layers(&o, &overlay_slot)
                 })
-                .and_then(|()| scenario(&h, &watch, &audio));
+                .and_then(|()| scenario(&h, &watch, &audio))
+                .and_then(|()| {
+                    let o = h.overlay().ok_or("no overlay browser")?;
+                    templates_render(&o, &overlay_slot)
+                });
             tx.send(r).unwrap();
             h.shutdown();
         });

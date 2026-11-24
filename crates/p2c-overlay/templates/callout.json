@@ -1,0 +1,13 @@
+{
+  "name": "Callout",
+  "category": "software",
+  "description": "An arrow with a label that points at a spot on a shared screen or demo, with an optional softly pulsing ring at the tip.",
+  "rect": [0.55, 0.44, 0.24, 0.1],
+  "params": [
+    {"name": "label", "type": "text", "required": true, "help": "Short label, e.g. Click Publish"},
+    {"name": "direction", "type": "choice", "default": "left", "options": ["left", "right", "up", "down"], "help": "Where the arrow points; its tip sits near that edge of the layer box, so place the box next to the spot. For up/down use a taller box (e.g. w 0.14, h 0.25)"},
+    {"name": "pulse", "type": "bool", "default": true, "help": "Softly pulsing ring at the arrow tip"}
+  ],
+  "example": {"label": "Click Publish", "direction": "left"},
+  "update": {"label": "Then pick a channel"}
+}

@@ -1,0 +1,14 @@
+{
+  "name": "Be right back",
+  "category": "cards",
+  "description": "Full-frame break card on a calm, slowly drifting gradient: title, subtitle and an optional countdown.",
+  "full_frame": true,
+  "params": [
+    {"name": "title", "type": "text", "default": "Be right back", "help": "Big heading"},
+    {"name": "subtitle", "type": "text", "default": "", "help": "Line under it, e.g. Short break, back in five minutes (empty: none)"},
+    {"name": "duration", "type": "duration", "default": 0, "help": "Count down this long from when it is shown or the value changes (seconds or m:ss; 0: no countdown)"},
+    {"name": "background", "type": "colour", "default": "", "help": "Card colour #rrggbb (empty: the look's)"}
+  ],
+  "example": {"title": "Be right back", "subtitle": "Short break, we continue in a few minutes", "duration": "5:00"},
+  "update": {"subtitle": "Almost there, grab your seat", "duration": "1:00"}
+}

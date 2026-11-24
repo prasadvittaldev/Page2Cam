@@ -1,0 +1,12 @@
+{
+  "name": "Disclaimer bar",
+  "category": "basics",
+  "description": "A thin full-width bar along the bottom edge with one line of small print, e.g. a disclaimer or notice.",
+  "rect": [0, 0.952, 1, 0.048],
+  "params": [
+    {"name": "text", "type": "text", "required": true, "help": "The small print, one line, e.g. Not financial advice. For information only"},
+    {"name": "label", "type": "text", "default": "", "help": "Short tag at the left, e.g. NOTICE or DISCLAIMER (empty: none)"}
+  ],
+  "example": {"text": "Not financial advice. For information only; do your own research.", "label": "Disclaimer"},
+  "update": {"text": "Opinions are the speaker's own and not those of Example Co."}
+}

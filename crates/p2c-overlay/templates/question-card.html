@@ -1,0 +1,32 @@
+<style>
+  .qa{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:6vh 7vh;border-radius:3vh;border-bottom:1.4vh solid var(--accent)}
+  .theme-minimal .qa{border-bottom-color:transparent}
+  .qa .tag{align-self:flex-start;max-width:100%;font-size:6vh;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:.35em .8em;border-radius:.4em;background:var(--accent);color:#fff;text-shadow:none}
+  .theme-minimal .qa .tag{background:rgba(255,255,255,.22)}
+  .qa .q{margin:3.5vh 0 0;font-size:var(--qs,9vh);font-weight:600;line-height:1.25;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:4;overflow:hidden}
+  .qa .who{margin-top:3.5vh;display:flex;align-items:center;gap:2.5vh;min-width:0;font-size:6.5vh}
+  .qa .av{flex:none;width:1.6em;height:1.6em;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;background:var(--bg2);color:var(--fg2);text-transform:uppercase}
+  .qa .nm{font-weight:700;flex:none;max-width:60%}
+  .qa .src{color:var(--muted);flex:1;min-width:0}
+</style>
+<div class="qa p2c-panel"><div class="tag p2c-ellipsis" id="tag"></div><p class="q" id="q"></p>
+  <div class="who" id="who"><span class="av" id="av"></span><span class="nm p2c-ellipsis" id="nm"></span><span class="src p2c-ellipsis" id="src"></span></div></div>
+<script>
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#tag"), p.label);
+  P2C.show(P2C.$("#tag"), !!p.label);
+  var q = String(p.question || "").trim();
+  var n = q.length;
+  var el = P2C.$("#q");
+  el.style.setProperty("--qs", (n <= 60 ? 10 : n <= 120 ? 8.5 : n <= 200 ? 7 : 5.5) + "vh");
+  P2C.text(el, q);
+  var name = String(p.name || "").trim();
+  P2C.text(P2C.$("#av"), name ? name.charAt(0) : "?");
+  P2C.show(P2C.$("#av"), !!name);
+  P2C.text(P2C.$("#nm"), name);
+  P2C.show(P2C.$("#nm"), !!name);
+  P2C.text(P2C.$("#src"), p.source);
+  P2C.show(P2C.$("#src"), !!p.source);
+  P2C.show(P2C.$("#who"), !!(name || p.source));
+});
+</script>

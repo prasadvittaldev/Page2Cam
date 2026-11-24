@@ -111,6 +111,10 @@ impl<E: Env> Bridge<E> {
     /// user what to do); every tool call is an error with `why`.
     fn local(&self, msg: &Value, why: &str) -> Option<Value> {
         let id = msg.get("id")?.clone();
+        // The guide, its resources and prompts need no tray.
+        if let Some(r) = p2c_mcp::offline(msg) {
+            return Some(r);
+        }
         let method = msg["method"].as_str().unwrap_or("");
         Some(match method {
             "initialize" => {
@@ -122,7 +126,8 @@ impl<E: Env> Bridge<E> {
                 };
                 json!({ "jsonrpc": "2.0", "id": id, "result": {
                     "protocolVersion": v,
-                    "capabilities": { "tools": { "listChanged": false } },
+                    "capabilities": { "tools": { "listChanged": false },
+                        "resources": { "listChanged": false }, "prompts": { "listChanged": false } },
                     "serverInfo": { "name": "page2cam", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": format!("Page2Cam can't be controlled right now: {why}."),
                 } })
@@ -709,9 +714,10 @@ mod tests {
         f.allowed.set(false);
         let mut b = Bridge::new(&f);
         let input = format!(
-            "{INIT}\n{}\n{}\n",
+            "{INIT}\n{}\n{}\n{}\n",
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"status","arguments":{}}}"#
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"status","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"guide","arguments":{"topic":"webinar"}}}"#
         );
         let out = run_lines(&mut b, &input);
         assert_eq!(out[0]["result"]["protocolVersion"], "2025-06-18");
@@ -719,9 +725,11 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Allow agents"));
-        assert_eq!(out[1]["result"]["tools"].as_array().unwrap().len(), 37);
+        assert_eq!(out[1]["result"]["tools"].as_array().unwrap().len(), 46);
         assert_eq!(out[2]["result"]["isError"], true);
         assert_eq!(out[2]["result"]["content"][0]["text"], p2c_mcp::AGENTS_OFF);
+        // The guide works without the tray.
+        assert_eq!(out[3]["result"]["isError"], false, "{}", out[3]);
         assert_eq!(f.launched.get(), 0, "no tray launch while agents are off");
         assert!(f.posts.borrow().is_empty());
     }

@@ -88,6 +88,28 @@ pub enum BackendCall {
     ClearLayers,
     /// Back to front.
     ReorderLayers(Vec<String>),
+    /// Answered by the server itself (no backend call).
+    Guide(Option<String>),
+    /// Built-in and user templates, optionally of one category.
+    ListTemplates(Option<String>),
+    GetTemplate {
+        id: String,
+        include_html: bool,
+    },
+    /// The engine's `POST /api/templates` body.
+    SaveTemplate(Value),
+    DeleteTemplate(String),
+    ListScenes,
+    SaveScene {
+        name: String,
+        include_background: bool,
+        include_webcam: bool,
+    },
+    LoadScene {
+        id: String,
+        replace: bool,
+    },
+    DeleteScene(String),
 }
 
 impl BackendCall {
@@ -104,6 +126,10 @@ impl BackendCall {
                 | BackendCall::GetBackground
                 | BackendCall::ListScreens
                 | BackendCall::ListLayers
+                | BackendCall::Guide(_)
+                | BackendCall::ListTemplates(_)
+                | BackendCall::GetTemplate { .. }
+                | BackendCall::ListScenes
         )
     }
 
@@ -150,6 +176,17 @@ impl BackendCall {
             BackendCall::RemoveLayer(id) => format!("remove layer {id:?}"),
             BackendCall::ClearLayers => "hide all layers".into(),
             BackendCall::ReorderLayers(ids) => format!("reorder layers {}", ids.join(", ")),
+            BackendCall::SaveTemplate(v) => format!(
+                "save template {:?}",
+                v["id"].as_str().or(v["from_layer"].as_str()).unwrap_or("?")
+            ),
+            BackendCall::DeleteTemplate(id) => format!("delete template {id:?}"),
+            BackendCall::SaveScene { name, .. } => format!("save scene {name:?}"),
+            BackendCall::LoadScene { id, replace } => format!(
+                "load scene {id:?} ({})",
+                if *replace { "replace" } else { "add" }
+            ),
+            BackendCall::DeleteScene(id) => format!("delete scene {id:?}"),
             other => format!("{other:?}").to_lowercase(),
         }
     }
@@ -277,6 +314,40 @@ Give a local file path or base64 file bytes (PNG, JPEG or WebP, up to 20 MB).".i
             &json!({ "type": "object", "required": ["ids"], "additionalProperties": false,
                 "properties": { "ids": { "type": "array", "minItems": 1, "maxItems": 32,
                     "items": { "type": "string", "maxLength": 40 } } } })),
+        t("guide", "How to run a good show for the user: call it first for a use case. No topic = the index. topic = the user's role or goal (\"doctor\", \"webinar\", \"release demo\", \"teacher\": a playbook with background, webcam, graphics, steps and rules), a template id (its parameters and example calls), \"catalogue\" (every template), or a how-to (templates, scenes, layout, privacy, writing-templates). Works while stopped.".into(),
+            &json!({ "type": "object", "additionalProperties": false,
+                "properties": { "topic": { "type": "string", "maxLength": 200 } } })),
+        t("list_templates", "Overlay templates (built-in and the user's own): id, name, category, one-line description. category: basics, time, cards, lists, data, cta, calm, software, mine. Add one with add_layer kind template.".into(),
+            &json!({ "type": "object", "additionalProperties": false,
+                "properties": { "category": { "type": "string", "maxLength": 40 } } })),
+        t("get_template", "One template in full: params with types, defaults and help, an example, a live-change example. include_html adds its HTML (always for the user's own).".into(),
+            &json!({ "type": "object", "required": ["id"], "additionalProperties": false,
+                "properties": { "id": { "type": "string", "maxLength": 40 }, "include_html": { "type": "boolean" } } })),
+        t("save_template", "Save a template of the user's own (replaces one with the same id). Either a full definition (id, name, html, params, example, rect, category, description), or from_layer = an html layer's id (plus name), or copy_of = a template id plus id and the fields to change. See guide \"writing-templates\".".into(),
+            &json!({ "type": "object", "additionalProperties": false,
+                "properties": {
+                    "id": { "type": "string", "maxLength": 40 }, "name": { "type": "string", "maxLength": 80 },
+                    "category": { "type": "string", "maxLength": 40 }, "description": { "type": "string", "maxLength": 500 },
+                    "html": { "type": "string", "maxLength": MAX_LAYER_HTML },
+                    "params": { "type": "array", "maxItems": 40, "items": { "type": "object" } },
+                    "example": { "type": "object" }, "update": { "type": "object" },
+                    "rect": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "type": "number", "minimum": 0, "maximum": 1 } },
+                    "full_frame": { "type": "boolean" },
+                    "from_layer": { "type": "string", "maxLength": 40 }, "copy_of": { "type": "string", "maxLength": 40 } } })),
+        t("delete_template", "Delete a template of the user's own (built-ins stay). Layers using it show \"template missing\".".into(),
+            &json!({ "type": "object", "required": ["id"], "additionalProperties": false,
+                "properties": { "id": { "type": "string", "maxLength": 40 } } })),
+        t("list_scenes", "Saved looks (scenes): id, name, number of layers, whether background and webcam are included.".into(), &none),
+        t("save_scene", "Save the current overlay layers (shown or hidden) as a look under a name, optionally with the background and the webcam overlay. The same name replaces it.".into(),
+            &json!({ "type": "object", "required": ["name"], "additionalProperties": false,
+                "properties": { "name": { "type": "string", "maxLength": 80 },
+                    "include_background": { "type": "boolean" }, "include_webcam": { "type": "boolean" } } })),
+        t("load_scene", "Bring back a saved look: mode replace (default: the other layers are removed first) or add (in front of the current ones). Layers show as saved; a saved background and webcam overlay come back too. Says what was skipped.".into(),
+            &json!({ "type": "object", "required": ["id"], "additionalProperties": false,
+                "properties": { "id": { "type": "string", "maxLength": 40 }, "mode": { "enum": ["replace", "add"] } } })),
+        t("delete_scene", "Delete a saved look.".into(),
+            &json!({ "type": "object", "required": ["id"], "additionalProperties": false,
+                "properties": { "id": { "type": "string", "maxLength": 40 } } })),
     ]
 }
 
@@ -291,6 +362,9 @@ loop and muted default true), youtube (link; muted and loop default true). Style
 minimal (white text with a shadow, no box), brand (Page2Cam navy and blue); colour and background override the text and box colours. \
 Animations (enter/exit): none, fade (default), slide-left, slide-right, slide-up, slide-down. hide_after_s hides it by itself. \
 Sound of unmuted videos goes to the stream only (with page sound). Layers come back hidden after a restart. \
+template: a ready-made graphic (template = an id from list_templates, params = its values; geometry defaults from the template; \
+guide <template id> lists the params); update_layer with params changes values live without reloading (null resets one). \
+A picture param may be given as {\"path\": \"C:\\\\...\\\\logo.png\"} (read and embedded, up to 1 MB). \
 Check the result with snapshot.";
 
 /// The `add_layer` (`add`) or `update_layer` input schema.
@@ -321,9 +395,12 @@ fn layer_schema(add: bool) -> Value {
         "link": { "type": "string", "maxLength": 2048 },
         "start_s": { "type": "integer", "minimum": 0, "maximum": 86400 },
         "loop": { "type": "boolean" }, "muted": { "type": "boolean" },
+        "template": { "type": "string", "maxLength": 40 },
+        "params": { "type": "object" },
     });
     if add {
-        props["kind"] = json!({ "enum": ["title", "ticker", "html", "image", "video", "youtube"] });
+        props["kind"] =
+            json!({ "enum": ["title", "ticker", "html", "template", "image", "video", "youtube"] });
         json!({ "type": "object", "required": ["kind"], "additionalProperties": false, "properties": props })
     } else {
         json!({ "type": "object", "required": ["id"], "additionalProperties": false, "minProperties": 2, "properties": props })
@@ -364,6 +441,8 @@ const LAYER_FIELDS: &[&str] = &[
     "start_s",
     "loop",
     "muted",
+    "template",
+    "params",
 ];
 
 fn int_arg(args: &Args, k: &str, lo: i64, hi: i64) -> Result<Option<i64>, String> {
@@ -533,7 +612,85 @@ fn layer_body(args: &Args) -> Result<Map<String, Value>, String> {
     if let Some(s) = int_arg(args, "start_s", 0, 86400)? {
         m.insert("start_s".into(), s.into());
     }
+    if let Some(t) = str_arg(args, "template")? {
+        let t = t.trim();
+        if !is_simple_id(t) {
+            return Err("template must be an id from list_templates".into());
+        }
+        m.insert("template".into(), t.into());
+    }
+    match args.get("params") {
+        None => {}
+        Some(Value::Object(p)) => {
+            let mut p = p.clone();
+            embed_paths(&mut p)?;
+            if serde_json::to_string(&p).map_or(0, |s| s.len()) > MAX_PARAMS_BYTES {
+                return Err("params are larger than 2 MB".into());
+            }
+            m.insert("params".into(), Value::Object(p));
+        }
+        Some(_) => return Err("params must be an object of parameter values".into()),
+    }
     Ok(m)
+}
+
+/// Largest parameter set of a template layer.
+const MAX_PARAMS_BYTES: usize = 2 * 1024 * 1024;
+/// Largest picture a template param may embed.
+const MAX_PARAM_PICTURE: usize = 1024 * 1024;
+
+/// `[A-Za-z0-9_-]`, 1..=40.
+fn is_simple_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 40
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Template params given as `{"path": "C:\\…\\logo.png"}` become
+/// `data:image/…;base64,` URIs (local drives only, pictures up to 1 MB).
+fn embed_paths(params: &mut Map<String, Value>) -> Result<(), String> {
+    for (k, v) in params.iter_mut() {
+        let Some(o) = v.as_object() else { continue };
+        let Some(path) = o.get("path").and_then(Value::as_str) else {
+            return Err(format!(
+                "params.{k}: give a value, or {{\"path\": \"C:\\\\...\\\\picture.png\"}} for a picture"
+            ));
+        };
+        if o.len() != 1 {
+            return Err(format!("params.{k}: give only path"));
+        }
+        if !is_local_drive_path(path) {
+            return Err(format!(
+                "params.{k}: path must be a local file on a drive (like C:\\Pictures\\logo.png); network shares are not allowed"
+            ));
+        }
+        let meta = std::fs::metadata(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        if !meta.is_file() || meta.len() as usize > MAX_PARAM_PICTURE {
+            return Err(format!(
+                "params.{k}: {path} must be a picture file of at most 1 MB"
+            ));
+        }
+        let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "png"
+        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            "jpeg"
+        } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+            "webp"
+        } else if bytes.starts_with(b"GIF8") {
+            "gif"
+        } else {
+            return Err(format!(
+                "params.{k}: {path} is not a PNG, JPEG, WebP or GIF picture"
+            ));
+        };
+        *v = Value::String(format!(
+            "data:image/{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        ));
+    }
+    Ok(())
 }
 
 fn layer_id(args: &Args) -> Result<String, String> {
@@ -874,7 +1031,9 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
             let kind = one_of(
                 "kind",
                 req_str(args, "kind")?,
-                &["title", "ticker", "html", "image", "video", "youtube"],
+                &[
+                    "title", "ticker", "html", "template", "image", "video", "youtube",
+                ],
             )?;
             let mut m = layer_body(args)?;
             m.insert("kind".into(), kind.into());
@@ -919,6 +1078,121 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(C::ReorderLayers(ids))
+        })(),
+        "guide" => (|| {
+            only(args, &["topic"])?;
+            let t = text_arg(args, "topic", 200)?;
+            Ok(C::Guide(t.filter(|s| !s.trim().is_empty())))
+        })(),
+        "list_templates" => (|| {
+            only(args, &["category"])?;
+            let c = text_arg(args, "category", 40)?.filter(|s| !s.trim().is_empty());
+            if let Some(c) = &c {
+                if !is_simple_id(c.trim()) {
+                    return Err("category must be one of basics, time, cards, lists, data, cta, calm, software, mine".into());
+                }
+            }
+            Ok(C::ListTemplates(c.map(|c| c.trim().to_string())))
+        })(),
+        "get_template" | "delete_template" | "delete_scene" => (|| {
+            let allowed: &[&str] = if name == "get_template" {
+                &["id", "include_html"]
+            } else {
+                &["id"]
+            };
+            only(args, allowed)?;
+            let id = req_str(args, "id")?.trim().to_string();
+            if !is_simple_id(&id) {
+                return Err(format!(
+                    "id must be an id from {}",
+                    if name == "delete_scene" {
+                        "list_scenes"
+                    } else {
+                        "list_templates"
+                    }
+                ));
+            }
+            Ok(match name {
+                "get_template" => C::GetTemplate {
+                    id,
+                    include_html: bool_arg(args, "include_html")?.unwrap_or(false),
+                },
+                "delete_template" => C::DeleteTemplate(id),
+                _ => C::DeleteScene(id),
+            })
+        })(),
+        "save_template" => (|| {
+            only(
+                args,
+                &[
+                    "id",
+                    "name",
+                    "category",
+                    "description",
+                    "html",
+                    "params",
+                    "example",
+                    "update",
+                    "rect",
+                    "full_frame",
+                    "from_layer",
+                    "copy_of",
+                ],
+            )?;
+            if args.is_empty() {
+                return Err("give a template definition, from_layer or copy_of".into());
+            }
+            if let Some(h) = str_arg(args, "html")? {
+                if h.len() > MAX_LAYER_HTML {
+                    return Err("html is larger than 256 KB".into());
+                }
+            }
+            for k in ["id", "from_layer", "copy_of"] {
+                if let Some(v) = str_arg(args, k)? {
+                    if !is_simple_id(v) {
+                        return Err(format!("{k} must be an id (a-z, 0-9 and -)"));
+                    }
+                }
+            }
+            if args.contains_key("from_layer") && args.contains_key("copy_of") {
+                return Err("give from_layer or copy_of, not both".into());
+            }
+            if !args.contains_key("from_layer") && !args.contains_key("copy_of") {
+                for k in ["id", "name", "html"] {
+                    if !args.contains_key(k) {
+                        return Err(format!(
+                            "{k} is required for a new template (or use from_layer / copy_of)"
+                        ));
+                    }
+                }
+            }
+            Ok(C::SaveTemplate(Value::Object(args.clone())))
+        })(),
+        "list_scenes" => return simple(C::ListScenes),
+        "save_scene" => (|| {
+            only(args, &["name", "include_background", "include_webcam"])?;
+            let n = req_str(args, "name")?.trim();
+            if n.is_empty() || n.chars().count() > 80 {
+                return Err("name must be 1 to 80 characters".into());
+            }
+            Ok(C::SaveScene {
+                name: n.to_string(),
+                include_background: bool_arg(args, "include_background")?.unwrap_or(false),
+                include_webcam: bool_arg(args, "include_webcam")?.unwrap_or(false),
+            })
+        })(),
+        "load_scene" => (|| {
+            only(args, &["id", "mode"])?;
+            let id = req_str(args, "id")?.trim().to_string();
+            if !is_simple_id(&id) {
+                return Err("id must be an id from list_scenes".into());
+            }
+            let replace = match str_arg(args, "mode")?.unwrap_or("replace") {
+                "replace" => true,
+                "add" => false,
+                _ => return Err("mode must be replace or add".into()),
+            };
+            Ok(C::LoadScene { id, replace })
         })(),
         _ => return Err(None),
     };

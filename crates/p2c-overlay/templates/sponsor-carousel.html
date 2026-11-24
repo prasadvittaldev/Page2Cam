@@ -1,0 +1,55 @@
+<style>
+  .sp{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;padding:3.5vh 4vh 3vh;border-radius:2.5vh;border-top:1.6vh solid var(--accent)}
+  .theme-minimal .sp{border-top-color:transparent}
+  .sp .hd{flex:none;font-size:9vh;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;max-width:100%}
+  .sp .item{flex:1;min-height:0;width:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1.5vh;transition:opacity .7s ease}
+  .sp .item img{flex:0 1 auto;min-height:0;max-height:58%;max-width:90%;object-fit:contain}
+  .sp .nm{font-size:17vh;font-weight:700;max-width:100%;text-align:center}
+  .sp .item.logo .nm{font-size:9vh;color:var(--muted);font-weight:600}
+  .sp .dots{flex:none;display:flex;gap:1.5vh;height:2.2vh}
+  .sp .dot{width:2.2vh;height:2.2vh;border-radius:50%;background:var(--line);transition:background .7s ease}
+  .sp .dot.on{background:var(--accent)}
+  .theme-minimal .sp .dot.on{background:#fff}
+</style>
+<div class="sp p2c-panel"><div class="hd p2c-ellipsis" id="hd"></div><div class="item" id="item"><img id="logo" alt=""><div class="nm p2c-ellipsis" id="nm"></div></div><div class="dots" id="dots"></div></div>
+<script>
+var idx = 0, gen = 0;
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#hd"), p.heading);
+  P2C.show(P2C.$("#hd"), !!p.heading);
+  var rows = (p.sponsors || []).map(function (r) {
+    return { name: String(r[0] === undefined || r[0] === null ? "" : r[0]), logo: P2C.asset(r[1]) };
+  }).filter(function (r) { return r.name.trim() || r.logo; });
+  gen++;
+  var my = gen;
+  var item = P2C.$("#item"), dots = P2C.clear(P2C.$("#dots"));
+  P2C.stop("rot");
+  if (!rows.length) { P2C.show(item, false); return; }
+  P2C.show(item, true);
+  if (idx >= rows.length) idx = 0;
+  rows.forEach(function () { P2C.el("div", "dot", null, dots); });
+  P2C.show(dots, rows.length > 1);
+  function render() {
+    var r = rows[idx];
+    var has = P2C.img(P2C.$("#logo"), r.logo);
+    item.classList.toggle("logo", has);
+    P2C.text(P2C.$("#nm"), r.name);
+    P2C.show(P2C.$("#nm"), !!r.name.trim());
+    P2C.$$(".dot", dots).forEach(function (d, i) { d.classList.toggle("on", i === idx); });
+  }
+  render();
+  item.style.opacity = "1";
+  if (rows.length < 2) return;
+  var first = true;
+  P2C.every("rot", Math.max(2, Number(p.seconds) || 5) * 1000, function () {
+    if (first) { first = false; return; }
+    item.style.opacity = "0";
+    setTimeout(function () {
+      if (my !== gen) return;
+      idx = (idx + 1) % rows.length;
+      render();
+      item.style.opacity = "1";
+    }, 750);
+  });
+});
+</script>

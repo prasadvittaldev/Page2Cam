@@ -1,0 +1,15 @@
+{
+  "name": "Clock",
+  "category": "time",
+  "description": "The current time, local or at a fixed UTC offset, 24h or 12h, with an optional label such as a city.",
+  "rect": [0.82, 0.05, 0.15, 0.1],
+  "params": [
+    {"name": "label", "type": "text", "default": "", "help": "Small line above the time, e.g. London (empty: none)"},
+    {"name": "format", "type": "choice", "options": ["24h", "12h"], "default": "24h", "help": "24h (18:30) or 12h (6:30 PM)"},
+    {"name": "seconds", "type": "bool", "default": false, "help": "Show seconds"},
+    {"name": "use_local", "type": "bool", "default": true, "help": "true: this computer's time zone; false: use utc_offset"},
+    {"name": "utc_offset", "type": "number", "min": -12, "max": 14, "default": 0, "help": "Hours from UTC when use_local is false, e.g. -5, 1, 5.5 (no daylight saving: give the current offset)"}
+  ],
+  "example": {"label": "Local time", "format": "24h", "seconds": true},
+  "update": {"label": "New York", "use_local": false, "utc_offset": -5, "format": "12h"}
+}

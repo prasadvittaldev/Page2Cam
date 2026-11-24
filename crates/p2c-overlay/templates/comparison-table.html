@@ -1,0 +1,61 @@
+<style>
+  .ct{position:absolute;inset:0;display:flex;flex-direction:column;padding:3.5vh 3.5vh 2.5vh;border-radius:2vh;border-top:1.2vh solid var(--accent)}
+  .theme-minimal .ct{border-top-color:transparent}
+  .ct h1{margin:0 0 1.5vh;font-size:7.5vh;font-weight:700;flex:none;max-width:100%}
+  .grid{flex:1;display:flex;flex-direction:column;min-height:0}
+  .row{flex:1;display:flex;align-items:stretch;min-height:0;max-height:16vh;border-bottom:.25vh solid var(--line)}
+  .row:last-child{border-bottom:0}
+  .cell{flex:1;display:flex;align-items:center;justify-content:center;min-width:0;padding:0 1.2vh;text-align:center;font-variant-numeric:tabular-nums}
+  .cell.f{flex:1.7;justify-content:flex-start;text-align:left}
+  .cell span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  .cell.hl{background:color-mix(in srgb,var(--accent) 24%,transparent)}
+  .head .cell{font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-size:.82em}
+  .head .cell.hl{color:var(--fg);box-shadow:inset 0 -.6vh 0 var(--accent);border-radius:1vh 1vh 0 0}
+  .row:last-child .cell.hl{border-radius:0 0 1vh 1vh}
+  .yes{color:#3fcf7f;font-weight:800;font-size:1.15em}
+  .no{color:#ef6b63;font-weight:800;font-size:1.05em;opacity:.85}
+  .theme-minimal .yes,.theme-minimal .no{color:#ffffff}
+</style>
+<div class="ct p2c-panel"><h1 class="p2c-ellipsis" id="h"></h1><div class="grid" id="grid"></div></div>
+<script>
+function ynOf(v) {
+  var s = String(v).trim().toLowerCase();
+  if (s === "yes" || s === "y" || s === "true" || s === "✓") return 1;
+  if (s === "no" || s === "n" || s === "false" || s === "✗") return -1;
+  return 0;
+}
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.show(P2C.$("#h"), !!p.title);
+  var rows = (p.rows || []).filter(function (r) { return r && r.length; });
+  var heads = p.headers || [];
+  var n = Math.max(heads.length - 1, 0);
+  rows.forEach(function (r) {
+    for (var i = r.length - 1; i >= 1; i--) {
+      if (String(r[i]).trim()) { n = Math.max(n, i); break; }
+    }
+  });
+  n = Math.max(1, Math.min(3, n));
+  var hi = { a: 1, b: 2, c: 3 }[p.highlight] || 0;
+  var hasHead = heads.some(function (h) { return String(h).trim(); });
+  var g = P2C.clear(P2C.$("#grid"));
+  var count = rows.length + (hasHead ? 1 : 0);
+  g.style.fontSize = Math.min(6.5, 62 / Math.max(1, count)).toFixed(2) + "vh";
+  function fill(c, v, plain) {
+    v = v === undefined || v === null ? "" : String(v);
+    var k = plain ? 0 : ynOf(v);
+    if (k === 1) P2C.el("span", "yes", "✓", c);
+    else if (k === -1) P2C.el("span", "no", "✗", c);
+    else P2C.el("span", "", v, c);
+  }
+  function line(cells, head) {
+    var row = P2C.el("div", "row" + (head ? " head" : ""), null, g);
+    for (var i = 0; i <= n; i++) {
+      var c = P2C.el("div", "cell" + (i === 0 ? " f" : "") + (i === hi ? " hl" : ""), null, row);
+      fill(c, cells[i], head || i === 0);
+    }
+  }
+  if (hasHead) line(heads, true);
+  rows.forEach(function (r) { line(r, false); });
+});
+</script>

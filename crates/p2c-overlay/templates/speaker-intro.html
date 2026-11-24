@@ -1,0 +1,52 @@
+<style>
+  .card{position:absolute;inset:0;overflow:hidden;background:var(--bg);
+    background-image:radial-gradient(circle at 20% 30%,rgba(255,255,255,.08),transparent 45%),radial-gradient(circle at 85% 90%,rgba(0,0,0,.25),transparent 50%)}
+  .theme-minimal .card{background-color:rgba(0,0,0,.72)}
+  .card .in{position:absolute;left:9vw;right:9vw;top:8vh;bottom:8vh;display:flex;align-items:center;gap:5vw}
+  .card .ph{flex:none;position:relative;width:46vh;height:46vh;border-radius:50%;overflow:hidden;border:1vh solid var(--accent);background:var(--accent)}
+  .card .ph img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  .card .ini{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:17vh;font-weight:800;color:#fff;text-shadow:none}
+  .theme-minimal .card .ini{color:#000}
+  .card .txt{flex:1;min-width:0}
+  .card .co{font-size:3.4vh;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.16em;margin-bottom:1.5vh}
+  .card h1{margin:0;font-size:10vh;font-weight:800;letter-spacing:-.01em;line-height:1.1;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+  .card .role{margin-top:1.5vh;font-size:4.8vh;color:var(--muted)}
+  .card .rule{width:12vh;height:1vh;border-radius:.5vh;background:var(--accent);margin:4vh 0}
+  .card .bio{max-width:62ch;font-size:3.6vh;line-height:1.45;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:5;overflow:hidden}
+</style>
+<div class="card" id="card">
+  <div class="in">
+    <div class="ph"><span class="ini" id="ini"></span><img id="img" alt=""></div>
+    <div class="txt">
+      <div class="co p2c-ellipsis" id="co"></div>
+      <h1 id="h"></h1>
+      <div class="role p2c-ellipsis" id="role"></div>
+      <div class="rule"></div>
+      <div class="bio" id="bio"></div>
+    </div>
+  </div>
+</div>
+<script>
+function initials(name) {
+  var words = String(name || "").trim().split(/\s+/).filter(function (w) { return w && !/\.$/.test(w); });
+  if (!words.length) words = String(name || "").trim().split(/\s+/).filter(function (w) { return !!w; });
+  if (!words.length) return "";
+  var a = words[0].charAt(0), b = words.length > 1 ? words[words.length - 1].charAt(0) : "";
+  return (a + b).toUpperCase();
+}
+P2C.onParams(function (p) {
+  P2C.$("#card").style.backgroundColor = p.background || "";
+  P2C.text(P2C.$("#h"), p.name);
+  P2C.text(P2C.$("#co"), p.company);
+  P2C.show(P2C.$("#co"), !!p.company);
+  P2C.text(P2C.$("#role"), p.role);
+  P2C.show(P2C.$("#role"), !!p.role);
+  var bio = String(p.bio || "").trim();
+  if (bio.length > 300) bio = bio.slice(0, 297).replace(/\s+\S*$/, "") + "...";
+  P2C.text(P2C.$("#bio"), bio);
+  P2C.show(P2C.$("#bio"), !!bio);
+  P2C.text(P2C.$("#ini"), initials(p.name));
+  var hasPhoto = P2C.img(P2C.$("#img"), p.photo);
+  P2C.show(P2C.$("#ini"), !hasPhoto);
+});
+</script>

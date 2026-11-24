@@ -1,0 +1,13 @@
+{
+  "name": "Quote card",
+  "category": "lists",
+  "description": "A quotation with a large quotation mark, the author and their role; for testimonials, famous quotes and pull quotes.",
+  "rect": [0.1, 0.62, 0.6, 0.3],
+  "params": [
+    {"name": "quote", "type": "longtext", "required": true, "help": "The quote itself, without quotation marks. Best under 200 characters; longer text gets smaller and is cut after 5 lines"},
+    {"name": "author", "type": "text", "default": "", "help": "Who said it (empty: no author line)"},
+    {"name": "role", "type": "text", "default": "", "help": "Their role, company or source, shown after the author"}
+  ],
+  "example": {"quote": "The best way to predict the future is to invent it.", "author": "Alan Kay", "role": "Computer scientist"},
+  "update": {"quote": "Simple things should be simple, complex things should be possible.", "author": "Alan Kay", "role": "Turing Award 2003"}
+}

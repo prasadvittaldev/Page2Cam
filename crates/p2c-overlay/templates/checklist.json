@@ -1,0 +1,13 @@
+{
+  "name": "Checklist",
+  "category": "lists",
+  "description": "A checklist with ticked and open items and a done count; tick items off live (release checklist, preflight, to-do list).",
+  "rect": [0.66, 0.1, 0.29, 0.5],
+  "params": [
+    {"name": "title", "type": "text", "default": "Checklist", "help": "Heading (empty: none)"},
+    {"name": "items", "type": "table", "columns": ["item", "done"], "max_items": 12, "required": true, "help": "Up to 12 rows: item text, done (yes/no or 1/0)"},
+    {"name": "show_count", "type": "bool", "default": true, "help": "Show the done count (e.g. 2 / 5) next to the heading"}
+  ],
+  "example": {"title": "Launch checklist", "items": [["Tests green", "yes"], ["Docs updated", "yes"], ["Changelog written", "no"], ["Release notes sent", "no"], ["Tag the release", "no"]]},
+  "update": {"items": [["Tests green", "yes"], ["Docs updated", "yes"], ["Changelog written", "yes"], ["Release notes sent", "no"], ["Tag the release", "no"]]}
+}

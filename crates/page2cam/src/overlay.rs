@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use p2c_browser::BrowserHandle;
 use p2c_compositor::OverlayFeed;
-use p2c_overlay::{Assets, LayerSet};
+use p2c_overlay::{Assets, LayerSet, SceneStore, TemplateLib};
 use parking_lot::Mutex;
 use serde_json::Value;
 
@@ -56,6 +56,7 @@ struct Gov {
 /// The engine's overlay layers.
 pub struct OverlayLayers {
     set: Mutex<LayerSet>,
+    scenes: Mutex<SceneStore>,
     assets: Assets,
     file: Option<PathBuf>,
     /// For the ticker: CPU frames and "any layer visible".
@@ -99,11 +100,31 @@ impl OverlayLayers {
             },
             None => LayerSet::new(),
         };
+        let (lib, scenes) = match &dir {
+            Some(d) => {
+                let (lib, bad) = TemplateLib::open(d.join("templates"));
+                for e in bad {
+                    tracing::warn!("overlay template skipped: {e}");
+                }
+                let (scenes, bad) = SceneStore::open(d.join("scenes"));
+                for e in bad {
+                    tracing::warn!("overlay scene skipped: {e}");
+                }
+                (lib, scenes)
+            }
+            None => (TemplateLib::builtin_only(), SceneStore::in_memory()),
+        };
+        let mut set = set;
+        set.set_templates(lib);
         if dir.is_some() {
-            assets.prune(&set.assets_in_use());
+            let scene_files = scenes.assets_in_use();
+            let mut keep = set.assets_in_use();
+            keep.extend(scene_files.iter().map(String::as_str));
+            assets.prune(&keep);
         }
         OverlayLayers {
             set: Mutex::new(set),
+            scenes: Mutex::new(scenes),
             assets,
             file,
             feed: OverlayFeed::default(),
@@ -192,12 +213,64 @@ impl OverlayLayers {
     }
 
     pub fn layers(&self) -> Vec<Value> {
-        self.set
+        self.set.lock().layers_json()
+    }
+
+    pub fn templates(&self, category: Option<&str>) -> Value {
+        self.set.lock().templates().list_json(category)
+    }
+
+    pub fn template(&self, id: &str) -> Option<Value> {
+        self.set.lock().templates().full_json(id)
+    }
+
+    /// Save a user template (layers using it reload).
+    pub fn save_template(&self, def: Value) -> Result<Value> {
+        self.change(|s, _| Ok(s.save_template(def)?.to_json(true)))
+    }
+
+    pub fn delete_template(&self, id: &str) -> Result<()> {
+        self.change(|s, _| s.delete_template(id))
+    }
+
+    pub fn scenes(&self) -> Value {
+        serde_json::json!({ "scenes": self.scenes.lock().list() })
+    }
+
+    /// Save the layers (and the given background/webcam) as a scene.
+    pub fn save_scene(
+        &self,
+        name: &str,
+        background: Option<Value>,
+        webcam: Option<Value>,
+    ) -> Result<Value> {
+        let layers = self.set.lock().scene_layers();
+        let s = self
+            .scenes
             .lock()
-            .layers()
-            .iter()
-            .map(|l| l.to_json())
-            .collect()
+            .save(name, layers, background, webcam, &self.assets)?;
+        Ok(s.summary())
+    }
+
+    /// Bring back a scene's layers; the scene (for its background and
+    /// webcam) and what was added or skipped.
+    pub fn load_scene(
+        &self,
+        id: &str,
+        replace: bool,
+    ) -> Result<(p2c_overlay::Scene, p2c_overlay::SceneLoad)> {
+        let scene = self
+            .scenes
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no scene {id:?} (list_scenes shows the ids)"))?;
+        let r = self.change(|s, a| s.load_scene(&scene, replace, a, Instant::now()))?;
+        Ok((scene, r))
+    }
+
+    pub fn delete_scene(&self, id: &str) -> Result<()> {
+        self.scenes.lock().delete(id, &self.assets)
     }
 
     pub fn add(&self, spec: Value) -> Result<Value> {
@@ -229,8 +302,8 @@ impl OverlayLayers {
         (since != Some(s.rev())).then(|| s.state_json())
     }
 
-    pub fn html_of(&self, id: &str) -> Option<String> {
-        self.set.lock().html_of(id).map(str::to_string)
+    pub fn layer_page(&self, id: &str) -> Option<String> {
+        self.set.lock().layer_page(id)
     }
 
     pub fn asset(&self, name: &str) -> Option<(Vec<u8>, &'static str)> {
@@ -288,6 +361,35 @@ mod tests {
             decide(false, Some(true), &mut hs, soon + IDLE_AFTER),
             Some(false)
         );
+    }
+
+    #[test]
+    fn templates_and_scenes_persist() {
+        let d = tempfile::tempdir().unwrap();
+        let o = OverlayLayers::new(Some(d.path()), 30);
+        o.save_template(json!({"copy_of": "lower-third", "id": "mine"}))
+            .unwrap();
+        o.add(
+            json!({"kind": "template", "template": "mine", "id": "lt", "params": {"title": "Sam"}}),
+        )
+        .unwrap();
+        let s = o
+            .save_scene("Main", Some(json!({"full": "page"})), None)
+            .unwrap();
+        assert_eq!(s["id"], "main");
+        o.clear();
+        let (scene, r) = o.load_scene("main", true).unwrap();
+        assert_eq!(r.added, ["lt"]);
+        assert_eq!(scene.background, Some(json!({"full": "page"})));
+        assert_eq!(o.visible_count(), 1, "shown as saved");
+        // After a restart: the template and the scene are still there.
+        let again = OverlayLayers::new(Some(d.path()), 30);
+        assert!(again.template("mine").is_some());
+        assert_eq!(again.scenes()["scenes"][0]["id"], "main");
+        assert!(again.load_scene("nope", true).is_err());
+        again.delete_scene("main").unwrap();
+        again.delete_template("mine").unwrap();
+        assert_eq!(again.layers()[0]["template_missing"], true);
     }
 
     #[test]

@@ -1,0 +1,42 @@
+<style>
+  .ck{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:10vh;border-bottom:5vh solid var(--accent);min-width:0}
+  .theme-minimal .ck{border-bottom-color:transparent}
+  .ck .lbl{max-width:92%;font-size:20vh;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+  .ck .tm{max-width:96%;font-size:46vh;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.05;white-space:nowrap}
+  .ck.one .tm{font-size:56vh}
+  .ck .ap{font-size:.45em;font-weight:600;margin-left:.2em;color:var(--muted)}
+</style>
+<div class="ck p2c-panel" id="ck"><div class="lbl p2c-ellipsis" id="lbl"></div><div class="tm"><span id="tm"></span><span class="ap" id="ap"></span></div></div>
+<script>
+function pad2(n) { return (n < 10 ? "0" : "") + n; }
+function drawClock() {
+  var q = P2C.params, h, m, s, d;
+  if (q.use_local === false) {
+    var off = P2C.num(q.utc_offset);
+    if (!isFinite(off)) off = 0;
+    d = new Date(Date.now() + off * 3600000);
+    h = d.getUTCHours(); m = d.getUTCMinutes(); s = d.getUTCSeconds();
+  } else {
+    d = new Date();
+    h = d.getHours(); m = d.getMinutes(); s = d.getSeconds();
+  }
+  var ap = "", hs;
+  if (q.format === "12h") {
+    ap = h < 12 ? "AM" : "PM";
+    h = h % 12;
+    if (h === 0) h = 12;
+    hs = String(h);
+  } else {
+    hs = pad2(h);
+  }
+  P2C.text(P2C.$("#tm"), hs + ":" + pad2(m) + (q.seconds ? ":" + pad2(s) : ""));
+  P2C.text(P2C.$("#ap"), ap);
+  P2C.show(P2C.$("#ap"), !!ap);
+}
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#lbl"), p.label);
+  P2C.show(P2C.$("#lbl"), !!p.label);
+  P2C.$("#ck").classList.toggle("one", !p.label);
+  P2C.every("clock", 250, drawClock);
+});
+</script>

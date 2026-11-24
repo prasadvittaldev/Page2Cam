@@ -1,0 +1,28 @@
+<style>
+  .qt{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:7vh 7vh 7vh 22vh;border-radius:3vh;overflow:hidden;border-left:1.6vh solid var(--accent)}
+  .theme-minimal .qt{border-left-color:rgba(255,255,255,.6)}
+  .qt .mk{position:absolute;left:4vh;top:-4vh;font-size:56vh;line-height:1;font-weight:800;color:var(--accent);opacity:.9;text-shadow:none}
+  .theme-minimal .qt .mk{color:rgba(255,255,255,.7)}
+  .qt .q{margin:0;font-size:var(--qs,10vh);font-weight:600;line-height:1.25;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:5;overflow:hidden;transition:opacity .5s}
+  .qt .by{margin-top:4vh;display:flex;align-items:baseline;gap:2vh;min-width:0;font-size:7vh}
+  .qt .au{font-weight:700;flex:none;max-width:60%}
+  .qt .au::before{content:"\2014\00a0";color:var(--accent)}
+  .qt .ro{color:var(--muted);flex:1;min-width:0}
+</style>
+<div class="qt p2c-panel"><div class="mk">&#8220;</div><p class="q" id="q"></p><div class="by" id="by"><span class="au p2c-ellipsis" id="au"></span><span class="ro p2c-ellipsis" id="ro"></span></div></div>
+<script>
+P2C.onParams(function (p) {
+  var q = String(p.quote || "").trim();
+  var n = q.length;
+  var size = n <= 60 ? 11 : n <= 120 ? 9 : n <= 200 ? 7.5 : n <= 320 ? 6 : 5;
+  if (!p.author && !p.role) size = size * 1.1;
+  var el = P2C.$("#q");
+  el.style.setProperty("--qs", size + "vh");
+  P2C.text(el, q);
+  P2C.text(P2C.$("#au"), p.author);
+  P2C.show(P2C.$("#au"), !!p.author);
+  P2C.text(P2C.$("#ro"), p.role);
+  P2C.show(P2C.$("#ro"), !!p.role);
+  P2C.show(P2C.$("#by"), !!(p.author || p.role));
+});
+</script>
