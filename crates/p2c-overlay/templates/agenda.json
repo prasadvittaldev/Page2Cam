@@ -1,0 +1,13 @@
+{
+  "name": "Agenda",
+  "category": "lists",
+  "description": "A numbered agenda with the current item highlighted and earlier items ticked; move `current` as the session goes on.",
+  "rect": [0.66, 0.1, 0.29, 0.5],
+  "params": [
+    {"name": "title", "type": "text", "default": "Agenda", "help": "Heading (empty: none)"},
+    {"name": "items", "type": "list", "max_items": 12, "required": true, "help": "Up to 12 agenda items, in order, short (a few words each)"},
+    {"name": "current", "type": "number", "default": 0, "min": 0, "max": 12, "help": "The item happening now, 1-based (0: none highlighted). Earlier items are shown as done"}
+  ],
+  "example": {"title": "Today", "items": ["Welcome", "Product demo", "Roadmap", "Customer story", "Q&A"], "current": 2},
+  "update": {"current": 3}
+}

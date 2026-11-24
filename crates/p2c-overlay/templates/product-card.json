@@ -1,0 +1,31 @@
+{
+  "name": "Product card",
+  "category": "cta",
+  "description": "Live-shopping card: product picture, name, price with the old price struck through, a discount badge, an optional offer countdown and a stock bar.",
+  "rect": [0.69, 0.1, 0.26, 0.8],
+  "params": [
+    {"name": "name", "type": "text", "required": true, "help": "Product name"},
+    {"name": "picture", "type": "asset", "default": "", "help": "Product picture: an https address or a data:image URI (empty: no picture)"},
+    {"name": "price", "type": "text", "required": true, "help": "Price as shown, e.g. $79 or 79,00 EUR"},
+    {"name": "old_price", "type": "text", "default": "", "help": "Earlier price, shown struck through (empty: none)"},
+    {"name": "badge", "type": "text", "default": "", "help": "Short badge, e.g. -20% or NEW (empty: none)"},
+    {"name": "offer_until", "type": "datetime", "default": "", "help": "Offer ends at this time (18:30 or 2026-12-31T18:30); wins over offer_duration"},
+    {"name": "offer_duration", "type": "duration", "default": 0, "help": "Or the offer runs this long from when it is shown (seconds or m:ss; 0 and no time: no countdown)"},
+    {"name": "offer_text", "type": "text", "default": "Offer ends in", "help": "Text before the countdown"},
+    {"name": "stock_left", "type": "number", "default": 0, "min": 0, "max": 1000000, "help": "Items left (shown when stock_total is above 0)"},
+    {"name": "stock_total", "type": "number", "default": 0, "min": 0, "max": 1000000, "help": "Items at the start, for the stock bar (0: no stock bar)"},
+    {"name": "cta", "type": "text", "default": "", "help": "Call to action at the bottom, e.g. Link in the description (empty: none)"}
+  ],
+  "example": {
+    "name": "Studio ANC headphones",
+    "picture": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA0MDAgMzAwIj48ZGVmcz48bGluZWFyR3JhZGllbnQgaWQ9ImciIHgxPSIwIiB5MT0iMCIgeDI9IjEiIHkyPSIxIj48c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNmNGY3ZmIiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiNkM2RjZTciLz48L2xpbmVhckdyYWRpZW50PjxsaW5lYXJHcmFkaWVudCBpZD0iYyIgeDE9IjAiIHkxPSIwIiB4Mj0iMCIgeTI9IjEiPjxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iIzJmMzk0YiIvPjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzEwMTQxYyIvPjwvbGluZWFyR3JhZGllbnQ+PC9kZWZzPjxyZWN0IHdpZHRoPSI0MDAiIGhlaWdodD0iMzAwIiBmaWxsPSJ1cmwoI2cpIi8+PGVsbGlwc2UgY3g9IjIwMCIgY3k9IjI2NCIgcng9IjEyNSIgcnk9IjEyIiBmaWxsPSIjMDAwIiBvcGFjaXR5PSIuMTIiLz48cGF0aCBkPSJNMTEyIDE3MiBDMTEyIDkyIDE1MiA1NiAyMDAgNTYgQzI0OCA1NiAyODggOTIgMjg4IDE3MiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJ1cmwoI2MpIiBzdHJva2Utd2lkdGg9IjE2IiBzdHJva2UtbGluZWNhcD0icm91bmQiLz48cmVjdCB4PSI4NCIgeT0iMTUwIiB3aWR0aD0iNTgiIGhlaWdodD0iMTA0IiByeD0iMjciIGZpbGw9InVybCgjYykiLz48cmVjdCB4PSIyNTgiIHk9IjE1MCIgd2lkdGg9IjU4IiBoZWlnaHQ9IjEwNCIgcng9IjI3IiBmaWxsPSJ1cmwoI2MpIi8+PHJlY3QgeD0iMTMwIiB5PSIxNzAiIHdpZHRoPSIxNCIgaGVpZ2h0PSI2NCIgcng9IjciIGZpbGw9IiMwYjYzZjAiLz48cmVjdCB4PSIyNTYiIHk9IjE3MCIgd2lkdGg9IjE0IiBoZWlnaHQ9IjY0IiByeD0iNyIgZmlsbD0iIzBiNjNmMCIvPjwvc3ZnPg==",
+    "price": "$79",
+    "old_price": "$99",
+    "badge": "-20%",
+    "offer_duration": "15:00",
+    "stock_left": 7,
+    "stock_total": 40,
+    "cta": "Link in the description"
+  },
+  "update": {"stock_left": 3, "price": "$69", "badge": "-30%"}
+}

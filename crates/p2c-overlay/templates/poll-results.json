@@ -1,0 +1,13 @@
+{
+  "name": "Poll results",
+  "category": "data",
+  "description": "Live poll results: the question and one bar per option with its percentage, the leader highlighted; new vote counts animate.",
+  "rect": [0.6, 0.1, 0.35, 0.5],
+  "params": [
+    {"name": "question", "type": "text", "required": true, "help": "The poll question"},
+    {"name": "options", "type": "table", "columns": ["option", "votes"], "max_items": 8, "required": true, "help": "2 to 8 rows: option text, votes (a number)"},
+    {"name": "show_votes", "type": "bool", "default": true, "help": "Show the total number of votes under the bars"}
+  ],
+  "example": {"question": "Which feature should we build next?", "options": [["Dark mode", "412"], ["Offline sync", "268"], ["API access", "190"], ["Plugins", "95"]]},
+  "update": {"options": [["Dark mode", "430"], ["Offline sync", "520"], ["API access", "214"], ["Plugins", "101"]]}
+}

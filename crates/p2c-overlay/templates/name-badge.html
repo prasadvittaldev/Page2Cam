@@ -1,0 +1,18 @@
+<style>
+  .nb{position:absolute;left:0;top:0;bottom:0;max-width:100%;min-width:0;display:flex;flex-direction:column;justify-content:center;padding:0 9vh 0 8vh;border-radius:10vh;border-left:5vh solid var(--accent)}
+  .nb.right{left:auto;right:0;text-align:right;border-left:0;border-right:5vh solid var(--accent);padding:0 8vh 0 9vh}
+  .nb .n{font-size:38vh;font-weight:700;line-height:1.2}
+  .nb .l{font-size:24vh;color:var(--muted);line-height:1.3}
+  .nb.one .n{font-size:46vh}
+</style>
+<div class="nb p2c-panel" id="nb"><div class="n p2c-ellipsis" id="n"></div><div class="l p2c-ellipsis" id="l"></div></div>
+<script>
+P2C.onParams(function (p) {
+  var box = P2C.$("#nb");
+  P2C.text(P2C.$("#n"), p.name);
+  P2C.text(P2C.$("#l"), p.line);
+  P2C.show(P2C.$("#l"), !!p.line);
+  box.classList.toggle("one", !p.line);
+  box.classList.toggle("right", p.align === "right");
+});
+</script>

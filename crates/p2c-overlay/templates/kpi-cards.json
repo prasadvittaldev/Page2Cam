@@ -1,0 +1,13 @@
+{
+  "name": "KPI cards",
+  "category": "data",
+  "description": "2 to 4 KPI tiles with a big value and a green/red change arrow; also the metrics board for software companies (MRR, DAU, uptime, latency). Numeric values animate on change.",
+  "rect": [0.05, 0.06, 0.6, 0.2],
+  "params": [
+    {"name": "kpis", "type": "table", "columns": ["label", "value", "change", "note"], "max_items": 4, "required": true, "help": "1 to 4 rows: label, value (e.g. $48.2k, 99.98%, 182 ms), change (e.g. +12% or -3%; empty: none), note (e.g. vs last week; optional)"},
+    {"name": "title", "type": "text", "default": "", "help": "Small heading above the tiles (empty: none)"},
+    {"name": "invert", "type": "text", "default": "", "help": "Labels (comma-separated) where going down is good, e.g. p95 latency, Churn: their arrows are green when negative"}
+  ],
+  "example": {"kpis": [["MRR", "$48.2k", "+6.1%", "vs last month"], ["Daily users", "12,480", "+12%", "vs last week"], ["Uptime", "99.98%", "+0.01%", "30 days"], ["p95 latency", "182 ms", "-9%", "vs last week"]], "invert": "p95 latency"},
+  "update": {"kpis": [["MRR", "$49.6k", "+9.0%", "vs last month"], ["Daily users", "12,910", "+15%", "vs last week"], ["Uptime", "99.98%", "+0.01%", "30 days"], ["p95 latency", "176 ms", "-12%", "vs last week"]]}
+}

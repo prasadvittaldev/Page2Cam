@@ -1,0 +1,15 @@
+<style>
+  .db{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:0 5vw;border-top:4vh solid var(--accent);min-width:0}
+  .db .lab{flex:none;margin-right:22vh;padding:0 18vh;border-radius:10vh;background:var(--accent);color:#fff;font-size:38vh;font-weight:700;letter-spacing:.08em;text-transform:uppercase;line-height:1.55;text-shadow:none}
+  .theme-minimal .db .lab{color:#000}
+  .theme-minimal .db{border-top-color:transparent}
+  .db .t{min-width:0;font-size:46vh;line-height:1.3}
+</style>
+<div class="db p2c-panel"><span class="lab" id="lab"></span><span class="t p2c-ellipsis" id="t"></span></div>
+<script>
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#t"), p.text);
+  P2C.text(P2C.$("#lab"), p.label);
+  P2C.show(P2C.$("#lab"), !!p.label);
+});
+</script>

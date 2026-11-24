@@ -1,0 +1,15 @@
+{
+  "name": "Now playing",
+  "category": "lists",
+  "description": "The song that is playing: title, artist, optional cover picture and an optional progress bar.",
+  "rect": [0.05, 0.8, 0.32, 0.12],
+  "params": [
+    {"name": "title", "type": "text", "required": true, "help": "Song title"},
+    {"name": "artist", "type": "text", "default": "", "help": "Artist or band (empty: none)"},
+    {"name": "cover", "type": "asset", "default": "", "help": "Cover art: an https address or a data:image URI (empty: a music-note tile)"},
+    {"name": "progress", "type": "number", "default": -1, "min": -1, "max": 100, "help": "How far into the song, 0 to 100 percent (-1: no progress bar)"},
+    {"name": "label", "type": "text", "default": "Now playing", "help": "Small tag above the title"}
+  ],
+  "example": {"title": "Midnight City", "artist": "M83", "progress": 35},
+  "update": {"progress": 70, "title": "Wait", "artist": "M83"}
+}

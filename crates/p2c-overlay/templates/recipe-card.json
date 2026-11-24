@@ -1,0 +1,15 @@
+{
+  "name": "Recipe card",
+  "category": "lists",
+  "description": "A recipe panel for cooking shows: title, servings and time, the ingredients list and the step being done right now.",
+  "rect": [0.62, 0.08, 0.33, 0.72],
+  "params": [
+    {"name": "title", "type": "text", "required": true, "help": "The dish, e.g. Lemon garlic pasta"},
+    {"name": "meta", "type": "text", "default": "", "help": "One line under the title, e.g. Serves 4 · 25 min"},
+    {"name": "ingredients", "type": "list", "max_items": 16, "default": [], "help": "Up to 16 ingredients with amounts, e.g. 400 g spaghetti"},
+    {"name": "step", "type": "longtext", "default": "", "help": "The step being done now (empty: no step box). Keep it to one or two sentences"},
+    {"name": "step_label", "type": "text", "default": "Now", "help": "Small tag above the step, e.g. Now or Step 3"}
+  ],
+  "example": {"title": "Lemon garlic pasta", "meta": "Serves 4 · 25 min", "ingredients": ["400 g spaghetti", "3 cloves garlic", "1 lemon, zest and juice", "60 g butter", "50 g parmesan", "Fresh parsley"], "step": "Boil the spaghetti in well salted water for 9 minutes.", "step_label": "Step 1"},
+  "update": {"step": "Melt the butter and gently fry the sliced garlic until golden.", "step_label": "Step 2"}
+}

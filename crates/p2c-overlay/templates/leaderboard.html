@@ -1,0 +1,49 @@
+<style>
+  .lb{position:absolute;inset:0;display:flex;flex-direction:column;padding:3.5vh 3.5vh 3vh;border-radius:2vh;border-top:1.2vh solid var(--accent)}
+  .theme-minimal .lb{border-top-color:transparent}
+  .lb h1{margin:0 0 2vh;font-size:7vh;font-weight:700;flex:none;max-width:100%}
+  .rows{flex:1;display:flex;flex-direction:column;gap:1.2vh;min-height:0}
+  .r{flex:1;max-height:14vh;display:flex;align-items:center;gap:.7em;position:relative;min-height:0;padding:0 .7em;border-radius:1.2vh;background:rgba(255,255,255,.06);overflow:hidden;border-left:.7vh solid transparent}
+  .r .fill{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--accent);opacity:.2}
+  .r .rk{position:relative;flex:none;width:1.6em;height:1.6em;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:.8em;background:var(--line);color:var(--fg);text-shadow:none}
+  .r .nm{position:relative;flex:1;min-width:0;font-weight:600}
+  .r .sc{position:relative;flex:none;font-weight:700;font-variant-numeric:tabular-nums}
+  .r.m1{border-left-color:#e8b923}.r.m1 .rk{background:#e8b923;color:#1a1300}
+  .r.m2{border-left-color:#c3cbd6}.r.m2 .rk{background:#c3cbd6;color:#12161c}
+  .r.m3{border-left-color:#cd7f32}.r.m3 .rk{background:#cd7f32;color:#1c0f02}
+  .r.m1 .nm{font-weight:700}
+</style>
+<div class="lb p2c-panel"><h1 class="p2c-ellipsis" id="h"></h1><div class="rows" id="rows"></div></div>
+<script>
+var shown = {};
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.show(P2C.$("#h"), !!p.title);
+  var unit = p.unit || "";
+  var list = (p.rows || []).map(function (r, i) {
+    var s = P2C.num(r[1]);
+    return { name: String(r[0] === undefined || r[0] === null ? "" : r[0]), score: isFinite(s) ? s : 0, i: i };
+  }).filter(function (x) { return x.name.trim(); });
+  list.sort(function (a, b) { return b.score - a.score || a.i - b.i; });
+  var top = list.length ? list[0].score : 0;
+  if (!(top > 0)) top = 1;
+  var box = P2C.clear(P2C.$("#rows"));
+  box.style.fontSize = Math.min(6.5, 58 / Math.max(1, list.length)).toFixed(2) + "vh";
+  var rank = 0;
+  list.forEach(function (x, k) {
+    if (k === 0 || x.score !== list[k - 1].score) rank = k + 1;
+    var row = P2C.el("div", "r" + (rank <= 3 ? " m" + rank : ""), null, box);
+    var fill = P2C.el("div", "fill", null, row);
+    P2C.el("div", "rk", String(rank), row);
+    P2C.el("div", "nm p2c-ellipsis", x.name, row);
+    var sc = P2C.el("div", "sc", "", row);
+    var whole = Math.round(x.score) === x.score;
+    var from = shown[x.name] === undefined ? 0 : shown[x.name];
+    P2C.tween("s" + k, from, x.score, 900, function (v) {
+      shown[x.name] = v;
+      P2C.text(sc, P2C.fmtNum(whole ? Math.round(v) : Math.round(v * 10) / 10) + unit);
+      fill.style.width = (Math.max(0, Math.min(1, v / top)) * 100).toFixed(2) + "%";
+    });
+  });
+});
+</script>

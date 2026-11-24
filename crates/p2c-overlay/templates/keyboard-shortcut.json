@@ -1,0 +1,12 @@
+{
+  "name": "Keyboard shortcut",
+  "category": "software",
+  "description": "Key caps joined by + (e.g. Ctrl + Shift + P) with an optional caption saying what the shortcut does.",
+  "rect": [0.05, 0.76, 0.36, 0.14],
+  "params": [
+    {"name": "keys", "type": "list", "max_items": 5, "required": true, "help": "Up to 5 keys in order, e.g. [\"Ctrl\", \"Shift\", \"P\"]; symbols like ⌘ or ⇧ work too"},
+    {"name": "caption", "type": "text", "default": "", "help": "What it does, e.g. Open the command palette (empty: none)"}
+  ],
+  "example": {"keys": ["Ctrl", "Shift", "P"], "caption": "Open the command palette"},
+  "update": {"keys": ["Ctrl", "K"], "caption": "Search everywhere"}
+}

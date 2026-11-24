@@ -1,0 +1,17 @@
+{
+  "name": "Leaderboard",
+  "category": "data",
+  "description": "Ranked names and scores, sorted highest first, with gold, silver and bronze for the top three; changed scores count up and the order follows.",
+  "rect": [0.66, 0.08, 0.29, 0.6],
+  "params": [
+    {"name": "title", "type": "text", "default": "Leaderboard", "help": "Heading (empty: none)"},
+    {"name": "rows", "type": "table", "columns": ["name", "score"], "max_items": 10, "required": true, "help": "Up to 10 rows: name, score (a number). Sorted by score, highest first; send the whole table on every change"},
+    {"name": "unit", "type": "text", "default": "", "help": "Shown after each score, e.g. \" pts\""}
+  ],
+  "example": {
+    "title": "Top contributors",
+    "rows": [["Maya", "1280"], ["Jonas", "1140"], ["Priya", "980"], ["Leo", "860"], ["Sam", "720"]],
+    "unit": " pts"
+  },
+  "update": {"rows": [["Maya", "1280"], ["Jonas", "1140"], ["Priya", "980"], ["Leo", "1350"], ["Sam", "760"]]}
+}

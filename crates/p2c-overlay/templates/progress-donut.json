@@ -1,0 +1,14 @@
+{
+  "name": "Progress donut",
+  "category": "data",
+  "description": "A ring that fills to value out of max, with the percentage (or your own text) in the centre and a label; changes animate.",
+  "rect": [0.78, 0.08, 0.17, 0.3022],
+  "params": [
+    {"name": "value", "type": "number", "default": 0, "help": "Current amount, e.g. 68"},
+    {"name": "max", "type": "number", "default": 100, "min": 0, "help": "The full amount (100 for a percentage)"},
+    {"name": "label", "type": "text", "default": "", "help": "Line under the ring, e.g. Funded or Sprint done (empty: none)"},
+    {"name": "centre", "type": "text", "default": "", "help": "Text in the middle instead of the percentage, e.g. 34/50 (empty: the percentage)"}
+  ],
+  "example": {"value": 68, "max": 100, "label": "Sprint complete"},
+  "update": {"value": 84}
+}

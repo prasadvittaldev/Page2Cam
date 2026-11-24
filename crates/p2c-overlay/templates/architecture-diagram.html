@@ -1,0 +1,105 @@
+<style>
+  .ad{position:absolute;inset:0;display:flex;flex-direction:column;padding:3vh 3vh 2.5vh;border-radius:2vh;border-top:1.2vh solid var(--accent)}
+  .theme-minimal .ad{border-top-color:transparent}
+  .ad h1{flex:none;margin:0 0 1.5vh;font-size:6.5vh;font-weight:700;max-width:100%}
+  .ad svg{flex:1;min-height:0;width:100%;display:block;overflow:visible}
+  .edge{fill:none;stroke:var(--muted)}
+  .ahd{fill:var(--muted)}
+  .node{fill:var(--bg);stroke:var(--accent)}
+  .node.hl{fill:var(--accent)}
+  .theme-minimal .node{fill:rgba(0,0,0,.4);stroke:rgba(255,255,255,.85)}
+  .theme-minimal .node.hl{fill:rgba(255,255,255,.9)}
+  .nlbl{fill:var(--fg);font-family:var(--font);font-weight:600}
+  .theme-minimal .nlbl.hl{fill:#111}
+  .elbl{fill:var(--fg);font-family:var(--font);font-weight:600;paint-order:stroke;stroke:var(--bg);stroke-linejoin:round}
+  .theme-minimal .elbl{stroke:rgba(0,0,0,.75)}
+</style>
+<div class="ad p2c-panel"><h1 class="p2c-ellipsis" id="h"></h1><svg id="d"></svg></div>
+<script>
+var lastParams = null;
+function cell(v) { return String(v === undefined || v === null ? "" : v).trim(); }
+function fit(s, max) { return s.length > max ? s.slice(0, Math.max(1, max - 1)) + "…" : s; }
+function drawDiagram(p) {
+  var svg = P2C.clear(P2C.$("#d"));
+  var W = svg.clientWidth || 900, H = svg.clientHeight || 500;
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  var nodes = {}, order = [];
+  (p.nodes || []).forEach(function (r) {
+    var id = cell(r[0]);
+    if (!id || nodes[id]) return;
+    var c = Math.round(P2C.num(r[2]));
+    if (!isFinite(c)) c = 1;
+    c = Math.max(1, Math.min(6, c));
+    nodes[id] = { id: id, label: cell(r[1]) || id, col: c };
+    order.push(nodes[id]);
+  });
+  if (!order.length) return;
+  var cols = [];
+  order.forEach(function (n) { if (cols.indexOf(n.col) < 0) cols.push(n.col); });
+  cols.sort(function (a, b) { return a - b; });
+  var per = cols.map(function () { return []; });
+  order.forEach(function (n) { per[cols.indexOf(n.col)].push(n); });
+  var maxPer = 1;
+  per.forEach(function (l) { maxPer = Math.max(maxPer, l.length); });
+  var colW = W / cols.length;
+  var nw = Math.min(colW * 0.72, W * 0.32);
+  var nh = Math.min((H / maxPer) * 0.62, H * 0.2, nw * 0.55);
+  var fs = Math.max(8, Math.min(nh * 0.36, nw / 7.5, H * 0.07));
+  var sw = Math.max(1.5, H * 0.0045);
+  per.forEach(function (l, ci) {
+    l.forEach(function (n, k) {
+      n.cx = colW * (ci + 0.5);
+      n.cy = (H * (k + 0.5)) / l.length;
+    });
+  });
+  var a = Math.max(7, Math.min(18, sw * 4.5));
+  var defs = P2C.svg("defs", {}, svg);
+  var mk = P2C.svg("marker", { id: "ah", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: a, markerHeight: a,
+    markerUnits: "userSpaceOnUse", orient: "auto" }, defs);
+  P2C.svg("path", { d: "M0,0 L10,5 L0,10 z", "class": "ahd" }, mk);
+  var labels = [];
+  (p.edges || []).forEach(function (r) {
+    var s = nodes[cell(r[0])], t = nodes[cell(r[1])];
+    if (!s || !t || s === t) return;
+    var x1, y1, x2, y2, d;
+    if (t.cx !== s.cx) {
+      var dir = t.cx > s.cx ? 1 : -1;
+      x1 = s.cx + dir * nw / 2; y1 = s.cy;
+      x2 = t.cx - dir * nw / 2; y2 = t.cy;
+      var mx = (x1 + x2) / 2;
+      d = "M" + x1.toFixed(1) + "," + y1.toFixed(1) + " C" + mx.toFixed(1) + "," + y1.toFixed(1) + " " +
+        mx.toFixed(1) + "," + y2.toFixed(1) + " " + x2.toFixed(1) + "," + y2.toFixed(1);
+    } else {
+      var down = t.cy > s.cy ? 1 : -1;
+      x1 = s.cx; y1 = s.cy + down * nh / 2;
+      x2 = t.cx; y2 = t.cy - down * nh / 2;
+      d = "M" + x1.toFixed(1) + "," + y1.toFixed(1) + " L" + x2.toFixed(1) + "," + y2.toFixed(1);
+    }
+    P2C.svg("path", { d: d, "class": "edge", "stroke-width": sw.toFixed(2), "marker-end": "url(#ah)" }, svg);
+    var lb = cell(r[2]);
+    if (lb) labels.push({ x: (x1 + x2) / 2, y: (y1 + y2) / 2, t: lb });
+  });
+  var hl = cell(p.highlight);
+  order.forEach(function (n) {
+    var on = n.id === hl;
+    P2C.svg("rect", { x: (n.cx - nw / 2).toFixed(1), y: (n.cy - nh / 2).toFixed(1), width: nw.toFixed(1), height: nh.toFixed(1),
+      rx: (nh * 0.18).toFixed(1), "class": "node" + (on ? " hl" : ""), "stroke-width": sw.toFixed(2) }, svg);
+    var tx = P2C.svg("text", { x: n.cx.toFixed(1), y: n.cy.toFixed(1), "text-anchor": "middle", "dominant-baseline": "central",
+      "font-size": fs.toFixed(1), "class": "nlbl" + (on ? " hl" : "") }, svg);
+    P2C.text(tx, fit(n.label, Math.max(3, Math.floor((nw - fs * 0.8) / (fs * 0.56)))));
+  });
+  var efs = fs * 0.78;
+  labels.forEach(function (l) {
+    var tx = P2C.svg("text", { x: l.x.toFixed(1), y: l.y.toFixed(1), "text-anchor": "middle", "dominant-baseline": "central",
+      "font-size": efs.toFixed(1), "class": "elbl", "stroke-width": (efs * 0.35).toFixed(1) }, svg);
+    P2C.text(tx, fit(l.t, 24));
+  });
+}
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.show(P2C.$("#h"), !!p.title);
+  lastParams = p;
+  drawDiagram(p);
+});
+window.addEventListener("resize", function () { if (lastParams) drawDiagram(lastParams); });
+</script>

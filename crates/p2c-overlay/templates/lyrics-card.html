@@ -1,0 +1,37 @@
+<style>
+  .ly{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:5vh 5vw;border-radius:3vh;
+      background-image:linear-gradient(180deg,rgba(255,255,255,.06),rgba(0,0,0,.12))}
+  .theme-minimal .ly{background-image:none}
+  .ly .lines{max-width:100%;min-height:0;font-size:var(--fs,10vh);font-weight:600;line-height:1.25}
+  .ly .ln{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;animation:lyin .8s ease both}
+  .ly .ref{margin-top:3vh;font-size:6vh;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);max-width:100%}
+  .theme-minimal .ly .ref{color:var(--muted)}
+  .ly .bar{width:12vh;height:.9vh;border-radius:.45vh;background:var(--accent);margin-top:2.5vh;flex:none}
+  .theme-minimal .ly .bar{background:rgba(255,255,255,.6)}
+  @keyframes lyin{from{opacity:0}to{opacity:1}}
+</style>
+<div class="ly p2c-panel"><div class="lines" id="lines"></div><div class="bar" id="bar"></div><div class="ref p2c-ellipsis" id="ref"></div></div>
+<script>
+var lastKey = null;
+P2C.onParams(function (p) {
+  var lines = String(p.lines || "").split(/\r?\n/).map(function (s) { return s.trim(); })
+    .filter(function (s) { return s.length > 0; }).slice(0, 6);
+  var box = P2C.$("#lines");
+  var room = p.reference ? 66 : 82;
+  var longest = 0;
+  lines.forEach(function (s) { if (s.length > longest) longest = s.length; });
+  var byHeight = room / Math.max(lines.length, 1) / 1.3;
+  var wide = window.innerHeight > 0 ? (window.innerWidth * 0.88) / window.innerHeight * 100 : 400;
+  var byWidth = longest > 0 ? wide / (0.55 * longest) : 14;
+  box.style.setProperty("--fs", Math.max(3, Math.min(14, byHeight, byWidth)) + "vh");
+  var key = lines.join("\n");
+  if (key !== lastKey) {
+    lastKey = key;
+    P2C.clear(box);
+    lines.forEach(function (s) { P2C.el("div", "ln", s, box); });
+  }
+  P2C.text(P2C.$("#ref"), p.reference);
+  P2C.show(P2C.$("#ref"), !!p.reference);
+  P2C.show(P2C.$("#bar"), !!p.reference);
+});
+</script>

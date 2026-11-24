@@ -1,0 +1,13 @@
+{
+  "name": "Lower third",
+  "category": "basics",
+  "description": "Name and role (or any two lines) in a band at the bottom left, with an optional logo.",
+  "rect": [0.05, 0.74, 0.5, 0.15],
+  "params": [
+    {"name": "title", "type": "text", "required": true, "help": "Main line, e.g. the person's name"},
+    {"name": "subtitle", "type": "text", "default": "", "help": "Second line, e.g. role and company (empty: one line)"},
+    {"name": "logo", "type": "asset", "default": "", "help": "Small picture at the left: an https address or a data:image URI"}
+  ],
+  "example": {"title": "Alex Kim", "subtitle": "Head of Product, Example Co"},
+  "update": {"subtitle": "Founder, Example Co"}
+}

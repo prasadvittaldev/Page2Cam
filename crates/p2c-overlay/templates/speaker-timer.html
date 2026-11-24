@@ -1,0 +1,39 @@
+<style>
+  .st{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;padding:4vh 8vh;border-radius:8vh;border-bottom:5vh solid var(--sc);min-width:0;--sc:var(--accent)}
+  .st.warn{--sc:#f5a623}
+  .st.over{--sc:#e5232f}
+  .st .top{display:flex;justify-content:space-between;align-items:baseline;min-width:0;line-height:1.25}
+  .st .nm{min-width:0;font-size:20vh;font-weight:700}
+  .st .stt{flex:none;margin-left:4vh;font-size:13vh;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+  .st.warn .stt,.st.over .stt{color:var(--sc)}
+  .st .t{font-size:50vh;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.05;text-align:center;white-space:nowrap}
+  .st.warn .t,.st.over .t{color:var(--sc)}
+</style>
+<div class="st p2c-panel" id="st">
+  <div class="top"><span class="nm p2c-ellipsis" id="nm"></span><span class="stt" id="stt"></span></div>
+  <div class="t" id="t"></div>
+</div>
+<script>
+var stEnd = 0, stKey = null;
+function drawSpeaker() {
+  var warn = P2C.num(P2C.params.warn_at);
+  if (!isFinite(warn)) warn = 60;
+  var left = (stEnd - Date.now()) / 1000;
+  var state = left > warn ? "ok" : left > 0 ? "warn" : "over";
+  var box = P2C.$("#st");
+  box.classList.toggle("warn", state === "warn");
+  box.classList.toggle("over", state === "over");
+  P2C.text(P2C.$("#stt"), state === "ok" ? "Time left" : state === "warn" ? "Wrap up" : "Over time");
+  P2C.text(P2C.$("#t"), left > 0 ? P2C.fmtTime(Math.ceil(left)) : "+" + P2C.fmtTime(Math.floor(-left)));
+}
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#nm"), p.speaker);
+  var k = p.speaker + "|" + p.duration;
+  if (k !== stKey) {
+    stKey = k;
+    var d = P2C.num(p.duration);
+    stEnd = Date.now() + (isFinite(d) && d > 0 ? d : 0) * 1000;
+  }
+  P2C.every("tick", 250, drawSpeaker);
+});
+</script>

@@ -1,0 +1,13 @@
+{
+  "name": "Name badge",
+  "category": "basics",
+  "description": "A compact name tag for a corner: the name and a short line such as pronouns or role.",
+  "rect": [0.04, 0.84, 0.22, 0.1],
+  "params": [
+    {"name": "name", "type": "text", "required": true, "help": "The person's name, e.g. Alex Kim"},
+    {"name": "line", "type": "text", "default": "", "help": "Short second line, e.g. pronouns (she/her) or role (empty: name only)"},
+    {"name": "align", "type": "choice", "options": ["left", "right"], "default": "left", "help": "Which side of the box the tag sits on: left for a left corner, right for a right corner"}
+  ],
+  "example": {"name": "Alex Kim", "line": "she/her · Product"},
+  "update": {"name": "Sam Ortiz", "line": "he/him · Engineering"}
+}

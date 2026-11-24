@@ -1,0 +1,84 @@
+<style>
+  .lc{position:absolute;inset:0;display:flex;flex-direction:column;padding:4vh 5vh 3vh 4vh;border-radius:2vh}
+  .lc .hd{display:flex;align-items:flex-end;gap:3vh;flex:none;margin-bottom:2.5vh;min-width:0}
+  .lc h1{margin:0;font-size:7vh;font-weight:700;flex:1;min-width:0;padding-bottom:1vh}
+  .lc .big{flex:none;font-size:15vh;font-weight:800;line-height:1;font-variant-numeric:tabular-nums;color:var(--fg)}
+  .lc .plot{position:relative;flex:1;min-height:0}
+  .lc svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible}
+  .lc .grid{stroke:var(--line);stroke-width:1px;vector-effect:non-scaling-stroke}
+  .lc .line{fill:none;stroke:var(--accent);stroke-width:.9vh;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke}
+  .lc .area{fill:url(#lcg);stroke:none}
+  .lc .s0{stop-color:var(--accent);stop-opacity:.45}
+  .lc .s1{stop-color:var(--accent);stop-opacity:0}
+  .lc .dot{position:absolute;width:3.4vh;height:3.4vh;margin:-1.7vh 0 0 -1.7vh;border-radius:50%;background:var(--accent);border:.8vh solid #fff;box-shadow:0 0 0 .6vh rgba(0,0,0,.25)}
+  .lc .ax{display:flex;justify-content:space-between;gap:3vh;flex:none;margin-top:1.6vh;font-size:4.6vh;color:var(--muted);min-width:0}
+  .lc .ax span{min-width:0;max-width:48%}
+</style>
+<div class="lc p2c-panel">
+  <div class="hd"><h1 class="p2c-ellipsis" id="h"></h1><div class="big" id="big"></div></div>
+  <div class="plot">
+    <svg id="svg" viewBox="0 0 1000 400" preserveAspectRatio="none">
+      <defs><linearGradient id="lcg" x1="0" y1="0" x2="0" y2="1"><stop class="s0" offset="0"></stop><stop class="s1" offset="1"></stop></linearGradient></defs>
+      <line class="grid" x1="0" y1="0" x2="1000" y2="0"></line>
+      <line class="grid" x1="0" y1="200" x2="1000" y2="200"></line>
+      <line class="grid" x1="0" y1="400" x2="1000" y2="400"></line>
+      <polygon class="area" id="area" points=""></polygon>
+      <polyline class="line" id="line" points=""></polyline>
+    </svg>
+    <div class="dot" id="dot"></div>
+  </div>
+  <div class="ax"><span class="p2c-ellipsis" id="first"></span><span class="p2c-ellipsis" id="last"></span></div>
+</div>
+<script>
+var W = 1000, H = 400;
+var shownVals = [];
+var shownBig = NaN;
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.show(P2C.$("#h"), !!p.title);
+  var rows = (Array.isArray(p.points) ? p.points : []).filter(function (r) {
+    return Array.isArray(r) && isFinite(P2C.num(r[1]));
+  });
+  var vals = rows.map(function (r) { return P2C.num(r[1]); });
+  var line = P2C.$("#line"), area = P2C.$("#area"), dot = P2C.$("#dot"), big = P2C.$("#big");
+  P2C.show(dot, vals.length > 0);
+  if (!vals.length) {
+    line.setAttribute("points", "");
+    area.setAttribute("points", "");
+    P2C.text(big, "");
+    P2C.text(P2C.$("#first"), "");
+    P2C.text(P2C.$("#last"), "");
+    shownVals = [];
+    shownBig = NaN;
+    return;
+  }
+  var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+  if (p.from_zero) { lo = Math.min(0, lo); hi = Math.max(0, hi); }
+  var span = hi - lo;
+  if (span <= 0) span = Math.abs(hi) || 1;
+  var top = hi + span * 0.12;
+  var bot = p.from_zero ? lo : lo - span * 0.12;
+  P2C.text(P2C.$("#first"), rows[0][0]);
+  P2C.text(P2C.$("#last"), rows.length > 1 ? rows[rows.length - 1][0] : "");
+  var from = shownVals.length === vals.length ? shownVals.slice() : null;
+  P2C.tween("line", 0, 1, from ? 800 : 0, function (k) {
+    var cur = vals.map(function (v, i) { return from ? from[i] + (v - from[i]) * k : v; });
+    shownVals = cur;
+    var pts = P2C.linePoints(cur, W, H, bot, top);
+    line.setAttribute("points", pts);
+    area.setAttribute("points", "0," + H + " " + pts + " " + W + "," + H);
+    var last = cur[cur.length - 1];
+    dot.style.left = (cur.length === 1 ? 50 : 100) + "%";
+    dot.style.top = ((1 - (last - bot) / (top - bot)) * 100).toFixed(2) + "%";
+  });
+  var raw = String(rows[rows.length - 1][1]);
+  var m = /\.(\d+)/.exec(raw);
+  var dec = m ? Math.min(2, m[1].length) : 0;
+  var target = vals[vals.length - 1];
+  var unit = p.unit || "";
+  P2C.tween("big", isFinite(shownBig) ? shownBig : target, target, 800, function (v) {
+    shownBig = v;
+    P2C.text(big, P2C.fmtNum(v, dec) + unit);
+  });
+});
+</script>

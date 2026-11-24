@@ -1,0 +1,38 @@
+<style>
+  .sw{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:8vh;border-bottom:5vh solid var(--accent);min-width:0}
+  .theme-minimal .sw{border-bottom-color:transparent}
+  .sw .lbl{max-width:92%;font-size:18vh;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+  .sw .t{max-width:96%;font-size:46vh;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.05;white-space:nowrap}
+  .sw.one .t{font-size:54vh}
+  .sw.paused .t{color:var(--muted)}
+  .sw.paused{border-bottom-color:var(--line)}
+</style>
+<div class="sw p2c-panel" id="sw"><div class="lbl p2c-ellipsis" id="lbl"></div><div class="t" id="t"></div></div>
+<script>
+var baseMs = 0, since = null, swKey = null;
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#lbl"), p.label);
+  P2C.show(P2C.$("#lbl"), !!p.label);
+  var box = P2C.$("#sw");
+  box.classList.toggle("one", !p.label);
+  var run = p.running !== false;
+  var now = Date.now();
+  var k = String(p.start_at);
+  if (k !== swKey) {
+    swKey = k;
+    var s0 = P2C.num(p.start_at);
+    baseMs = (isFinite(s0) && s0 > 0 ? s0 : 0) * 1000;
+    since = run ? now : null;
+  } else if (run && since === null) {
+    since = now;
+  } else if (!run && since !== null) {
+    baseMs += now - since;
+    since = null;
+  }
+  box.classList.toggle("paused", !run);
+  P2C.every("tick", 250, function () {
+    var ms = baseMs + (since === null ? 0 : Date.now() - since);
+    P2C.text(P2C.$("#t"), P2C.fmtTime(ms / 1000));
+  });
+});
+</script>

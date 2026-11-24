@@ -1,0 +1,49 @@
+<style>
+  .rc{position:absolute;inset:0;display:flex;flex-direction:column;padding:3.5vh 3.5vh;border-radius:2.5vh;border-top:1vh solid var(--accent)}
+  .theme-minimal .rc{border-top-color:transparent}
+  .rc h1{margin:0;font-size:5.6vh;font-weight:800;flex:none;line-height:1.15}
+  .rc .meta{margin-top:.8vh;font-size:3.2vh;color:var(--muted);flex:none}
+  .rc .sec{margin-top:2.5vh;font-size:2.4vh;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);flex:none}
+  .theme-minimal .rc .sec{color:var(--muted)}
+  .rc ul{list-style:none;margin:1.2vh 0 0;padding:0;flex:1;min-height:0;overflow:hidden;font-size:var(--fs,3.4vh)}
+  .rc li{display:flex;align-items:center;gap:.6em;padding:.28em 0;border-bottom:1px solid var(--line);min-width:0}
+  .rc li:last-child{border-bottom:none}
+  .rc li::before{content:"";flex:none;width:.42em;height:.42em;border-radius:50%;background:var(--accent)}
+  .theme-minimal .rc li::before{background:#fff}
+  .rc li span{flex:1;min-width:0}
+  .rc .now{margin-top:2vh;flex:none;padding:1.8vh 2.2vh;border-radius:1.6vh;background:var(--bg2);color:var(--fg2);text-shadow:none;transition:opacity .5s}
+  .theme-minimal .rc .now{text-shadow:var(--shadow)}
+  .rc .now .lb{font-size:2.4vh;font-weight:700;letter-spacing:.1em;text-transform:uppercase;opacity:.8}
+  .rc .now .tx{margin-top:.6vh;font-size:3.4vh;font-weight:600;line-height:1.25;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}
+</style>
+<div class="rc p2c-panel">
+  <h1 class="p2c-ellipsis" id="h"></h1><div class="meta p2c-ellipsis" id="meta"></div>
+  <div class="sec" id="sec">Ingredients</div><ul id="list"></ul>
+  <div class="now" id="now"><div class="lb p2c-ellipsis" id="lb"></div><div class="tx" id="tx"></div></div>
+</div>
+<script>
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.text(P2C.$("#meta"), p.meta);
+  P2C.show(P2C.$("#meta"), !!p.meta);
+  var items = Array.isArray(p.ingredients) ? p.ingredients : [];
+  var list = P2C.$("#list");
+  P2C.show(P2C.$("#sec"), items.length > 0);
+  P2C.show(list, items.length > 0);
+  var room = p.step ? 50 : 72;
+  list.style.setProperty("--fs", Math.max(2, Math.min(3.6, room / Math.max(items.length, 1) / 1.65)) + "vh");
+  while (list.children.length > items.length) list.removeChild(list.lastChild);
+  items.forEach(function (s, i) {
+    var li = list.children[i];
+    if (!li) {
+      li = P2C.el("li", "", null, list);
+      P2C.el("span", "p2c-ellipsis", "", li);
+    }
+    P2C.text(li.children[0], s);
+  });
+  P2C.text(P2C.$("#lb"), p.step_label);
+  P2C.show(P2C.$("#lb"), !!p.step_label);
+  P2C.text(P2C.$("#tx"), p.step);
+  P2C.show(P2C.$("#now"), !!p.step);
+});
+</script>

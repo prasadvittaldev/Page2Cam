@@ -1,0 +1,17 @@
+{
+  "name": "Sponsor carousel",
+  "category": "cta",
+  "description": "Thanks sponsors one at a time: each logo (or name) fades in, stays a few seconds, then gives way to the next.",
+  "rect": [0.72, 0.7, 0.23, 0.22],
+  "params": [
+    {"name": "heading", "type": "text", "default": "Thanks to our sponsors", "help": "Line above the sponsor (empty: none)"},
+    {"name": "sponsors", "type": "table", "columns": ["name", "logo"], "max_items": 20, "required": true, "help": "Up to 20 rows: name, logo (an https address or a data:image URI; empty: the name is shown large instead)"},
+    {"name": "seconds", "type": "number", "default": 5, "min": 2, "max": 60, "help": "Seconds each sponsor stays"}
+  ],
+  "example": {
+    "heading": "Thanks to our sponsors",
+    "sponsors": [["Northwind Cloud", ""], ["Globex Labs", ""], ["Acme Robotics", ""]],
+    "seconds": 5
+  },
+  "update": {"heading": "Powered by", "sponsors": [["Northwind Cloud", ""], ["Globex Labs", ""], ["Acme Robotics", ""], ["Initech", ""]]}
+}

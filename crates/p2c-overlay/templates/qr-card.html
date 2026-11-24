@@ -1,0 +1,16 @@
+<style>
+  .qc{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:3vh;border-radius:3vh;border-top:2vh solid var(--accent)}
+  .qc h1{margin:0 0 2vh;font-size:8vh;font-weight:700;text-align:center;max-width:100%}
+  .qc svg{flex:1;min-height:0;width:100%;border-radius:1.5vh}
+  .qc .cap{margin-top:1.5vh;font-size:5.5vh;color:var(--muted);max-width:100%}
+</style>
+<div class="qc p2c-panel"><h1 class="p2c-ellipsis" id="h"></h1><svg id="code"></svg><div class="cap p2c-ellipsis" id="cap"></div></div>
+<script>
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.show(P2C.$("#h"), !!p.title);
+  P2C.text(P2C.$("#cap"), p.caption);
+  P2C.show(P2C.$("#cap"), !!p.caption);
+  P2C.qr(P2C.$("#code"), p.link);
+});
+</script>

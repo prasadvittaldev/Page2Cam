@@ -1,0 +1,12 @@
+{
+  "name": "Logo bug",
+  "category": "basics",
+  "description": "A logo or small picture in a corner, slightly see-through like a TV channel bug.",
+  "rect": [0.86, 0.05, 0.11, 0.1956],
+  "params": [
+    {"name": "image", "type": "asset", "required": true, "help": "The logo: an https address or a data:image URI (PNG with transparency or SVG looks best)"},
+    {"name": "opacity", "type": "number", "min": 0.2, "max": 1, "default": 0.85, "help": "How solid the logo is: 0.2 (faint) to 1 (solid)"}
+  ],
+  "example": {"image": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48cmVjdCB4PSI0IiB5PSI0IiB3aWR0aD0iOTIiIGhlaWdodD0iOTIiIHJ4PSIyMiIgZmlsbD0iIzBiNjNmMCIvPjxjaXJjbGUgY3g9IjUwIiBjeT0iNTAiIHI9IjI3IiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmZmZmYiIHN0cm9rZS13aWR0aD0iOCIvPjxjaXJjbGUgY3g9IjUwIiBjeT0iNTAiIHI9IjEwIiBmaWxsPSIjZmZmZmZmIi8+PC9zdmc+", "opacity": 0.9},
+  "update": {"opacity": 0.4}
+}

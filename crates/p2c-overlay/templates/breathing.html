@@ -1,0 +1,64 @@
+<style>
+  .br{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3vh;padding:4vh;border-radius:5vmin}
+  .br .ti{flex:none;font-size:5.5vh;font-weight:600;color:var(--fg);max-width:100%;text-align:center}
+  .br .stage{position:relative;flex:none;width:min(68vmin,62vh);height:min(68vmin,62vh)}
+  .br .halo{position:absolute;inset:0;border-radius:50%;border:.5vmin solid var(--line)}
+  .br .ball{position:absolute;inset:0;border-radius:50%;opacity:.9;transform:scale(.42);transition-property:transform;transition-timing-function:ease-in-out;transition-duration:3s;
+    background:radial-gradient(circle at 38% 32%,color-mix(in srgb,var(--accent) 45%,#ffffff),var(--accent) 70%);
+    box-shadow:0 0 6vmin color-mix(in srgb,var(--accent) 45%,transparent)}
+  .theme-minimal .br .ball{background:radial-gradient(circle at 38% 32%,rgba(255,255,255,.55),rgba(255,255,255,.18) 70%);box-shadow:none;border:.4vmin solid rgba(255,255,255,.7)}
+  .br .ph{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:0 4%}
+  .br .pt{font-size:6.5vmin;font-weight:700;max-width:100%;text-shadow:0 .1em .4em rgba(0,0,0,.45)}
+  .br .ps{font-size:5vmin;font-weight:600;opacity:.85;font-variant-numeric:tabular-nums;margin-top:.5vmin;text-shadow:0 .1em .4em rgba(0,0,0,.45)}
+  .br .ct{flex:none;font-size:4vh;color:var(--muted);font-variant-numeric:tabular-nums}
+</style>
+<div class="br p2c-panel"><div class="ti p2c-ellipsis" id="ti"></div><div class="stage"><div class="halo"></div><div class="ball" id="ball"></div><div class="ph"><div class="pt p2c-ellipsis" id="pt"></div><div class="ps" id="ps"></div></div></div><div class="ct" id="ct"></div></div>
+<script>
+var ball = P2C.$("#ball");
+void ball.offsetWidth;
+var start = 0, key = "", shownPhase = "";
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#ti"), p.title);
+  P2C.show(P2C.$("#ti"), !!p.title);
+  function secs(v, lo) { var n = Number(v); return isFinite(n) ? Math.max(lo, Math.min(20, n)) : lo; }
+  var phases = [
+    { t: p.inhale_text, d: secs(p.inhale, 1), s: 1 },
+    { t: p.hold_text, d: secs(p.hold, 0), s: 1 },
+    { t: p.exhale_text, d: secs(p.exhale, 1), s: 0.42 },
+    { t: p.hold_text, d: secs(p.hold_after, 0), s: 0.42 }
+  ].filter(function (x) { return x.d > 0; });
+  var cycle = 0;
+  phases.forEach(function (x) { cycle += x.d; });
+  var cycles = Math.max(0, Math.floor(Number(p.cycles) || 0));
+  var k = phases.map(function (x) { return x.d; }).join("|") + "|" + cycles;
+  if (k !== key) { key = k; start = Date.now(); }
+  shownPhase = "";
+  P2C.every("tick", 200, function () {
+    var el = (Date.now() - start) / 1000;
+    var n = Math.floor(el / cycle);
+    if (cycles > 0 && n >= cycles) {
+      if (shownPhase !== "done") {
+        shownPhase = "done";
+        ball.style.transitionDuration = "3s";
+        ball.style.transform = "scale(0.42)";
+        P2C.text(P2C.$("#pt"), p.done_text);
+        P2C.text(P2C.$("#ps"), "");
+        P2C.text(P2C.$("#ct"), "");
+      }
+      return;
+    }
+    var t = el - n * cycle, i = 0;
+    while (i < phases.length - 1 && t >= phases[i].d) { t -= phases[i].d; i++; }
+    var cur = phases[i];
+    var id = n + ":" + i;
+    if (id !== shownPhase) {
+      shownPhase = id;
+      ball.style.transitionDuration = cur.d + "s";
+      ball.style.transform = "scale(" + cur.s + ")";
+      P2C.text(P2C.$("#pt"), cur.t);
+    }
+    P2C.text(P2C.$("#ps"), String(Math.max(1, Math.ceil(cur.d - t))));
+    P2C.text(P2C.$("#ct"), cycles > 0 ? "Breath " + (n + 1) + " of " + cycles : "");
+  });
+});
+</script>

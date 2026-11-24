@@ -1,0 +1,60 @@
+<style>
+  .it{position:absolute;inset:0;display:flex;flex-direction:column;padding:5vh 7vh;border-radius:7vh;border-top:4vh solid var(--ph);min-width:0;--ph:#2fbf71}
+  .it.rest{--ph:#f5a623}
+  .it.done{--ph:var(--accent)}
+  .it .lbl{font-size:12vh;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;line-height:1.3}
+  .it .top{display:flex;justify-content:space-between;align-items:baseline;font-size:16vh;line-height:1.25;min-width:0}
+  .it .ph{font-weight:800;letter-spacing:.08em;color:var(--ph)}
+  .it .rd{margin-left:4vh;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .it .t{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;font-size:40vh;font-weight:700;font-variant-numeric:tabular-nums;line-height:1;white-space:nowrap;overflow:hidden}
+  .it.done .t{font-size:32vh}
+  .it .bar{flex:none;height:4vh;border-radius:2vh;background:var(--line);overflow:hidden}
+  .it .bar i{display:block;height:100%;width:0;background:var(--ph)}
+</style>
+<div class="it p2c-panel" id="it">
+  <div class="lbl p2c-ellipsis" id="lbl"></div>
+  <div class="top"><span class="ph" id="ph"></span><span class="rd" id="rd"></span></div>
+  <div class="t" id="t"></div>
+  <div class="bar"><i id="bar"></i></div>
+</div>
+<script>
+var itStart = 0, itKey = null;
+function intOr(v, d, lo) {
+  var n = Math.round(P2C.num(v));
+  if (!isFinite(n)) n = d;
+  return Math.max(lo, n);
+}
+function drawInterval() {
+  var p = P2C.params;
+  var w = intOr(p.work, 40, 1), r = intOr(p.rest, 0, 0), n = intOr(p.rounds, 1, 1);
+  var cyc = w + r, total = n * w + (n - 1) * r;
+  var el = (Date.now() - itStart) / 1000;
+  var phase, left = 0, frac = 1, round = n;
+  if (el >= total) {
+    phase = "done";
+  } else {
+    round = Math.min(n, Math.floor(el / cyc) + 1);
+    var t = el - (round - 1) * cyc;
+    if (t < w) { phase = "work"; left = w - t; frac = t / w; }
+    else { phase = "rest"; left = cyc - t; frac = r > 0 ? (t - w) / r : 1; }
+  }
+  var box = P2C.$("#it");
+  box.classList.toggle("work", phase === "work");
+  box.classList.toggle("rest", phase === "rest");
+  box.classList.toggle("done", phase === "done");
+  P2C.text(P2C.$("#ph"), phase === "work" ? "WORK" : phase === "rest" ? "REST" : "FINISHED");
+  P2C.text(P2C.$("#rd"), "Round " + round + "/" + n);
+  P2C.text(P2C.$("#t"), phase === "done" ? (p.done_text || "Done") : P2C.fmtTime(Math.ceil(left)));
+  P2C.$("#bar").style.width = (Math.max(0, Math.min(1, frac)) * 100).toFixed(1) + "%";
+}
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#lbl"), p.label);
+  P2C.show(P2C.$("#lbl"), !!p.label);
+  var k = [p.work, p.rest, p.rounds].join("|");
+  if (k !== itKey) {
+    itKey = k;
+    itStart = Date.now();
+  }
+  P2C.every("tick", 250, drawInterval);
+});
+</script>

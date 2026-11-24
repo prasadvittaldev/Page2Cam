@@ -1,0 +1,42 @@
+<style>
+  .card{position:absolute;inset:0;overflow:hidden;background:var(--bg);
+    background-image:linear-gradient(115deg,rgba(255,255,255,.06),transparent 55%),radial-gradient(circle at 90% 85%,rgba(0,0,0,.28),transparent 50%)}
+  .theme-minimal .card{background-color:rgba(0,0,0,.72)}
+  .card .in{position:absolute;left:9vw;right:9vw;top:8vh;bottom:8vh;display:flex;align-items:center;gap:4vw}
+  .card .num{flex:none;font-size:24vh;font-weight:800;line-height:1;color:var(--accent);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+  .card .bar{flex:none;align-self:center;width:1vh;height:30vh;border-radius:.5vh;background:var(--accent)}
+  .card .txt{flex:1;min-width:0}
+  .card .kick{font-size:3.8vh;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.2em;margin-bottom:2vh}
+  .card h1{margin:0;font-size:11vh;font-weight:800;letter-spacing:-.01em;line-height:1.08;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
+  .card .sub{margin-top:2.5vh;font-size:4.5vh;color:var(--muted)}
+  .card .rule{width:14vh;height:1vh;border-radius:.5vh;background:var(--accent);margin-top:4vh}
+  .card.hasnum .rule{display:none}
+</style>
+<div class="card" id="card">
+  <div class="in">
+    <div class="num" id="num"></div>
+    <div class="bar" id="bar"></div>
+    <div class="txt">
+      <div class="kick p2c-ellipsis" id="kick"></div>
+      <h1 id="h"></h1>
+      <div class="sub p2c-ellipsis" id="sub"></div>
+      <div class="rule"></div>
+    </div>
+  </div>
+</div>
+<script>
+P2C.onParams(function (p) {
+  var card = P2C.$("#card");
+  card.style.backgroundColor = p.background || "";
+  var num = String(p.number === undefined || p.number === null ? "" : p.number).trim();
+  P2C.text(P2C.$("#num"), num);
+  P2C.show(P2C.$("#num"), !!num);
+  P2C.show(P2C.$("#bar"), !!num);
+  card.classList.toggle("hasnum", !!num);
+  P2C.text(P2C.$("#kick"), p.kicker);
+  P2C.show(P2C.$("#kick"), !!p.kicker);
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.text(P2C.$("#sub"), p.subtitle);
+  P2C.show(P2C.$("#sub"), !!p.subtitle);
+});
+</script>

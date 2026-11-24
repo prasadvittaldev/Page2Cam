@@ -1,0 +1,84 @@
+<style>
+  .kp{position:absolute;inset:0;display:flex;flex-direction:column;--k:1}
+  .kp.titled{--k:.82}
+  .kp h1{margin:0 0 3vh;flex:none;font-size:11vh;font-weight:700;text-transform:uppercase;letter-spacing:.08em;text-shadow:0 .08em .3em rgba(0,0,0,.85)}
+  .kp .tiles{flex:1;min-height:0;display:flex;gap:2.2vh}
+  .kp .tile{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;padding:6vh 7vh;border-radius:6vh;border-left:2.2vh solid var(--accent)}
+  .theme-minimal .kp .tile{border-left-color:rgba(255,255,255,.6)}
+  .kp .lb{font-size:calc(12vh * var(--k));font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+  .kp .v{font-size:calc(30vh * var(--k));font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums}
+  .kp .ch{display:flex;align-items:baseline;gap:.5em;font-size:calc(12vh * var(--k));min-width:0}
+  .kp .d{flex:none;font-weight:700;font-variant-numeric:tabular-nums}
+  .kp .d.good{color:#2ecc71}
+  .kp .d.bad{color:#ff5a5f}
+  .kp .nt{flex:1;min-width:0;color:var(--muted)}
+</style>
+<div class="kp" id="kp"><h1 class="p2c-ellipsis" id="h"></h1><div class="tiles" id="tiles"></div></div>
+<script>
+var shown = [];
+function parts(s) {
+  var m = /^([^\d]*?)(-?[\d,]*\.?\d+)(.*)$/.exec(String(s === undefined || s === null ? "" : s).trim());
+  if (!m) return null;
+  var n = parseFloat(m[2].replace(/,/g, ""));
+  if (!isFinite(n)) return null;
+  var dot = m[2].indexOf(".");
+  return { pre: m[1], n: n, dec: dot >= 0 ? Math.min(3, m[2].length - dot - 1) : 0, suf: m[3], comma: m[2].indexOf(",") >= 0 };
+}
+function fmt(pt, v) {
+  return pt.pre + (pt.comma ? P2C.fmtNum(v, pt.dec) : v.toFixed(pt.dec)) + pt.suf;
+}
+function sign(ch) {
+  var s = String(ch || "").trim();
+  if (!s) return 0;
+  if (/^[-−▼]/.test(s)) return -1;
+  if (/^[+▲]/.test(s)) return 1;
+  var n = P2C.num(s);
+  return isFinite(n) ? (n > 0 ? 1 : n < 0 ? -1 : 0) : 0;
+}
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.show(P2C.$("#h"), !!p.title);
+  P2C.$("#kp").classList.toggle("titled", !!p.title);
+  var rows = (Array.isArray(p.kpis) ? p.kpis : []).slice(0, 4);
+  var inv = String(p.invert || "").toLowerCase().split(",").map(function (s) { return s.trim(); })
+    .filter(function (s) { return s.length > 0; });
+  var box = P2C.$("#tiles");
+  while (box.children.length > rows.length) box.removeChild(box.lastChild);
+  shown.length = Math.min(shown.length, rows.length);
+  rows.forEach(function (r, i) {
+    var t = box.children[i];
+    if (!t) {
+      t = P2C.el("div", "tile p2c-panel", null, box);
+      P2C.el("div", "lb p2c-ellipsis", "", t);
+      P2C.el("div", "v p2c-ellipsis", "", t);
+      var ch = P2C.el("div", "ch", null, t);
+      P2C.el("span", "d", "", ch);
+      P2C.el("span", "nt p2c-ellipsis", "", ch);
+    }
+    var label = String(r[0] === undefined ? "" : r[0]);
+    P2C.text(t.children[0], label);
+    var valEl = t.children[1];
+    var pt = parts(r[1]);
+    var prev = shown[i];
+    if (pt && prev && prev.pre === pt.pre && prev.suf === pt.suf && isFinite(prev.cur)) {
+      var start = prev.cur;
+      var rec = { pre: pt.pre, suf: pt.suf, cur: start };
+      shown[i] = rec;
+      P2C.tween("kpi" + i, start, pt.n, 800, function (v) { rec.cur = v; P2C.text(valEl, fmt(pt, v)); });
+    } else {
+      P2C.tween("kpi" + i, 0, 0, 0, function () {});
+      shown[i] = pt ? { pre: pt.pre, suf: pt.suf, cur: pt.n } : null;
+      P2C.text(valEl, r[1] === undefined ? "" : r[1]);
+    }
+    var change = String(r[2] === undefined ? "" : r[2]).trim();
+    var sg = sign(change);
+    var good = inv.indexOf(label.trim().toLowerCase()) >= 0 ? sg < 0 : sg > 0;
+    var d = t.children[2].children[0];
+    var arrow = sg > 0 ? "▲ " : sg < 0 ? "▼ " : "";
+    P2C.text(d, change ? arrow + change.replace(/^[+\-−▲▼]\s*/, "") : "");
+    d.className = "d" + (sg === 0 ? "" : good ? " good" : " bad");
+    P2C.text(t.children[2].children[1], r[3]);
+    P2C.show(t.children[2], !!(change || r[3]));
+  });
+});
+</script>

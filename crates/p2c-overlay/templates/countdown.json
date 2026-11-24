@@ -1,0 +1,14 @@
+{
+  "name": "Countdown",
+  "category": "time",
+  "description": "Counts down to a time of day or date, or for a duration from when it is shown; shows a message at zero.",
+  "rect": [0.72, 0.05, 0.23, 0.16],
+  "params": [
+    {"name": "label", "type": "text", "default": "Starting in", "help": "Text above the time"},
+    {"name": "until", "type": "datetime", "default": "", "help": "Count to this time: 18:30 (today or the next one) or 2026-12-31T18:30. Wins over duration"},
+    {"name": "duration", "type": "duration", "default": 300, "help": "Or count down this long (seconds or m:ss), from when the layer is shown or the value changes"},
+    {"name": "done_text", "type": "text", "default": "Starting now", "help": "Shown at zero"}
+  ],
+  "example": {"label": "We start in", "duration": "5:00"},
+  "update": {"duration": "2:00", "label": "Back in"}
+}

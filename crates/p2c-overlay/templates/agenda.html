@@ -1,0 +1,43 @@
+<style>
+  .ag{position:absolute;inset:0;display:flex;flex-direction:column;padding:4vh;border-radius:2.5vh;border-top:1.2vh solid var(--accent)}
+  .theme-minimal .ag{border-top-color:transparent}
+  .ag h1{margin:0 0 2.5vh;font-size:8vh;font-weight:700;flex:none}
+  .ag ol{list-style:none;margin:0;padding:0;flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;gap:.25em;font-size:var(--fs,6vh)}
+  .ag li{display:flex;align-items:center;gap:.6em;padding:.25em .4em;border-radius:.3em;min-width:0;flex:none;transition:background-color .6s,color .6s}
+  .ag .n{flex:none;width:1.45em;height:1.45em;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:.8em;font-weight:700;border:.12em solid var(--line);font-variant-numeric:tabular-nums;transition:background-color .6s,border-color .6s}
+  .ag .t{flex:1;min-width:0}
+  .ag li.done{color:var(--muted)}
+  .ag li.done .n{border-color:transparent;color:var(--accent)}
+  .ag li.cur{background:var(--accent);color:#fff;font-weight:700}
+  .ag li.cur .n{border-color:#fff}
+  .theme-minimal .ag li.cur{background:rgba(255,255,255,.22)}
+  .theme-minimal .ag li.done .n{color:var(--muted)}
+</style>
+<div class="ag p2c-panel"><h1 class="p2c-ellipsis" id="h"></h1><ol id="list"></ol></div>
+<script>
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.show(P2C.$("#h"), !!p.title);
+  var items = Array.isArray(p.items) ? p.items : [];
+  var cur = Math.round(P2C.num(p.current));
+  if (!isFinite(cur)) cur = 0;
+  var list = P2C.$("#list");
+  var room = p.title ? 74 : 86;
+  var fs = Math.max(2.5, Math.min(6.5, room / Math.max(items.length, 1) / 2));
+  list.style.setProperty("--fs", fs + "vh");
+  while (list.children.length > items.length) list.removeChild(list.lastChild);
+  items.forEach(function (s, i) {
+    var li = list.children[i];
+    if (!li) {
+      li = P2C.el("li", "", null, list);
+      P2C.el("span", "n", "", li);
+      P2C.el("span", "t p2c-ellipsis", "", li);
+    }
+    var n = i + 1;
+    var done = cur > 0 && n < cur;
+    li.className = done ? "done" : (n === cur ? "cur" : "");
+    P2C.text(li.children[0], done ? "✓" : n);
+    P2C.text(li.children[1], s);
+  });
+});
+</script>

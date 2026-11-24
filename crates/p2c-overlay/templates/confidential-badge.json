@@ -1,0 +1,13 @@
+{
+  "name": "Confidential badge",
+  "category": "basics",
+  "description": "A bordered CONFIDENTIAL (or any) warning badge for the top right, with an optional second line.",
+  "rect": [0.75, 0.05, 0.22, 0.1],
+  "params": [
+    {"name": "text", "type": "text", "default": "CONFIDENTIAL", "help": "The badge word, e.g. CONFIDENTIAL, INTERNAL, DRAFT, EMBARGOED"},
+    {"name": "note", "type": "text", "default": "", "help": "Small second line, e.g. Internal only, do not record (empty: none)"},
+    {"name": "colour", "type": "choice", "options": ["red", "amber", "accent"], "default": "red", "help": "Badge colour: red, amber, or the look's accent"}
+  ],
+  "example": {"text": "CONFIDENTIAL", "note": "Internal only, do not record"},
+  "update": {"text": "DRAFT", "note": "Figures not final", "colour": "amber"}
+}

@@ -1,0 +1,18 @@
+{
+  "name": "Scoreboard",
+  "category": "data",
+  "description": "A score bug for two teams or players: names, team colours, scores, the period and an optional clock text; a changed score animates with a soft glow.",
+  "rect": [0.05, 0.05, 0.4, 0.1],
+  "params": [
+    {"name": "home_name", "type": "text", "required": true, "help": "First (left) team or player, short, e.g. LIONS or Team A"},
+    {"name": "home_score", "type": "number", "default": 0, "min": 0, "help": "Left score"},
+    {"name": "home_colour", "type": "colour", "default": "", "help": "Left team colour #rrggbb (empty: the accent colour)"},
+    {"name": "away_name", "type": "text", "required": true, "help": "Second (right) team or player, short"},
+    {"name": "away_score", "type": "number", "default": 0, "min": 0, "help": "Right score"},
+    {"name": "away_colour", "type": "colour", "default": "", "help": "Right team colour #rrggbb (empty: grey)"},
+    {"name": "period", "type": "text", "default": "", "help": "Period text, e.g. Q3, 2nd half, Round 4 (empty: none)"},
+    {"name": "clock", "type": "text", "default": "", "help": "Clock text as shown, e.g. 67:12 (it does not run by itself; update it or leave empty)"}
+  ],
+  "example": {"home_name": "Lions", "home_score": 2, "home_colour": "#f2b705", "away_name": "Eagles", "away_score": 1, "away_colour": "#1fa37a", "period": "2nd half", "clock": "67:12"},
+  "update": {"home_score": 3, "clock": "71:40"}
+}

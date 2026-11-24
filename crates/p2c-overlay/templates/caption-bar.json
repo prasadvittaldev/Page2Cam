@@ -1,0 +1,12 @@
+{
+  "name": "Caption bar",
+  "category": "basics",
+  "description": "Manual captions: up to two lines of large white text on a dark band, centred near the bottom, readable on any background.",
+  "rect": [0.1, 0.77, 0.8, 0.17],
+  "params": [
+    {"name": "text", "type": "longtext", "required": true, "help": "The caption. At most two lines show (about 90 characters); replace it with update_layer as the talk moves on"},
+    {"name": "speaker", "type": "text", "default": "", "help": "Who is speaking, shown as a small tag above (empty: none)"}
+  ],
+  "example": {"text": "Welcome everyone, and thanks for joining today's session on the new release.", "speaker": "Alex"},
+  "update": {"text": "First, let's look at what changed since the last version.", "speaker": "Sam"}
+}

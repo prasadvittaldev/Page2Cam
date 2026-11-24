@@ -1,0 +1,32 @@
+<style>
+  .pd{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:5vh;border-radius:6vh}
+  .pd .ring{position:relative;flex:1;min-height:0;width:100%;display:flex;align-items:center;justify-content:center}
+  .pd svg{position:absolute;inset:0;width:100%;height:100%;display:block}
+  .pd .ctr{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:var(--cs,17vh);font-weight:800;font-variant-numeric:tabular-nums;padding:0 18%;text-align:center}
+  .pd .ctr span{max-width:100%}
+  .pd .lbl{flex:none;margin-top:3vh;font-size:8vh;font-weight:600;color:var(--muted);max-width:100%;text-align:center}
+</style>
+<div class="pd p2c-panel"><div class="ring"><svg id="ring"></svg><div class="ctr"><span class="p2c-ellipsis" id="ctr"></span></div></div><div class="lbl p2c-ellipsis" id="lbl"></div></div>
+<script>
+var shown = NaN;
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#lbl"), p.label);
+  P2C.show(P2C.$("#lbl"), !!p.label);
+  var max = P2C.num(p.max);
+  if (!isFinite(max) || max <= 0) max = 100;
+  var val = P2C.num(p.value);
+  if (!isFinite(val)) val = 0;
+  var frac = Math.max(0, Math.min(1, val / max));
+  var custom = String(p.centre || "").trim();
+  var ctr = P2C.$("#ctr");
+  P2C.$(".ctr").style.setProperty("--cs", (custom.length > 5 ? 11 : 17) * (p.label ? 1 : 1.15) + "vh");
+  var track = document.documentElement.classList.contains("theme-minimal") ? "rgba(255,255,255,0.3)" : "rgba(255,255,255,0.16)";
+  var colour = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#0b63f0";
+  var from = isFinite(shown) ? shown : 0;
+  P2C.tween("ring", from, frac, 900, function (f) {
+    shown = f;
+    P2C.donut(P2C.$("#ring"), f, { width: 11, track: track, colour: colour });
+    P2C.text(ctr, custom || Math.round(f * 100) + "%");
+  });
+});
+</script>

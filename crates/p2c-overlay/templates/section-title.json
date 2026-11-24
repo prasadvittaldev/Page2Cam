@@ -1,0 +1,15 @@
+{
+  "name": "Section title",
+  "category": "cards",
+  "description": "Full-frame chapter heading: a big title with an optional number such as 01 and a small kicker line above it.",
+  "full_frame": true,
+  "params": [
+    {"name": "title", "type": "text", "required": true, "help": "The chapter heading, e.g. Results from the pilot"},
+    {"name": "number", "type": "text", "default": "", "help": "Optional chapter number, e.g. 01 or 2 (empty: none)"},
+    {"name": "kicker", "type": "text", "default": "", "help": "Small line above the title, e.g. Part two (empty: none)"},
+    {"name": "subtitle", "type": "text", "default": "", "help": "Optional line under the title"},
+    {"name": "background", "type": "colour", "default": "", "help": "Card colour #rrggbb (empty: the look's)"}
+  ],
+  "example": {"number": "02", "kicker": "Part two", "title": "Results from the pilot"},
+  "update": {"number": "03", "kicker": "Part three", "title": "What comes next"}
+}

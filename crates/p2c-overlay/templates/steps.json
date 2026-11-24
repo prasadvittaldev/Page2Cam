@@ -1,0 +1,14 @@
+{
+  "name": "Steps",
+  "category": "lists",
+  "description": "Numbered steps in a row or a column: the current step is highlighted, earlier ones are ticked. Good for tutorials, onboarding and processes.",
+  "rect": [0.15, 0.78, 0.7, 0.14],
+  "params": [
+    {"name": "steps", "type": "list", "max_items": 8, "required": true, "help": "Up to 8 step names, in order, short (one to three words each)"},
+    {"name": "current", "type": "number", "default": 1, "min": 0, "max": 8, "help": "The step in progress, 1-based (0: none). Earlier steps are shown ticked"},
+    {"name": "layout", "type": "choice", "options": ["horizontal", "vertical"], "default": "horizontal", "help": "horizontal: a row (wide, low box); vertical: a column (tall box, give it a taller rect)"},
+    {"name": "title", "type": "text", "default": "", "help": "Heading above the steps (empty: none)"}
+  ],
+  "example": {"steps": ["Sign up", "Connect", "Configure", "Go live"], "current": 2},
+  "update": {"current": 3}
+}

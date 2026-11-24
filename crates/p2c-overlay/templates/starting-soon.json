@@ -1,0 +1,15 @@
+{
+  "name": "Starting soon",
+  "category": "cards",
+  "description": "Full-frame card before the show: title, subtitle and a countdown.",
+  "full_frame": true,
+  "params": [
+    {"name": "title", "type": "text", "default": "Starting soon", "help": "Big heading"},
+    {"name": "subtitle", "type": "text", "default": "", "help": "Line under it, e.g. the show's name"},
+    {"name": "until", "type": "datetime", "default": "", "help": "Count down to this time (18:30 or 2026-12-31T18:30)"},
+    {"name": "duration", "type": "duration", "default": 0, "help": "Or count down this long from showing (0 and no time: no countdown)"},
+    {"name": "background", "type": "colour", "default": "", "help": "Card colour (empty: the look's)"}
+  ],
+  "example": {"title": "Starting soon", "subtitle": "Product launch: what is new in 2.0", "duration": "3:00"},
+  "update": {"subtitle": "Grab a coffee, we start in a minute", "duration": "1:00"}
+}

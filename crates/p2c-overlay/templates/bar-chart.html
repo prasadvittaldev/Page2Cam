@@ -1,0 +1,35 @@
+<style>
+  .bc{position:absolute;inset:0;display:flex;flex-direction:column;padding:4vh 4vh 3vh;border-radius:2vh}
+  .bc h1{margin:0 0 2vh;font-size:8vh;font-weight:700}
+  .bars{flex:1;display:flex;align-items:flex-end;gap:2.5%;min-height:0}
+  .bar{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;min-width:0}
+  .bar .v{font-size:5vh;font-weight:600;margin-bottom:1vh;font-variant-numeric:tabular-nums}
+  .bar .b{width:100%;background:var(--accent);border-radius:1vh 1vh 0 0;min-height:2px}
+  .bar .l{font-size:4.6vh;color:var(--muted);margin-top:1vh;max-width:100%}
+</style>
+<div class="bc p2c-panel"><h1 id="h"></h1><div class="bars" id="bars"></div></div>
+<script>
+var shown = {};
+P2C.onParams(function (p) {
+  P2C.text(P2C.$("#h"), p.title);
+  P2C.show(P2C.$("#h"), !!p.title);
+  var box = P2C.$("#bars");
+  var vals = p.rows.map(function (r) { var n = P2C.num(r[1]); return isFinite(n) ? n : 0; });
+  var top = p.max > 0 ? p.max : Math.max.apply(null, vals.concat([1]));
+  while (box.children.length > p.rows.length) box.removeChild(box.lastChild);
+  p.rows.forEach(function (r, i) {
+    var bar = box.children[i];
+    if (!bar) {
+      bar = P2C.el("div", "bar", null, box);
+      P2C.el("div", "v", "", bar); P2C.el("div", "b", null, bar); P2C.el("div", "l p2c-ellipsis", "", bar);
+    }
+    P2C.text(bar.children[2], r[0]);
+    var from = shown[i] === undefined ? 0 : shown[i];
+    P2C.tween("bar" + i, from, vals[i], 700, function (v) {
+      shown[i] = v;
+      bar.children[1].style.height = (Math.max(0, Math.min(1, v / top)) * 78) + "%";
+      P2C.text(bar.children[0], P2C.fmtNum(Math.round(v * 10) / 10) + p.unit);
+    });
+  });
+});
+</script>

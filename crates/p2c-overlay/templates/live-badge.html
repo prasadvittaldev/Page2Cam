@@ -1,0 +1,16 @@
+<style>
+  .lb{position:absolute;left:0;top:0;bottom:0;max-width:100%;min-width:0;display:flex;align-items:center;padding:0 28vh 0 22vh;border-radius:50vh;font-size:44vh;font-weight:800;letter-spacing:.08em;border:3vh solid var(--line)}
+  .lb .dot{flex:none;width:30vh;height:30vh;border-radius:50%;background:var(--live,#e5232f);margin-right:16vh}
+  .lb.pulse .dot{animation:lbpulse 2.4s ease-in-out infinite}
+  .lb .t{min-width:0}
+  @keyframes lbpulse{0%,100%{opacity:1}50%{opacity:.35}}
+</style>
+<div class="lb p2c-panel" id="lb"><span class="dot"></span><span class="t p2c-ellipsis" id="t"></span></div>
+<script>
+P2C.onParams(function (p) {
+  var box = P2C.$("#lb");
+  P2C.text(P2C.$("#t"), p.text ? p.text : (p.label || "LIVE"));
+  box.style.setProperty("--live", p.colour || "#e5232f");
+  box.classList.toggle("pulse", p.pulse !== false);
+});
+</script>

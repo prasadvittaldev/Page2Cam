@@ -1,0 +1,20 @@
+<style>
+  .cb{position:absolute;right:0;top:0;bottom:0;max-width:100%;min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 10vh;border:5vh solid var(--cc,#e5232f);border-radius:10vh;--cc:#e5232f}
+  .cb.amber{--cc:#f5a623}
+  .cb.accent{--cc:var(--accent)}
+  .cb .w{max-width:100%;color:var(--cc);font-size:36vh;font-weight:800;letter-spacing:.16em;line-height:1.15}
+  .cb .nt{max-width:100%;font-size:19vh;color:var(--fg);line-height:1.3}
+  .cb.one .w{font-size:46vh}
+</style>
+<div class="cb p2c-panel" id="cb"><div class="w p2c-ellipsis" id="w"></div><div class="nt p2c-ellipsis" id="nt"></div></div>
+<script>
+P2C.onParams(function (p) {
+  var box = P2C.$("#cb");
+  P2C.text(P2C.$("#w"), p.text || "CONFIDENTIAL");
+  P2C.text(P2C.$("#nt"), p.note);
+  P2C.show(P2C.$("#nt"), !!p.note);
+  box.classList.toggle("one", !p.note);
+  box.classList.toggle("amber", p.colour === "amber");
+  box.classList.toggle("accent", p.colour === "accent");
+});
+</script>

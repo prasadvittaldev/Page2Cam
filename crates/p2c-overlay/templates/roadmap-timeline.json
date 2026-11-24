@@ -1,0 +1,29 @@
+{
+  "name": "Roadmap timeline",
+  "category": "software",
+  "description": "Milestones on a horizontal timeline: done ones filled, the current one highlighted, next and later ones outlined.",
+  "rect": [0.05, 0.72, 0.9, 0.2],
+  "params": [
+    {"name": "title", "type": "text", "default": "Roadmap", "help": "Heading (empty: none)"},
+    {"name": "milestones", "type": "table", "columns": ["label", "when", "status"], "max_items": 8, "required": true, "help": "Up to 8 rows, left to right: label, when (e.g. Q1 or Mar), status: done, now, next or later"}
+  ],
+  "example": {
+    "title": "Roadmap 2027",
+    "milestones": [
+      ["Private beta", "Sep", "done"],
+      ["Public beta", "Nov", "done"],
+      ["v1.0 launch", "Jan", "now"],
+      ["Teams app", "Mar", "next"],
+      ["Enterprise SSO", "Q2", "later"]
+    ]
+  },
+  "update": {
+    "milestones": [
+      ["Private beta", "Sep", "done"],
+      ["Public beta", "Nov", "done"],
+      ["v1.0 launch", "Jan", "done"],
+      ["Teams app", "Mar", "now"],
+      ["Enterprise SSO", "Q2", "next"]
+    ]
+  }
+}

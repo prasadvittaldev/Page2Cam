@@ -1,0 +1,13 @@
+{
+  "name": "QR card",
+  "category": "cta",
+  "description": "A QR code with a heading and a short line: a link, a sign-up, a download.",
+  "rect": [0.74, 0.5, 0.21, 0.42],
+  "params": [
+    {"name": "link", "type": "qr", "required": true, "help": "The text or link the code opens"},
+    {"name": "title", "type": "text", "default": "Scan me", "help": "Heading above the code"},
+    {"name": "caption", "type": "text", "default": "", "help": "Line under the code, e.g. the short link"}
+  ],
+  "example": {"link": "https://example.com/signup", "title": "Get the slides", "caption": "example.com/signup"},
+  "update": {"title": "Join the beta", "link": "https://example.com/beta", "caption": "example.com/beta"}
+}

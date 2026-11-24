@@ -1,0 +1,48 @@
+<style>
+  .sh{position:absolute;inset:0;display:flex;min-width:0}
+  .sh.col{flex-direction:column;justify-content:flex-end;align-items:flex-start;gap:2vh}
+  .sh.row{flex-direction:row;align-items:center;gap:3vh}
+  .sh .it{display:flex;align-items:center;max-width:100%;min-width:0;flex:0 1 auto;padding:0 .7em 0 .3em;border-radius:.35em;border-left:.18em solid var(--accent)}
+  .sh .chip{flex:none;min-width:2.6em;margin-right:.5em;padding:.12em .35em;border-radius:.25em;text-align:center;font-size:.72em;font-weight:800;letter-spacing:.04em;color:#fff;background:var(--accent);text-shadow:none;box-shadow:inset 0 0 0 .08em rgba(255,255,255,.3)}
+  .theme-minimal .sh .chip.plain{color:#000}
+  .sh .h{min-width:0;font-weight:600}
+</style>
+<div class="sh col" id="sh"></div>
+<script>
+var PLAT = {
+  youtube: ["YT", "#ff0033"], x: ["X", "#000000"], instagram: ["IG", "#d62976"], linkedin: ["in", "#0a66c2"],
+  github: ["GH", "#24292f"], tiktok: ["TT", "#000000"], twitch: ["TW", "#9146ff"], facebook: ["FB", "#1877f2"],
+  bluesky: ["BSKY", "#0085ff"], mastodon: ["MA", "#6364ff"], discord: ["DC", "#5865f2"], threads: ["TH", "#000000"],
+  web: ["WEB", ""], website: ["WEB", ""], site: ["WEB", ""], email: ["MAIL", ""], mail: ["MAIL", ""]
+};
+function platform(name) {
+  var s = String(name === undefined || name === null ? "" : name).trim();
+  if (!s) return null;
+  var k = s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (k.indexOf("twitter") === 0) k = "x";
+  if (PLAT[k]) return PLAT[k];
+  return [s.slice(0, 4).toUpperCase(), ""];
+}
+P2C.onParams(function (p) {
+  var list = P2C.$("#sh");
+  P2C.clear(list);
+  var rows = (Array.isArray(p.handles) ? p.handles : []).filter(function (r) {
+    return Array.isArray(r) && (r[0] || r[1]);
+  });
+  var asRow = p.layout === "row";
+  list.className = "sh " + (asRow ? "row" : "col");
+  var n = Math.max(1, rows.length);
+  var h = asRow ? 70 : Math.min(30, (100 - 2 * (n - 1)) / n);
+  rows.forEach(function (r) {
+    var item = P2C.el("div", "it p2c-panel", null, list);
+    item.style.height = h + "vh";
+    item.style.fontSize = (h * 0.48).toFixed(2) + "vh";
+    var pl = platform(r[0]);
+    if (pl) {
+      var chip = P2C.el("span", "chip" + (pl[1] ? "" : " plain"), pl[0], item);
+      if (pl[1]) chip.style.background = pl[1];
+    }
+    P2C.el("span", "h p2c-ellipsis", r[1] === undefined || r[1] === null ? "" : r[1], item);
+  });
+});
+</script>

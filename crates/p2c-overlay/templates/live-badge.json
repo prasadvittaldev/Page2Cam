@@ -1,0 +1,14 @@
+{
+  "name": "Live badge",
+  "category": "basics",
+  "description": "A LIVE, REC or ON AIR pill with a slowly pulsing dot, for a top corner.",
+  "rect": [0.03, 0.05, 0.1, 0.06],
+  "params": [
+    {"name": "label", "type": "choice", "options": ["LIVE", "REC", "ON AIR"], "default": "LIVE", "help": "Which word to show"},
+    {"name": "text", "type": "text", "default": "", "help": "Custom text instead of the label, e.g. LIVE FROM BERLIN (empty: the label). Keep it short"},
+    {"name": "colour", "type": "colour", "default": "", "help": "Dot colour #rrggbb (empty: red)"},
+    {"name": "pulse", "type": "bool", "default": true, "help": "Let the dot pulse slowly"}
+  ],
+  "example": {"label": "LIVE"},
+  "update": {"label": "ON AIR"}
+}
