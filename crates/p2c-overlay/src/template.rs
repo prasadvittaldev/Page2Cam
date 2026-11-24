@@ -391,7 +391,7 @@ impl Param {
             ParamType::Choice => {
                 let s = check_text(v, what, 100)?;
                 ensure!(
-                    self.options.iter().any(|o| *o == s),
+                    self.options.contains(&s),
                     "{what} must be one of {}",
                     self.options.join(", ")
                 );

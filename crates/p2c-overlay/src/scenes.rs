@@ -314,7 +314,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert_ne!(layer_file, copy, "the layer gets its own copy");
-        assert_eq!(store.assets_in_use(), [copy.clone()]);
+        assert_eq!(store.assets_in_use(), std::slice::from_ref(&copy));
         store.delete("logo", &a).unwrap();
         assert!(a.read(&copy).is_none() && a.read(&layer_file).is_some());
     }
