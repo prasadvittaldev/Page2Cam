@@ -152,6 +152,17 @@ Overlays come back hidden when Page2Cam starts again, so nothing appears in a ca
 
 Agents act without asking, so the tray shows a notification when one starts or stops Page2Cam or your stream, or shares your screen, and the **Agents** panel on the control page lists every change. Untick **Allow agents** to switch it off. Details for developers: [`docs/agent-api.md`](docs/agent-api.md).
 
+### What agents can do for you
+Agents get a built-in guide with playbooks for 24 kinds of users and 48 ready-made graphics (lower thirds, timers, agendas, charts, polls, QR codes, product cards, code and release-notes cards…) whose values change live. Just say who you are and what you're doing:
+
+- **Creators:** *"Set me up for my game stream: starting-soon card with a 5-minute countdown, then my handles in a corner."* *"I'm teaching a yoga class: interval timer, 40 seconds on, 20 off, 8 rounds."*
+- **Business:** *"I'm hosting a webinar on our Q4 plans: agenda on the right, highlight item 2 now."* *"Live shopping: show the headphones card at 79 euros, 7 left, offer ends at 20:00."*
+- **Care and education:** *"I'm a physiotherapist starting a telehealth call: blur my room and show my name and practice."* *"Teacher mode: today's steps, and a QR code to the worksheet."*
+- **Community:** *"Sunday service: lyrics card for the first song, and a giving QR code at the end."* *"Fundraiser: goal bar at 6,200 of 10,000 dollars; update it as donations come in."*
+- **Software companies:** *"We're demoing our 2.0 release to customers: version badge, release notes, then a code card of the new API."* *"Incident update for the all-hands: status card, degraded, with the timeline so far."*
+
+Ask the agent to **save the look** ("save this as Intro") and switch between looks later in one sentence. You can also do all of it yourself in the control page: the **Overlays** panel has **Templates** (fill in a form, click Add; make, import and export your own) and **Scenes** tabs. The full guide the agents read is in [`docs/agent-guide/`](docs/agent-guide/README.md).
+
 ### Close Page2Cam
 Click the tray icon and choose **Stop** (Page2Cam stays in the tray) or **Quit**.
 

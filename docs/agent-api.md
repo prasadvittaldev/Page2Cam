@@ -61,6 +61,10 @@ Coordinates are 0..1 of the 1920×1080 output.
 | `show_layer(id)`, `hide_layer(id)` | with the enter / exit animation; showing restarts the auto-hide |
 | `remove_layer(id)`, `clear_layers` | delete one (and its stored file) / hide all |
 | `reorder_layers(ids)` | restack: back to front, the last in front; unlisted layers stay behind |
+| `guide(topic?)` | how to run a good show: no topic = the index; a role or goal (`"doctor"`, `"webinar"`, `"release demo"`) = that playbook; a template id = its parameters and example calls; `catalogue`; how-tos `templates`, `scenes`, `layout`, `privacy`, `writing-templates`. Answered by Page2Cam itself (works while stopped and with agents off) |
+| `list_templates(category?)`, `get_template(id, include_html?)` | overlay templates, built-in and the user's own (built-ins also while stopped) |
+| `save_template(…)`, `delete_template(id)` | the user's own templates: a full definition, `from_layer` (an html layer) or `copy_of` (a template id plus changes) |
+| `list_scenes`, `save_scene(name, include_background?, include_webcam?)`, `load_scene(id, mode: replace|add)`, `delete_scene(id)` | saved looks: the layers (and optionally background and webcam overlay) under a name |
 
 Tools that need the running engine answer "Page2Cam is stopped — call start first" while it is stopped. No tool returns the stream key or any token.
 
@@ -80,6 +84,7 @@ Every layer has `x`, `y` (top-left corner) and `w`, `h` (size), all 0..1 of the 
 | `image` | `path` (a local file, read once and copied) or `data_base64`; PNG, JPEG, WebP, GIF ≤ 20 MB; transparency kept |
 | `video` | `path` (local MP4/WebM ≤ 200 MB, copied) or `url` (http/https); `loop`, `muted` (both default true) |
 | `youtube` | `link` (a YouTube link or id), `start_s`, `loop`, `muted` (both default true) |
+| `template` | `template` (an id from `list_templates`), `params` (its values; geometry defaults from the template) |
 
 Styles: `news` (navy band with a red accent), `minimal` (white text with a shadow, no box), `brand` (Page2Cam navy and blue).
 
@@ -110,6 +115,27 @@ Examples (MCP `tools/call` arguments):
 ```
 
 Then `update_layer({ "id": "news", "items": ["Breaking: …"] })`, `hide_layer({ "id": "guest" })`, and check with `snapshot`.
+
+## Templates, scenes and the guide
+
+The full agent guide (playbooks for 24 user groups, how-tos, every template's parameters) is in [`docs/agent-guide/`](agent-guide/README.md); it is generated from the same sources the `guide` tool answers from.
+
+**Templates** are named, tested, parameterised graphics (48 built in: lower thirds, badges, timers, full-frame cards, agendas, charts, polls, QR and product cards, code, terminal, release-notes and status cards, …):
+
+```json
+{ "name": "add_layer", "arguments": { "kind": "template", "template": "countdown",
+  "params": { "label": "We start in", "duration": "5:00" } } }
+```
+
+`update_layer({ "id": "countdown", "params": { "duration": "2:00" } })` changes only the given values, live: the scene page posts them into the running frame (no reload; timers and animations keep going). `null` resets one. Every template takes `theme` (`brand`, `news`, `minimal`) and `accent`. A picture parameter accepts an https address, a `data:image/…;base64,` URI, or (over MCP) `{"path": "C:\\…\\logo.png"}`, which is read and embedded (≤ 1 MB). Template code runs in the same sandboxed frame as `html` layers; parameters are JSON data and built-in templates set them as text.
+
+**User templates** (`save_template`, the control page's *Templates* tab with import/export of `.p2c-template.json` files) live in `<data dir>/overlays/templates/` (at most 200, HTML ≤ 256 KB, ids `a-z0-9-`, never a built-in id). A layer whose template was deleted shows "template missing" and `list_layers` marks it `template_missing: true`.
+
+**Scenes** (`save_scene`, `load_scene`; the control page's *Scenes* tab) save every layer (shown or hidden, with copies of their pictures and videos) and optionally the background and the webcam overlay under a name, in `<data dir>/overlays/scenes/` (at most 100). Loading replaces the layers (or adds them in front with `mode: "add"`) and says what was skipped. Loading a scene whose background is `screen` shows the screen-sharing notification.
+
+**MCP resources and prompts.** `resources/list` / `resources/read` serve `page2cam://guide`, `page2cam://catalogue`, `page2cam://howto/<id>`, `page2cam://playbooks/<id>` and `page2cam://templates/<id>` (Markdown). `prompts/list` / `prompts/get` offer one prompt per playbook ("Set up for a webinar", with optional `name`, `title`, `topic`…), plus `clear-graphics` and `save-look`.
+
+**Claude Code skill.** While agents are allowed, the tray writes `%USERPROFILE%\.claude\skills\page2cam\` (`SKILL.md` plus `reference/`: the guide index, catalogue, playbooks, how-tos, templates), only if `%USERPROFILE%\.claude` exists. A marker file (`.page2cam-skill`, with the version) makes it Page2Cam's: only that folder is ever refreshed (when the version or files change) or removed (when agents are switched off); a folder without the marker is left alone.
 
 ## Local admin API (scripts)
 
