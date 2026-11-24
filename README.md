@@ -7,6 +7,8 @@
 
 <p align="center">A creative virtual camera platform that puts control of your visual identity in your hands, or in the hands of your AI agent.</p>
 
+<p align="center"><img src="assets/showcase.png" alt="Page2Cam: an AI agent sets up a game stream with a starting-soon card, countdown and social handles; playbooks for creators, business, care and education, community and software teams; works with Teams, Zoom, Google Meet and YouTube Live" width="100%"></p>
+
 **Page2Cam is a project by Prasad Vittaldev.**
 Connect with him on LinkedIn: <https://www.linkedin.com/in/prasadvittaldev/>
 
