@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath artifact configuration "binaries": Page2Cam's own program and
+     camera DLL, uploaded by .github/workflows/release.yml as one artifact
+     (a zip). Third-party files (Chromium/CEF, ONNX Runtime, DirectML, FFmpeg)
+     are not sent for signing. -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file path="page2cam.exe" product-name="Page2Cam">
+      <authenticode-sign/>
+    </pe-file>
+    <pe-file path="p2c_vcam_win_source.dll" product-name="Page2Cam">
+      <authenticode-sign/>
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

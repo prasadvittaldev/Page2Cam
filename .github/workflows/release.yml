@@ -1,0 +1,213 @@
+# Builds the Windows release on GitHub's own runners and has SignPath
+# (SignPath Foundation's free open-source code signing) sign it:
+#   1. build and assemble (scripts/package-windows.sh build)
+#   2. sign page2cam.exe and the camera DLL      (SignPath, "binaries")
+#   3. zip + installer from the signed files     (scripts/package-windows.sh pack)
+#   4. sign the installer                         (SignPath, "installer")
+#   5. SHA256SUMS, then a DRAFT GitHub release with the zip, installer and sums.
+# SHA256SUMS.sig (the in-app updater's ed25519 signature) is added afterwards
+# from the maintainer's machine with scripts/finish-release.sh, which also
+# publishes the draft. Every signing request needs manual approval in SignPath.
+#
+# Until the SignPath variables are set (Settings > Secrets and variables >
+# Actions: secret SIGNPATH_API_TOKEN; variables SIGNPATH_ORGANIZATION_ID,
+# SIGNPATH_PROJECT_SLUG, SIGNPATH_SIGNING_POLICY_SLUG) the same build runs
+# unsigned, so the pipeline can be tested.
+name: Release build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      draft_release:
+        description: Also create/update the draft GitHub release for this tag
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # the draft release
+  actions: read # SignPath reads the uploaded artifacts
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 360 # GitHub-hosted maximum; includes waiting for the signing approvals
+    env:
+      CEF_EXPORT_VERSION: '=156.6.0+156.0.30' # must match the pinned `cef` crate
+      NSIS_VERSION: '3.13'
+      NSIS_ZIP_SHA256: ba63dffc4410ee89193e1cb5a41989991bd77c61068da17e3156d136b7b0b3d8
+      NSIS_DEB: nsis-common_3.13-1_all.deb # Debian's amd64-unicode stubs and plugins
+      NSIS_DEB_SHA256: 5d66cf54a09214dd7874a038a94af42894066d1fb136d662619528b0c7ed1c8c
+      SIGN: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: ver
+        run: |
+          v="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v$v" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version $v"; exit 1
+          fi
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/export-cef-dir.exe
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Cache CEF, NSIS and downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/AppData/Local/cef-win
+            ~/AppData/Local/page2cam-build/nsis
+            ~/.cache/page2cam
+          key: deps-${{ runner.os }}-cef156.6.0-nsis3.13-${{ hashFiles('scripts/fetch-models.sh') }}
+
+      - name: Build tools on PATH (rc.exe, Ninja)
+        run: |
+          kit="$(ls -d "/c/Program Files (x86)/Windows Kits/10/bin/"10.*/x64 | sort -V | tail -1)"
+          echo "$kit" >> "$GITHUB_PATH"
+          command -v ninja || choco install ninja -y --no-progress
+
+      - name: CEF for Windows
+        run: |
+          [ -x ~/.cargo/bin/export-cef-dir.exe ] || cargo install export-cef-dir --locked --version "$CEF_EXPORT_VERSION"
+          [ -f "$LOCALAPPDATA/cef-win/libcef.dll" ] || export-cef-dir --force "$LOCALAPPDATA/cef-win"
+
+      - name: NSIS with amd64 stubs
+        run: |
+          dst="$LOCALAPPDATA/page2cam-build/nsis"
+          [ -f "$dst/Stubs/lzma-amd64-unicode" ] && exit 0
+          t="$(mktemp -d)"; cd "$t"
+          curl -fsSL --retry 3 -o nsis.zip "https://downloads.sourceforge.net/project/nsis/NSIS%203/$NSIS_VERSION/nsis-$NSIS_VERSION.zip"
+          curl -fsSL --retry 3 -o common.deb "https://deb.debian.org/debian/pool/main/n/nsis/$NSIS_DEB"
+          echo "$NSIS_ZIP_SHA256  nsis.zip" | sha256sum -c -
+          echo "$NSIS_DEB_SHA256  common.deb" | sha256sum -c -
+          unzip -q nsis.zip
+          mkdir deb && (cd deb && "$SYSTEMROOT/System32/tar.exe" -xf ../common.deb && "$SYSTEMROOT/System32/tar.exe" -xf data.tar.xz)
+          mkdir -p "$dst" && cp -r "nsis-$NSIS_VERSION"/. "$dst"/
+          cp deb/usr/share/nsis/Stubs/*amd64-unicode "$dst/Stubs/"
+          cp -r deb/usr/share/nsis/Plugins/amd64-unicode "$dst/Plugins/"
+          "$dst/makensis.exe" -VERSION
+
+      - name: Build and assemble
+        run: |
+          export CEF_PATH="$LOCALAPPDATA/cef-win"
+          ./scripts/package-windows.sh build
+          mkdir -p "$RUNNER_TEMP/p2c-unsigned"
+          cp dist/Page2Cam-windows-x64/page2cam.exe dist/Page2Cam-windows-x64/p2c_vcam_win_source.dll "$RUNNER_TEMP/p2c-unsigned/"
+
+      - name: Upload unsigned binaries
+        id: upload-binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-binaries
+          path: ${{ runner.temp }}/p2c-unsigned/
+          if-no-files-found: error
+
+      - name: Sign binaries (SignPath)
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: binaries
+          github-artifact-id: ${{ steps.upload-binaries.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 10800
+          output-artifact-directory: signed-binaries
+
+      - name: Put the signed binaries in place
+        if: env.SIGN == 'true'
+        run: |
+          cp signed-binaries/page2cam.exe signed-binaries/p2c_vcam_win_source.dll dist/Page2Cam-windows-x64/
+          for f in page2cam.exe p2c_vcam_win_source.dll; do
+            powershell -NoProfile -Command "\$s = Get-AuthenticodeSignature 'dist/Page2Cam-windows-x64/$f'; \"$f \$(\$s.Status) \$(\$s.SignerCertificate.Subject)\"; if (\$s.Status -ne 'Valid') { exit 1 }"
+          done
+
+      - name: Zip and installer
+        run: ./scripts/package-windows.sh pack
+
+      - name: Upload unsigned installer
+        id: upload-installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-installer
+          path: dist/Page2Cam-Setup-${{ steps.ver.outputs.version }}.exe
+          if-no-files-found: error
+
+      - name: Sign installer (SignPath)
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.upload-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 10800
+          output-artifact-directory: signed-installer
+
+      - name: Put the signed installer in place
+        if: env.SIGN == 'true'
+        run: |
+          f="Page2Cam-Setup-${{ steps.ver.outputs.version }}.exe"
+          cp "signed-installer/$f" "dist/$f"
+          powershell -NoProfile -Command "\$s = Get-AuthenticodeSignature 'dist/$f'; \"$f \$(\$s.Status) \$(\$s.SignerCertificate.Subject)\"; if (\$s.Status -ne 'Valid') { exit 1 }"
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum "Page2Cam-Setup-${{ steps.ver.outputs.version }}.exe" Page2Cam-windows-x64.zip | sed 's/  / */' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: page2cam-${{ steps.ver.outputs.version }}-windows
+          path: |
+            dist/Page2Cam-Setup-${{ steps.ver.outputs.version }}.exe
+            dist/Page2Cam-windows-x64.zip
+            dist/SHA256SUMS
+          compression-level: 0
+
+      - name: Draft release
+        if: github.ref_type == 'tag' || inputs.draft_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ steps.ver.outputs.version }}"
+          files=(dist/Page2Cam-Setup-*.exe dist/Page2Cam-windows-x64.zip dist/SHA256SUMS)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            if [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" != true ]; then
+              echo "::error::release $tag is already published; not replacing its files"; exit 1
+            fi
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" --draft --verify-tag --title "Page2Cam ${{ steps.ver.outputs.version }}" \
+              --notes "Built and signed by GitHub Actions run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. Code signing policy: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}#code-signing-policy" \
+              "${files[@]}"
+          fi

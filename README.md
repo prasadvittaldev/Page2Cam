@@ -231,6 +231,18 @@ If you need help, the file **`page2cam.log`** records what happened. Its locatio
 
 ---
 
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- Windows releases are built from this repository's source code by GitHub Actions ([`.github/workflows/release.yml`](.github/workflows/release.yml)) and signed there through SignPath. Only Page2Cam's own files are signed: `page2cam.exe`, the camera DLL (`p2c_vcam_win_source.dll`) and the installer. Files from other projects (Chromium Embedded Framework, FFmpeg, ONNX Runtime, DirectML, the Visual C++ runtime) are shipped as their authors publish them.
+- Team roles:
+  - Committers and reviewers: [Prasad Vittaldev](https://github.com/prasadvittaldev)
+  - Approvers (every signing request is approved by hand): [Prasad Vittaldev](https://github.com/prasadvittaldev)
+- Privacy: this program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it, except the update check described in [Your privacy](#your-privacy) (it asks GitHub for the latest version number only, and can be turned off).
+
+---
+
 ## Credits and licence
 
 Page2Cam is free software, released under the **GNU General Public License, version 3 or later** (see [`LICENSE`](LICENSE)).

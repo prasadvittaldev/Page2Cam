@@ -9,6 +9,12 @@
 # Cut-out models and ONNX Runtime come from scripts/fetch-models.sh.
 set -euo pipefail
 
+# Phases: "build" (compile and assemble dist/Page2Cam-windows-x64), "pack"
+# (zip, installer, checksums from that folder; CI signs page2cam.exe and the
+# camera DLL in between), or "all" (default: both).
+PHASE="${1:-all}"
+case "$PHASE" in all | build | pack) ;; *) echo "usage: $0 [all|build|pack]" >&2; exit 2 ;; esac
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) NATIVE=1 ;; *) NATIVE= ;; esac
 if [ -n "$NATIVE" ]; then
@@ -35,6 +41,7 @@ FFMPEG_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/page2cam/ffmpeg-win"
 export PATH="$HOME/.local/bin:$PATH"
 export CEF_PATH="$CEF_WIN"
 
+if [ "$PHASE" != pack ]; then
 echo "==> Building release binaries for $TARGET"
 cd "$ROOT"
 if [ -n "$NATIVE" ]; then
@@ -99,6 +106,15 @@ if ! command -v llvm-readobj >/dev/null; then
 elif llvm-readobj --coff-imports "$OUT/page2cam.exe" | grep -qi onnxruntime; then
   echo "page2cam.exe must not import onnxruntime.dll" >&2; exit 1
 fi
+
+fi # build
+
+if [ "$PHASE" = build ]; then
+  echo "==> Assembled $OUT (next: sign, then $0 pack)"
+  exit 0
+fi
+[ -s "$OUT/page2cam.exe" ] || { echo "nothing assembled at $OUT: run $0 build first" >&2; exit 1; }
+rm -rf "$ZIP" "$STAGE" "$ROOT"/dist/Page2Cam-Setup-*.exe "$ROOT"/dist/SHA256SUMS*
 
 echo "==> Zipping"
 if [ -n "$NATIVE" ]; then

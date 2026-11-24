@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath artifact configuration "installer": the NSIS installer built
+     from the already signed binaries, uploaded as one artifact (a zip). -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file path="Page2Cam-Setup-*.exe" product-name="Page2Cam">
+      <authenticode-sign/>
+    </pe-file>
+  </zip-file>
+</artifact-configuration>
