@@ -364,6 +364,89 @@ impl TrayBackend {
                 let v = self.post("/api/layers/order", &json!({ "ids": ids }))?;
                 Ok(BackendReply::Json(layers_out(&v["layers"])))
             }
+            // The MCP server answers it itself; here for completeness.
+            C::Guide(t) => p2c_guide::topic(t.as_deref().unwrap_or(""))
+                .map(|(_, text)| BackendReply::Done(text)),
+            C::ListTemplates(cat) => {
+                if self.ctl.engine().is_none() {
+                    let lib = p2c_overlay::TemplateLib::builtin_only();
+                    let mut v = lib.list_json(cat.as_deref());
+                    v["note"] = json!("Page2Cam is stopped: built-in templates only (start it to see the user's own)");
+                    return Ok(BackendReply::Json(v));
+                }
+                let path = match cat {
+                    Some(c) => format!("/api/templates?category={c}"),
+                    None => "/api/templates".into(),
+                };
+                self.get(&path).map(BackendReply::Json)
+            }
+            C::GetTemplate { id, include_html } => {
+                let mut v = if self.ctl.engine().is_none() {
+                    p2c_overlay::builtin(id)
+                        .map(|t| t.to_json(true))
+                        .ok_or_else(|| {
+                            format!(
+                                "no built-in template {id:?}; start Page2Cam to see the user's own"
+                            )
+                        })?
+                } else {
+                    self.get(&format!("/api/templates/{id}"))?
+                };
+                if !include_html && v["builtin"] == json!(true) {
+                    if let Some(m) = v.as_object_mut() {
+                        if let Some(h) = m.remove("html") {
+                            m.insert("html_bytes".into(), h.as_str().map_or(0, str::len).into());
+                        }
+                    }
+                }
+                Ok(BackendReply::Json(v))
+            }
+            C::SaveTemplate(body) => {
+                let mut v = self.json("POST", "/api/templates", Some(body), SLOW_TIMEOUT)?;
+                if let Some(m) = v.as_object_mut() {
+                    if let Some(h) = m.remove("html") {
+                        m.insert("html_bytes".into(), h.as_str().map_or(0, str::len).into());
+                    }
+                }
+                Ok(BackendReply::Json(v))
+            }
+            C::DeleteTemplate(id) => {
+                self.json(
+                    "DELETE",
+                    &format!("/api/templates/{id}"),
+                    None,
+                    ENGINE_TIMEOUT,
+                )?;
+                Ok(BackendReply::Done(format!("template {id} deleted")))
+            }
+            C::ListScenes => self.get("/api/scenes").map(BackendReply::Json),
+            C::SaveScene {
+                name,
+                include_background,
+                include_webcam,
+            } => self
+                .json(
+                    "POST",
+                    "/api/scenes",
+                    Some(
+                        &json!({ "name": name, "include_background": include_background,
+                        "include_webcam": include_webcam }),
+                    ),
+                    SLOW_TIMEOUT,
+                )
+                .map(BackendReply::Json),
+            C::LoadScene { id, replace } => self
+                .json(
+                    "POST",
+                    &format!("/api/scenes/{id}/load"),
+                    Some(&json!({ "mode": if *replace { "replace" } else { "add" } })),
+                    SLOW_TIMEOUT,
+                )
+                .map(BackendReply::Json),
+            C::DeleteScene(id) => {
+                self.json("DELETE", &format!("/api/scenes/{id}"), None, ENGINE_TIMEOUT)?;
+                Ok(BackendReply::Done(format!("scene {id} deleted")))
+            }
         }
     }
 }
@@ -446,6 +529,15 @@ impl Backend for TrayBackend {
                     text.push_str(" (stream ended)");
                 }
                 self.ctl.balloon(text);
+            }
+            // A scene may bring back a screen-sharing background: said always.
+            if let (BackendCall::LoadScene { .. }, Ok(BackendReply::Json(v))) = (&req, &r) {
+                if v["background_full"] == "screen" {
+                    let short: String = agent.chars().take(40).collect();
+                    self.ctl.balloon(format!(
+                        "Agent \u{201c}{short}\u{201d} is sharing your screen"
+                    ));
+                }
             }
         }
         r
@@ -848,6 +940,143 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(e, "only PNG, JPEG and WebP images are accepted");
         assert_eq!(b.activity.lock().list()[0].result, e);
+    }
+
+    #[test]
+    fn templates_listed_while_stopped() {
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "stopped".into();
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(tray, d.path());
+        match b
+            .call("A", BackendCall::ListTemplates(Some("time".into())))
+            .unwrap()
+        {
+            BackendReply::Json(v) => {
+                assert!(!v["templates"].as_array().unwrap().is_empty());
+                assert!(v["note"].as_str().unwrap().contains("stopped"));
+            }
+            r => panic!("{r:?}"),
+        }
+        let get = |include_html| {
+            b.call(
+                "A",
+                BackendCall::GetTemplate {
+                    id: "countdown".into(),
+                    include_html,
+                },
+            )
+        };
+        match get(false).unwrap() {
+            BackendReply::Json(v) => {
+                assert!(v.get("html").is_none() && v["html_bytes"].as_u64().unwrap() > 0);
+                assert!(v["all_params"].is_array());
+            }
+            r => panic!("{r:?}"),
+        }
+        match get(true).unwrap() {
+            BackendReply::Json(v) => assert!(v["html"].is_string()),
+            r => panic!("{r:?}"),
+        }
+        assert_eq!(
+            b.call("A", BackendCall::ListScenes).unwrap_err(),
+            p2c_mcp::STOPPED
+        );
+    }
+
+    #[test]
+    fn template_and_scene_calls_reach_the_engine() {
+        let (port, log) = fake_engine(|m, p, _| match (m, p) {
+            ("POST", "/api/templates") => (200, br#"{"id":"mine","html":"<b>x</b>"}"#.to_vec()),
+            ("POST", "/api/scenes/intro/load") => (
+                200,
+                br#"{"added":["t"],"skipped":[],"background_full":"screen"}"#.to_vec(),
+            ),
+            ("GET", "/api/templates/mine") => (
+                200,
+                br#"{"id":"mine","builtin":false,"html":"<b>x</b>"}"#.to_vec(),
+            ),
+            _ => (200, br#"{"scenes":[]}"#.to_vec()),
+        });
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "running".into();
+        *tray.engine.lock() = Some((port, "tok".into()));
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(tray.clone(), d.path());
+        match b
+            .call(
+                "Claude",
+                BackendCall::SaveTemplate(json!({ "copy_of": "countdown", "id": "mine" })),
+            )
+            .unwrap()
+        {
+            BackendReply::Json(v) => assert_eq!(v["html_bytes"], 8),
+            r => panic!("{r:?}"),
+        }
+        match b
+            .call(
+                "Claude",
+                BackendCall::GetTemplate {
+                    id: "mine".into(),
+                    include_html: false,
+                },
+            )
+            .unwrap()
+        {
+            BackendReply::Json(v) => {
+                assert_eq!(v["html"], "<b>x</b>", "the user's own keep their HTML")
+            }
+            r => panic!("{r:?}"),
+        }
+        b.call("Claude", BackendCall::ListTemplates(None)).unwrap();
+        b.call("Claude", BackendCall::DeleteTemplate("mine".into()))
+            .unwrap();
+        b.call(
+            "Claude",
+            BackendCall::SaveScene {
+                name: "Intro".into(),
+                include_background: true,
+                include_webcam: false,
+            },
+        )
+        .unwrap();
+        b.call(
+            "Claude",
+            BackendCall::LoadScene {
+                id: "intro".into(),
+                replace: false,
+            },
+        )
+        .unwrap();
+        b.call("Claude", BackendCall::ListScenes).unwrap();
+        b.call("Claude", BackendCall::DeleteScene("intro".into()))
+            .unwrap();
+        let log = log.lock();
+        let seen: Vec<String> = log.iter().map(|(m, p, _)| format!("{m} {p}")).collect();
+        assert_eq!(
+            seen,
+            [
+                "POST /api/templates",
+                "GET /api/templates/mine",
+                "GET /api/templates",
+                "DELETE /api/templates/mine",
+                "POST /api/scenes",
+                "POST /api/scenes/intro/load",
+                "GET /api/scenes",
+                "DELETE /api/scenes/intro",
+            ]
+        );
+        let body = |i: usize| -> Value { serde_json::from_slice(&log[i].2).unwrap() };
+        assert_eq!(
+            body(4),
+            json!({ "name": "Intro", "include_background": true, "include_webcam": false })
+        );
+        assert_eq!(body(5), json!({ "mode": "add" }));
+        assert_eq!(
+            tray.balloons.lock().as_slice(),
+            ["Agent \u{201c}Claude\u{201d} is sharing your screen"]
+        );
+        assert_eq!(b.activity.lock().list().len(), 5, "changes are listed");
     }
 
     #[test]

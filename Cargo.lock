@@ -2544,6 +2544,7 @@ name = "p2c-mcp"
 version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
+ "p2c-guide",
  "serde_json",
 ]
 
@@ -2622,7 +2623,9 @@ dependencies = [
  "image",
  "p2c-admin",
  "p2c-core",
+ "p2c-guide",
  "p2c-mcp",
+ "p2c-overlay",
  "p2c-proc",
  "p2c-shm",
  "p2c-update",

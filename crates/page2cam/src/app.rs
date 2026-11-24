@@ -827,12 +827,18 @@ impl p2c_admin::Overlays for App {
     fn load_scene(&self, id: &str, replace: bool) -> anyhow::Result<serde_json::Value> {
         let (scene, r) = self.overlay.load_scene(id, replace)?;
         let mut notes: Vec<String> = Vec::new();
+        let mut full = None;
         if let Some(bg) = scene.background {
             match serde_json::from_value::<BackgroundDto>(bg)
                 .map_err(anyhow::Error::from)
-                .and_then(|b| Controls::set_background(self, b))
-            {
-                Ok(()) => notes.push("background restored".into()),
+                .and_then(|b| {
+                    let f = b.full.clone();
+                    Controls::set_background(self, b).map(|()| f)
+                }) {
+                Ok(f) => {
+                    notes.push("background restored".into());
+                    full = Some(f);
+                }
                 Err(e) => notes.push(format!("background not restored: {e:#}")),
             }
         }
@@ -856,6 +862,7 @@ impl p2c_admin::Overlays for App {
         );
         Ok(serde_json::json!({
             "scene": scene.id, "added": r.added, "skipped": r.skipped, "notes": notes,
+            "background_full": full,
         }))
     }
     fn delete_scene(&self, id: &str) -> anyhow::Result<()> {

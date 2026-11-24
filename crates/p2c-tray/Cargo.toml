@@ -16,6 +16,8 @@ anyhow.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 p2c-mcp = { path = "../p2c-mcp" }
+p2c-guide = { path = "../p2c-guide" }
+p2c-overlay = { path = "../p2c-overlay" }
 # preserve_order: agent config files keep their key order when we add ours.
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"

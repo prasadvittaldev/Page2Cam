@@ -60,7 +60,7 @@
         "description": "One overlay layer, drawn over everything. Flat: the common fields plus those of its kind. Geometry is 0..1 of the output (x, y = top-left corner). In POST bodies every field except kind (when adding) is optional; image and video take path (a local file, copied once) or data_base64 (pictures); youtube takes link.",
         "properties": {
           "id": { "type": "string", "maxLength": 40, "description": "a-z0-9- (a given id is sanitised; else made from name or kind, e.g. title-1)" },
-          "kind": { "type": "string", "enum": ["title", "ticker", "html", "image", "video", "youtube"] },
+          "kind": { "type": "string", "enum": ["title", "ticker", "html", "template", "image", "video", "youtube"] }, "template": { "type": "string", "description": "template: an id from GET /api/templates" }, "params": { "type": "object", "description": "template: its parameter values (partial on change; null resets one)" },
           "name": { "type": "string", "maxLength": 80 },
           "x": { "type": "number", "minimum": 0, "maximum": 1 }, "y": { "type": "number", "minimum": 0, "maximum": 1 },
           "w": { "type": "number", "minimum": 0.01, "maximum": 1 }, "h": { "type": "number", "minimum": 0.01, "maximum": 1 },
@@ -139,6 +139,20 @@
     },
     "/api/layers/{id}/asset": { "post": { "summary": "Upload a new picture (PNG/JPEG/WebP/GIF) or video (MP4/WebM) for an image or video layer (raw body, at most 200 MB)", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "requestBody": { "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } }, "responses": { "200": { "description": "The Layer" }, "400": { "description": "{error}" }, "413": { "description": "Larger than 200 MB" }, "415": { "description": "Not a supported picture or video" } } } },
     "/api/layers/clear": { "post": { "summary": "Hide every overlay layer", "responses": { "200": { "description": "{hidden: n}" } } } },
-    "/api/layers/order": { "post": { "summary": "Restack layers: ids back to front (unlisted ones stay behind)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "required": ["ids"], "properties": { "ids": { "type": "array", "items": { "type": "string" } } } } } } }, "responses": { "200": { "description": "{layers}" }, "400": { "description": "{error}: unknown or repeated id" } } } }
+    "/api/layers/order": { "post": { "summary": "Restack layers: ids back to front (unlisted ones stay behind)", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "required": ["ids"], "properties": { "ids": { "type": "array", "items": { "type": "string" } } } } } } }, "responses": { "200": { "description": "{layers}" }, "400": { "description": "{error}: unknown or repeated id" } } } },
+    "/api/templates": {
+      "get": { "summary": "Overlay templates (built-in and the user's own)", "parameters": [{ "name": "category", "in": "query", "schema": { "type": "string", "enum": ["basics", "time", "cards", "lists", "data", "cta", "calm", "software", "mine"] } }], "responses": { "200": { "description": "{templates: [{id, name, category, description, builtin, full_frame}], categories: [{id, label}]}" } } },
+      "post": { "summary": "Save a user template: a full definition {id, name, category, description, params, html, rect, example, update, full_frame}, or {from_layer, name} (an html layer), or {copy_of, id, …changes}. The same id replaces it; built-in ids are refused; at most 200", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "The template in full" }, "400": { "description": "{error}" } } }
+    },
+    "/api/templates/{id}": {
+      "get": { "summary": "One template in full: params (with all_params incl. theme and accent), example, update example, html", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "The template" }, "404": { "description": "{error}" } } },
+      "delete": { "summary": "Delete a user template (layers using it show \"template missing\")", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "{removed}" }, "400": { "description": "{error}: built-in or unknown" } } }
+    },
+    "/api/scenes": {
+      "get": { "summary": "Saved looks (scenes)", "responses": { "200": { "description": "{scenes: [{id, name, layers, visible_layers, has_background, has_webcam, created}]}" } } },
+      "post": { "summary": "Save the current layers (and optionally background and webcam overlay) as a scene; the same name replaces it; at most 100", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" }, "include_background": { "type": "boolean" }, "include_webcam": { "type": "boolean" } } } } } }, "responses": { "200": { "description": "The scene summary" }, "400": { "description": "{error}" } } }
+    },
+    "/api/scenes/{id}/load": { "post": { "summary": "Load a scene: replace (default; other layers removed first) or add (in front)", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "mode": { "type": "string", "enum": ["replace", "add"] } } } } } }, "responses": { "200": { "description": "{scene, added, skipped, notes, background_full}" }, "400": { "description": "{error}" } } } },
+    "/api/scenes/{id}": { "delete": { "summary": "Delete a scene and its copied files", "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "{removed}" }, "400": { "description": "{error}" } } } }
   }
 }

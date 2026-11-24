@@ -578,7 +578,78 @@ pub fn apply_registration(
             result,
         });
     }
+    if let Some(s) = env.home.as_deref().and_then(|h| apply_skill(h, on)) {
+        out.push(s);
+    }
     out
+}
+
+/// The file that marks the skill folder as ours (holds the version).
+pub const SKILL_MARKER: &str = ".page2cam-skill";
+
+/// `<home>/.claude/skills/page2cam`.
+pub fn skill_dir(home: &Path) -> PathBuf {
+    home.join(".claude").join("skills").join("page2cam")
+}
+
+/// Write (on) or remove (off) the Claude Code skill in
+/// `<home>/.claude/skills/page2cam`, only if `<home>/.claude` exists. Only a
+/// folder with our marker is ever replaced or removed; it is rewritten only
+/// when its version or files differ. `None` when there is nothing to do.
+pub fn apply_skill(home: &Path, on: bool) -> Option<RegResult> {
+    if !home.join(".claude").is_dir() {
+        return None;
+    }
+    let dir = skill_dir(home);
+    let marker = dir.join(SKILL_MARKER);
+    let ours = marker.is_file();
+    let row = |result| {
+        Some(RegResult {
+            app: "Claude Code skill".into(),
+            result,
+        })
+    };
+    if !on {
+        if !ours {
+            return None;
+        }
+        return row(std::fs::remove_dir_all(&dir)
+            .map_err(|e| format!("cannot remove {}: {e}", dir.display())));
+    }
+    if dir.exists() && !ours {
+        return row(Err(format!(
+            "{} was not made by Page2Cam: left alone",
+            dir.display()
+        )));
+    }
+    let stamp = format!("page2cam {}\n", env!("CARGO_PKG_VERSION"));
+    let files = p2c_guide::skill_files();
+    let same = ours
+        && std::fs::read_to_string(&marker).is_ok_and(|m| m == stamp)
+        && files.iter().all(|(p, text)| {
+            std::fs::read_to_string(dir.join(p)).is_ok_and(|t| t.replace("\r\n", "\n") == *text)
+        });
+    if same {
+        return row(Ok(()));
+    }
+    let write = || -> io::Result<()> {
+        // Build next to it, then swap: a reader never sees half a skill.
+        let tmp = dir.with_file_name("page2cam.part");
+        let _ = std::fs::remove_dir_all(&tmp);
+        for (p, text) in &files {
+            let f = tmp.join(p);
+            if let Some(parent) = f.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&f, text)?;
+        }
+        std::fs::write(tmp.join(SKILL_MARKER), &stamp)?;
+        if ours {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        std::fs::rename(&tmp, &dir)
+    };
+    row(write().map_err(|e| format!("cannot write {}: {e}", dir.display())))
 }
 
 /// The copy-paste snippets for other clients (no token: it's in agent.json).
@@ -1002,6 +1073,77 @@ mod tests {
             "{:?}",
             t.elapsed()
         );
+    }
+
+    #[test]
+    fn skill_written_updated_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let r = apply_skill(home, true).unwrap();
+        assert_eq!(r.result, Ok(()));
+        assert_eq!(r.app, "Claude Code skill");
+        let dir = skill_dir(home);
+        let skill = std::fs::read_to_string(dir.join("SKILL.md")).unwrap();
+        assert!(skill.starts_with("---\nname: page2cam\n"));
+        assert!(dir.join("reference/playbooks/telehealth.md").is_file());
+        assert!(dir.join(SKILL_MARKER).is_file());
+        // Unchanged: not rewritten.
+        let before = std::fs::metadata(dir.join("SKILL.md"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(apply_skill(home, true).unwrap().result, Ok(()));
+        let after = std::fs::metadata(dir.join("SKILL.md"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after);
+        // An older version (or a changed file) is refreshed; stray files go.
+        std::fs::write(dir.join(SKILL_MARKER), "page2cam 0.0.1\n").unwrap();
+        std::fs::write(dir.join("old.md"), "x").unwrap();
+        assert_eq!(apply_skill(home, true).unwrap().result, Ok(()));
+        assert!(!dir.join("old.md").exists());
+        assert!(std::fs::read_to_string(dir.join(SKILL_MARKER))
+            .unwrap()
+            .contains(env!("CARGO_PKG_VERSION")));
+        // Off removes only our folder.
+        std::fs::write(home.join(".claude/skills/other.md"), "keep").unwrap();
+        assert_eq!(apply_skill(home, false).unwrap().result, Ok(()));
+        assert!(!dir.exists());
+        assert!(home.join(".claude/skills/other.md").exists());
+        assert!(apply_skill(home, false).is_none(), "nothing left to do");
+    }
+
+    #[test]
+    fn skill_never_touches_foreign_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        let dir = skill_dir(home);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "someone else's").unwrap();
+        let r = apply_skill(home, true).unwrap();
+        assert!(r.result.unwrap_err().contains("not made by Page2Cam"));
+        assert!(apply_skill(home, false).is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("SKILL.md")).unwrap(),
+            "someone else's"
+        );
+    }
+
+    #[test]
+    fn no_skill_without_dot_claude() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(apply_skill(d.path(), true).is_none());
+        assert!(!d.path().join(".claude").exists());
+        // Registration with such a home adds no skill row.
+        let env = RegEnv {
+            appdata: None,
+            home: Some(d.path().to_path_buf()),
+            localappdata: None,
+        };
+        let r = apply_registration(true, "C:\\p2c.exe", &env, &|_| None);
+        assert!(r.iter().all(|x| x.app != "Claude Code skill"));
     }
 
     #[test]
