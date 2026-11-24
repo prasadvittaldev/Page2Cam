@@ -65,6 +65,7 @@ pub const HOWTO_IDS: &[&str] = &[
     "layout",
     "privacy",
     "writing-templates",
+    "performance",
 ];
 
 /// A playbook or how-to: its header and Markdown body.
@@ -579,7 +580,7 @@ const SKILL_DESCRIPTION: &str = "Run the user's camera show with Page2Cam (virtu
 
 fn skill_md() -> String {
     let mut s = format!(
-        "---\nname: page2cam\ndescription: {SKILL_DESCRIPTION}\n---\n\n# Page2Cam\n\nControl Page2Cam through the `page2cam` MCP server's tools (status, start, set_background, set_overlay, add_layer, update_layer, snapshot, save_scene, guide, …). If those tools are missing, ask the user to turn on \"Allow agents\" in the Page2Cam tray menu and restart this app.\n\n{}\n\n## Reference files\n\n- `reference/guide.md`: the index (playbooks, templates, how-tos)\n- `reference/catalogue.md`: every built-in template with a line each\n- `reference/playbooks/<id>.md`: one per user group\n- `reference/templates/<id>.md`: one template's parameters and example calls\n- `reference/howto/<id>.md`: templates, scenes, layout, privacy, writing-templates\n\nThe same texts come from the `guide` tool; prefer it when the server is newer than these files.\n",
+        "---\nname: page2cam\ndescription: {SKILL_DESCRIPTION}\n---\n\n# Page2Cam\n\nControl Page2Cam through the `page2cam` MCP server's tools (status, start, set_background, set_overlay, add_layer, update_layer, snapshot, save_scene, guide, …). If those tools are missing, ask the user to turn on \"Allow agents\" in the Page2Cam tray menu and restart this app.\n\n{}\n\n## Reference files\n\n- `reference/guide.md`: the index (playbooks, templates, how-tos)\n- `reference/catalogue.md`: every built-in template with a line each\n- `reference/playbooks/<id>.md`: one per user group\n- `reference/templates/<id>.md`: one template's parameters and example calls\n- `reference/howto/<id>.md`: templates, scenes, layout, privacy, writing-templates, performance\n\nThe same texts come from the `guide` tool; prefer it when the server is newer than these files.\n",
         instructions()
     );
     s.push('\n');

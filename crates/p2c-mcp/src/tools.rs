@@ -314,7 +314,7 @@ Give a local file path or base64 file bytes (PNG, JPEG or WebP, up to 20 MB).".i
             &json!({ "type": "object", "required": ["ids"], "additionalProperties": false,
                 "properties": { "ids": { "type": "array", "minItems": 1, "maxItems": 32,
                     "items": { "type": "string", "maxLength": 40 } } } })),
-        t("guide", "How to run a good show for the user: call it first for a use case. No topic = the index. topic = the user's role or goal (\"doctor\", \"webinar\", \"release demo\", \"teacher\": a playbook with background, webcam, graphics, steps and rules), a template id (its parameters and example calls), \"catalogue\" (every template), or a how-to (templates, scenes, layout, privacy, writing-templates). Works while stopped.".into(),
+        t("guide", "How to run a good show for the user: call it first for a use case. No topic = the index. topic = the user's role or goal (\"doctor\", \"webinar\", \"release demo\", \"teacher\": a playbook with background, webcam, graphics, steps and rules), a template id (its parameters and example calls), \"catalogue\" (every template), or a how-to (templates, scenes, layout, privacy, writing-templates, performance). Works while stopped.".into(),
             &json!({ "type": "object", "additionalProperties": false,
                 "properties": { "topic": { "type": "string", "maxLength": 200 } } })),
         t("list_templates", "Overlay templates (built-in and the user's own): id, name, category, one-line description. category: basics, time, cards, lists, data, cta, calm, software, mine. Add one with add_layer kind template.".into(),

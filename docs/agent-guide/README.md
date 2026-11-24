@@ -18,6 +18,7 @@ What AI agents read about Page2Cam: the same texts reach them through the MCP `g
 ## How-tos
 
 - [Layout: where things go on the picture](howto/layout.md)
+- [Performance: fit Page2Cam to this PC](howto/performance.md)
 - [Privacy and compliance rules](howto/privacy.md)
 - [Saved looks (scenes)](howto/scenes.md)
 - [Using templates (built-in graphics with live values)](howto/templates.md)

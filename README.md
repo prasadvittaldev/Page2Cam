@@ -93,9 +93,9 @@ Add **`-AllowAgents`** at the end (inside the last bracket) to also let AI agent
 
 **Or just ask your agent.** In Claude Code, Codex, or any agent that can run commands on your PC, type:
 
-> Install Page2Cam on this Windows PC with agent control on: run
-> `powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/prasadvittaldev/Page2Cam/main/scripts/install-windows.ps1))) -AllowAgents"`
-> then tell me to restart my agent apps.
+> Install Page2Cam for me and tune it for this PC: follow https://raw.githubusercontent.com/prasadvittaldev/Page2Cam/main/AGENT-INSTALL.md
+
+The agent checks your PC (Windows version, processor, memory, graphics, webcam), picks settings that fit it (picture size, frame rate, cut-out quality), installs Page2Cam with agent control on, and tells you to restart your agent app. After the restart it can start Page2Cam, measure how smoothly it runs and fine-tune it. The steps it follows are in [AGENT-INSTALL.md](AGENT-INSTALL.md).
 
 Accept the Windows permission prompt when it appears. After restarting Claude Desktop (or your other agent app), Page2Cam shows up as a tool.
 

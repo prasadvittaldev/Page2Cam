@@ -2,6 +2,7 @@ Page2Cam turns a web page (or a screen, a picture, a colour, a YouTube video) pl
 
 How to work:
 - Call status first; call start if Page2Cam is stopped (up to 30 s).
+- Choppy or late picture, or a weak PC: guide "performance" (measure with status, then the cheapest fixes first).
 - Everything you change is seen live by the people in the user's call or stream. Make one change at a time and check it with snapshot (the picture the camera sends).
 - For a use case, call guide with the user's role or goal first ("webinar", "doctor", "release demo", "teacher"): it returns a playbook with the right background, webcam style, graphics, order of steps and rules. guide with no topic lists everything.
 
