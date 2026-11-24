@@ -16,6 +16,8 @@ pub enum MenuId {
     Quit = 7,
     /// "Allow agents" (checkbox).
     Agents = 8,
+    /// "Check for updates" (when no update is known yet).
+    CheckUpdates = 9,
 }
 
 impl MenuId {
@@ -30,6 +32,7 @@ impl MenuId {
             Autostart,
             Quit,
             Agents,
+            CheckUpdates,
         ]
         .into_iter()
         .find(|m| *m as u32 == v)
@@ -65,13 +68,40 @@ pub struct UpdateOffer {
     pub can_install: bool,
 }
 
+/// The menu's version line and update item: the running version, the
+/// newer release on offer (if any), and whether a check is running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateMenu {
+    pub current: String,
+    pub offer: Option<UpdateOffer>,
+    pub checking: bool,
+}
+
+impl UpdateMenu {
+    /// No update known, no check running.
+    pub fn idle(current: &str) -> UpdateMenu {
+        UpdateMenu {
+            current: current.into(),
+            offer: None,
+            checking: false,
+        }
+    }
+
+    pub fn offering(current: &str, offer: &UpdateOffer) -> UpdateMenu {
+        UpdateMenu {
+            offer: Some(offer.clone()),
+            ..UpdateMenu::idle(current)
+        }
+    }
+}
+
 /// The menu for `state`. `status` is the first, informational line (the
 /// tooltip text). `agents`: "Allow agents" checked or not (`None`: the agent
 /// endpoint isn't available, so no item).
 pub fn entries(
     state: &TrayState,
     status: &str,
-    update: Option<&UpdateOffer>,
+    update: &UpdateMenu,
     autostart: bool,
     agents: Option<bool>,
 ) -> Vec<Entry> {
@@ -79,6 +109,12 @@ pub fn entries(
         Entry::Item {
             id: None,
             label: status.into(),
+            enabled: false,
+            checked: false,
+        },
+        Entry::Item {
+            id: None,
+            label: format!("Version {}", update.current),
             enabled: false,
             checked: false,
         },
@@ -96,13 +132,17 @@ pub fn entries(
     ));
     v.push(item(MenuId::ForceRestart, "Force restart", true));
     v.push(Entry::Separator);
-    if let Some(u) = update {
-        let label = if u.can_install {
-            format!("Install update {}", u.version)
-        } else {
-            format!("Download update {}…", u.version)
-        };
-        v.push(item(MenuId::Update, &label, true));
+    match (&update.offer, update.checking) {
+        (Some(u), _) => {
+            let label = if u.can_install {
+                format!("Update now to {}", u.version)
+            } else {
+                format!("Download update {}…", u.version)
+            };
+            v.push(item(MenuId::Update, &label, true));
+        }
+        (None, true) => v.push(item(MenuId::CheckUpdates, "Checking for updates…", false)),
+        (None, false) => v.push(item(MenuId::CheckUpdates, "Check for updates", true)),
     }
     v.push(Entry::Item {
         id: Some(MenuId::Autostart),
@@ -159,18 +199,34 @@ mod tests {
     #[test]
     fn menu_follows_state() {
         use MenuId::*;
-        let stopped = entries(&TrayState::Stopped, "Page2Cam — stopped", None, false, None);
+        let stopped = entries(
+            &TrayState::Stopped,
+            "Page2Cam — stopped",
+            &UpdateMenu::idle("0.6.0"),
+            false,
+            None,
+        );
         assert_eq!(
             ids(&stopped),
             vec![
                 (Start, true),
                 (OpenPage, false),
                 (ForceRestart, true),
+                (CheckUpdates, true),
                 (Autostart, true),
                 (Quit, true)
             ]
         );
-        let running = entries(&TrayState::Running, "x", None, true, None);
+        assert!(stopped
+            .iter()
+            .any(|x| matches!(x, Entry::Item { id: None, label, .. } if label == "Version 0.6.0")));
+        let running = entries(
+            &TrayState::Running,
+            "x",
+            &UpdateMenu::idle("0.6.0"),
+            true,
+            None,
+        );
         assert!(ids(&running).contains(&(Stop, true)));
         assert!(ids(&running).contains(&(OpenPage, true)));
         assert!(running.iter().any(|e| matches!(
@@ -186,12 +242,18 @@ mod tests {
                 since: Instant::now(),
             },
             "x",
-            None,
+            &UpdateMenu::idle("0.6.0"),
             false,
             None,
         );
         assert!(ids(&stopping).contains(&(Stop, false)));
-        let err = entries(&TrayState::Error("boom".into()), "x", None, false, None);
+        let err = entries(
+            &TrayState::Error("boom".into()),
+            "x",
+            &UpdateMenu::idle("0.6.0"),
+            false,
+            None,
+        );
         assert!(ids(&err).contains(&(Start, true)));
     }
 
@@ -209,15 +271,33 @@ mod tests {
             })
         };
         assert_eq!(
-            checked(&entries(&TrayState::Stopped, "x", None, false, Some(true))),
+            checked(&entries(
+                &TrayState::Stopped,
+                "x",
+                &UpdateMenu::idle("0.6.0"),
+                false,
+                Some(true)
+            )),
             Some((true, true))
         );
         assert_eq!(
-            checked(&entries(&TrayState::Running, "x", None, false, Some(false))),
+            checked(&entries(
+                &TrayState::Running,
+                "x",
+                &UpdateMenu::idle("0.6.0"),
+                false,
+                Some(false)
+            )),
             Some((false, true))
         );
         assert_eq!(
-            checked(&entries(&TrayState::Running, "x", None, false, None)),
+            checked(&entries(
+                &TrayState::Running,
+                "x",
+                &UpdateMenu::idle("0.6.0"),
+                false,
+                None
+            )),
             None
         );
         assert_eq!(MenuId::from_u32(8), Some(MenuId::Agents));
@@ -229,23 +309,79 @@ mod tests {
             version: "0.4.0".into(),
             can_install: true,
         };
-        let e = entries(&TrayState::Stopped, "x", Some(&offer), false, None);
+        let e = entries(
+            &TrayState::Stopped,
+            "x",
+            &UpdateMenu::offering("0.3.0", &offer),
+            false,
+            None,
+        );
         assert!(e
             .iter()
-            .any(|x| matches!(x, Entry::Item { label, .. } if label == "Install update 0.4.0")));
+            .any(|x| matches!(x, Entry::Item { label, .. } if label == "Update now to 0.4.0")));
         let portable = UpdateOffer {
             can_install: false,
             ..offer
         };
-        let e = entries(&TrayState::Stopped, "x", Some(&portable), false, None);
+        let e = entries(
+            &TrayState::Stopped,
+            "x",
+            &UpdateMenu::offering("0.3.0", &portable),
+            false,
+            None,
+        );
         assert!(e.iter().any(
             |x| matches!(x, Entry::Item { label, .. } if label.starts_with("Download update 0.4.0"))
         ));
-        assert!(!ids(&entries(&TrayState::Stopped, "x", None, false, None))
-            .iter()
-            .any(|(id, _)| *id == MenuId::Update));
+        assert!(!ids(&entries(
+            &TrayState::Stopped,
+            "x",
+            &UpdateMenu::idle("0.6.0"),
+            false,
+            None
+        ))
+        .iter()
+        .any(|(id, _)| *id == MenuId::Update));
         assert_eq!(MenuId::from_u32(5), Some(MenuId::Update));
         assert_eq!(MenuId::from_u32(99), None);
+    }
+
+    #[test]
+    fn check_for_updates_item_when_nothing_is_offered() {
+        let find = |m: &UpdateMenu| {
+            entries(&TrayState::Stopped, "x", m, false, None)
+                .into_iter()
+                .find_map(|x| match x {
+                    Entry::Item {
+                        id: Some(id @ (MenuId::CheckUpdates | MenuId::Update)),
+                        label,
+                        enabled,
+                        ..
+                    } => Some((id, label, enabled)),
+                    _ => None,
+                })
+        };
+        assert_eq!(
+            find(&UpdateMenu::idle("0.6.0")),
+            Some((MenuId::CheckUpdates, "Check for updates".into(), true))
+        );
+        let checking = UpdateMenu {
+            checking: true,
+            ..UpdateMenu::idle("0.6.0")
+        };
+        assert_eq!(
+            find(&checking),
+            Some((MenuId::CheckUpdates, "Checking for updates…".into(), false))
+        );
+        let offer = UpdateOffer {
+            version: "0.7.0".into(),
+            can_install: true,
+        };
+        assert_eq!(
+            find(&UpdateMenu::offering("0.6.0", &offer)),
+            Some((MenuId::Update, "Update now to 0.7.0".into(), true))
+        );
+        assert_eq!(MenuId::from_u32(9), Some(MenuId::CheckUpdates));
     }
 
     #[test]

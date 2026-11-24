@@ -65,7 +65,8 @@ You control everything from a simple control page on your own computer. You can 
    Click its icon and choose **Start**, then **Open control page**. You can also start it from the **Start menu** or the **desktop shortcut**.
 
 **Updates are automatic.**
-When a new version is out, Page2Cam offers it (in the tray and on the control page). Click **Install update**: Page2Cam downloads it, checks that it really comes from Page2Cam, installs it and starts again. Windows asks for permission once.
+When a new version is out, Page2Cam offers it (in the tray and on the control page). Click **Update now** in the tray menu (or **Install update** on the control page): Page2Cam downloads it, checks that it really comes from Page2Cam, installs it and starts again. Windows asks for permission once.
+The tray menu also shows the version you are running, and **Check for updates** asks right away instead of waiting for the next automatic check.
 
 ### The one-line way (PowerShell, or ask an AI agent)
 

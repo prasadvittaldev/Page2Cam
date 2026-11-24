@@ -40,16 +40,23 @@ impl Updater {
 
     /// Ask GitHub once. Failures are logged, not shown (no nagging offline).
     pub fn check_once(&self) {
-        let found = match (self.fetch)() {
-            Ok(r) => r.filter(|r| p2c_update::is_newer(&self.current, &r.version)),
-            Err(e) => {
-                tracing::debug!("update check failed: {e:#}");
-                return;
-            }
-        };
+        if let Err(e) = self.check_now() {
+            tracing::debug!("update check failed: {e:#}");
+        }
+    }
+
+    /// The running version.
+    pub fn current(&self) -> &str {
+        &self.current
+    }
+
+    /// Ask GitHub now ("Check for updates" in the tray menu). Returns the
+    /// newer version on offer, if any; errors are the caller's to show.
+    pub fn check_now(&self) -> anyhow::Result<Option<String>> {
+        let found = (self.fetch)()?.filter(|r| p2c_update::is_newer(&self.current, &r.version));
         let mut info = self.info.lock();
         if info.state == "installing" {
-            return;
+            return Ok(Some(info.version.clone()));
         }
         *info = match &found {
             Some(r) => {
@@ -65,7 +72,9 @@ impl Updater {
             }
             None => UpdateInfo::default(),
         };
+        let version = found.as_ref().map(|r| r.version.clone());
         *self.release.lock() = found;
+        Ok(version)
     }
 
     /// Check now and then every few hours, on a background thread.
