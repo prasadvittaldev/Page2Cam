@@ -10,6 +10,12 @@
 **Page2Cam is a project by Prasad Vittaldev.**
 Connect with him on LinkedIn: <https://www.linkedin.com/in/prasadvittaldev/>
 
+> **Install with your AI agent.** In Claude Code, Codex, Cursor or any agent that can run commands on your Windows 11 PC, say:
+>
+> *Install Page2Cam for me and tune it for this PC: follow https://raw.githubusercontent.com/prasadvittaldev/Page2Cam/main/AGENT-INSTALL.md*
+>
+> The agent checks your PC, picks settings that fit it, installs Page2Cam with agent control on, and fine-tunes it after you restart the agent app. Prefer to do it yourself? See [How to install](#how-to-install-step-by-step).
+
 ---
 
 ## Three pillars of Page2Cam
