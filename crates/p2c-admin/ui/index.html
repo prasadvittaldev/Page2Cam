@@ -1100,7 +1100,6 @@
 
   // ---------- stream ----------
   const SITES = ["youtube", "twitch"];
-  let tickDirty = false; // ticks changed here before Go live: keep them over the saved ones
   // What a site's controls ask for. A typed key is sent once, then the box is cleared.
   function siteBody(site) {
     const o = { on: $("site-" + site + "-on").checked };
@@ -1114,10 +1113,13 @@
     $("site-" + site + "-key").value = "";
     $("site-" + site + "-remember").checked = false;
   }
+  const unsaved = {}; // sites whose tick the server refused while stopped: keep the box, Go live carries it
+  let streamErrUntil = 0; // keep a request error visible for a few seconds
   async function streamError(r) {
     let m = "";
     try { m = (await r.json()).error || ""; } catch { /* not JSON */ }
     setState("streamState", "error: " + (m || "could not change the stream"));
+    streamErrUntil = Date.now() + 6000;
   }
   const isLive = () => !!state && /^(live|connecting)/.test(state.status.stream);
   $("goLive").onclick = async () => {
@@ -1127,14 +1129,24 @@
     SITES.forEach((s) => { sites[s] = siteBody(s); });
     const r = await api("/api/stream/start", { sites });
     $("goLive").disabled = false;
-    if (r.ok) { SITES.forEach(clearKey); tickDirty = false; } else await streamError(r);
+    if (r.ok) SITES.forEach((s) => { clearKey(s); delete unsaved[s]; }); else await streamError(r);
     refresh();
   };
   SITES.forEach((s) => {
     $("site-" + s + "-on").onchange = async () => {
-      if (!isLive()) { tickDirty = true; return; } // before Go live the ticks are sent with it
-      const r = await api("/api/stream/sites", { sites: { [s]: siteBody(s) } });
-      if (r.ok) clearKey(s); else await streamError(r);
+      // Saved at once, stopped or live. While stopped a refusal (e.g. no key typed yet)
+      // only shows the error: the box stays as set and Go live carries it.
+      const live = isLive();
+      const r = await api("/api/stream/sites", { [s]: siteBody(s) });
+      if (r.ok) { clearKey(s); delete unsaved[s]; }
+      else {
+        await streamError(r);
+        if (!live) unsaved[s] = true;
+        else {
+          const d = ((state && state.status.streams) || []).find((x) => x.site === s);
+          $("site-" + s + "-on").checked = !!(d && d.ticked);
+        }
+      }
       refresh();
     };
   });
@@ -1143,11 +1155,11 @@
     SITES.forEach((site) => {
       const d = list.find((x) => x.site === site) || { state: "idle", ticked: false, has_saved_key: false, url: "" };
       const on = $("site-" + site + "-on"), url = $("site-" + site + "-url");
-      if (firstTime || (!tickDirty && document.activeElement !== on)) on.checked = !!d.ticked;
+      if (firstTime || (!unsaved[site] && document.activeElement !== on)) on.checked = !!d.ticked;
       if (d.url && (firstTime || document.activeElement !== url)) url.value = d.url;
       $("site-" + site + "-key").placeholder = d.has_saved_key ? "●●●●●● (saved)" : "Stream key";
       const txt = d.state === "idle" ? "" : d.state === "live" ? "Live" : d.state === "connecting" ? "Connecting…" : d.state;
-      setState("site-" + site + "-state", d.ticked || txt ? txt : "");
+      setState("site-" + site + "-state", txt);
     });
     setState("stream-note", s.stream_note || "");
   }
@@ -1262,7 +1274,7 @@
       const live = s.stream === "live", connecting = s.stream === "connecting";
       $("goLive").textContent = live ? "End stream" : connecting ? "Cancel" : "Go live";
       $("goLive").classList.toggle("live", live);
-      setState("streamState", live ? "Live" : connecting ? "Connecting…" : s.stream === "idle" ? "" : s.stream);
+      if (Date.now() > streamErrUntil) setState("streamState", live ? "Live" : connecting ? "Connecting…" : s.stream === "idle" ? "" : s.stream);
       setState("webcamState", s.webcam === "none" ? "No webcam found. Plug one in and restart Page2Cam." : /^error/.test(s.webcam) ? s.webcam : /^reconnecting/.test(s.webcam) ? "Webcam " + s.webcam : "");
       document.querySelectorAll("[data-engine]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.engine === s.cutout_engine)));
       setState("cutoutState", s.cutout);
