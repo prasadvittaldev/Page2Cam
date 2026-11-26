@@ -513,10 +513,19 @@ fn overlay_out(pip: &Value) -> Value {
     v
 }
 
+/// The partial `set_background` names the window background (`full: window`
+/// or a `full_window` value).
+fn touches_window(p: &Value) -> bool {
+    p["full"] == "window" || p.get("full_window").is_some()
+}
+
 /// The title part of the engine's window label "<title> (<exe>)": the
 /// trailing " (xxx.exe)" is dropped, the rest (or the whole text when it has
 /// no such suffix) is kept, one line and short.
 fn window_title(label: &str) -> String {
+    if label.trim().is_empty() {
+        return "(untitled)".into();
+    }
     let t = match label.rfind(" (") {
         Some(i) if label.ends_with(')') && label[i..].to_lowercase().ends_with(".exe)") => {
             &label[..i]
@@ -581,14 +590,20 @@ impl Backend for TrayBackend {
             // A shared window: said always, with the title the engine resolved.
             let short: String = agent.chars().take(40).collect();
             match (&req, &r) {
-                (BackendCall::SetBackground(p), Ok(BackendReply::Json(v)))
-                    if p["full"] == "window" =>
-                {
-                    let label = v["full_window"].as_str().or(p["full_window"].as_str());
-                    self.ctl.balloon(format!(
-                        "Agent \u{201c}{short}\u{201d} is sharing a window: {}",
-                        window_title(label.unwrap_or(""))
-                    ));
+                // Decided from the engine's merged answer, so a partial that
+                // only names `window` counts too (balloon_for stays quiet for
+                // those; the generic balloon is sent here when it isn't window).
+                (BackendCall::SetBackground(p), Ok(BackendReply::Json(v))) if touches_window(p) => {
+                    if v["full"] == "window" {
+                        self.ctl.balloon(format!(
+                            "Agent \u{201c}{short}\u{201d} is sharing a window: {}",
+                            window_title(v["full_window"].as_str().unwrap_or(""))
+                        ));
+                    } else if running {
+                        self.ctl.balloon(format!(
+                            "Agent \u{201c}{short}\u{201d} changed your background"
+                        ));
+                    }
                 }
                 (BackendCall::LoadScene { .. }, Ok(BackendReply::Json(v)))
                     if v["background_full"] == "window" =>
@@ -1006,7 +1021,75 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn window_only_partial_and_scene_load_are_announced() {
+        let bg_ok = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let bg = bg_ok.clone();
+        let (port, _log) = fake_engine(move |m, p, body| match (m, p) {
+            ("GET", "/api/state") => (200, br#"{"status":{}}"#.to_vec()),
+            ("GET", "/api/background") => {
+                if bg.load(std::sync::atomic::Ordering::SeqCst) {
+                    (
+                        200,
+                        br#"{"full":"window","full_window":"Notes (notepad.exe)"}"#.to_vec(),
+                    )
+                } else {
+                    (500, br#"{"error":"boom"}"#.to_vec())
+                }
+            }
+            ("POST", "/api/background") => {
+                if String::from_utf8_lossy(body).contains("blank") {
+                    (200, br#"{"full":"window","full_window":""}"#.to_vec())
+                } else {
+                    (
+                        200,
+                        br#"{"full":"window","full_window":"Other (chrome.exe)"}"#.to_vec(),
+                    )
+                }
+            }
+            ("POST", "/api/scenes/s/load") => (
+                200,
+                br#"{"added":[],"skipped":[],"background_full":"window"}"#.to_vec(),
+            ),
+            _ => (200, b"{}".to_vec()),
+        });
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "running".into();
+        *tray.engine.lock() = Some((port, "tok".into()));
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(tray.clone(), d.path());
+        // Only `window` given: still the sharing balloon, not the generic one.
+        b.call(
+            "Claude",
+            BackendCall::SetBackground(json!({ "full_window": "Other" })),
+        )
+        .unwrap();
+        // An empty resolved title gets a placeholder, never the agent's text.
+        b.call(
+            "Claude",
+            BackendCall::SetBackground(json!({ "full": "window", "full_window": "blank-7" })),
+        )
+        .unwrap();
+        let scene = || BackendCall::LoadScene {
+            id: "s".into(),
+            replace: true,
+        };
+        b.call("Claude", scene()).unwrap();
+        bg_ok.store(false, std::sync::atomic::Ordering::SeqCst);
+        b.call("Claude", scene()).unwrap();
+        assert_eq!(
+            tray.balloons.lock().as_slice(),
+            [
+                "Agent “Claude” is sharing a window: Other",
+                "Agent “Claude” is sharing a window: (untitled)",
+                "Agent “Claude” is sharing a window: Notes",
+                "Agent “Claude” is sharing a window: (untitled)",
+            ]
+        );
+    }
+
+    #[test]
     fn window_title_drops_the_exe_suffix() {
+        assert_eq!(window_title(""), "(untitled)");
         assert_eq!(window_title("Twitch - Home (chrome.exe)"), "Twitch - Home");
         assert_eq!(window_title("Notes (draft) (Notepad.EXE)"), "Notes (draft)");
         assert_eq!(window_title("Report (final)"), "Report (final)");

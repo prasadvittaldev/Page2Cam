@@ -727,7 +727,9 @@ pub fn balloon_for(agent: &str, call: &BackendCall, running: bool) -> Option<Str
         }
         // A shared window is announced by the backend once the engine has
         // resolved its title.
-        C::SetBackground(v) if v["full"] == "window" => return None,
+        C::SetBackground(v) if v["full"] == "window" || v.get("full_window").is_some() => {
+            return None
+        }
         C::OpenUrl(_) | C::ShowPage { .. } | C::Navigate(_) if running => {
             format!("{agent} changed the page")
         }
