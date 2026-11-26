@@ -17,7 +17,7 @@ use tokio::sync::watch;
 
 use crate::api::{
     AudioSettings, BackgroundDto, Controls, CropDto, GpuInfo, ImageRow, InputEvent, KeyAction,
-    MouseBtn, NavAction, PipDto, ScreenDto, SitesRequest, StreamRequest,
+    MouseBtn, NavAction, PipDto, ScreenDto, SitesRequest, StreamRequest, WindowDto,
 };
 use crate::input::{map_preview, normalize_url};
 use crate::preview::spawn_encoder;
@@ -126,6 +126,7 @@ pub(crate) fn router(st: State) -> Router {
         .route("/api/update/install", post(update_install))
         .route("/api/gpus", get(gpus))
         .route("/api/screens", get(screens))
+        .route("/api/windows", get(windows))
         .route("/api/gpu", post(gpu))
         .route("/api/restart", post(restart))
         .route("/api/quit", post(quit))
@@ -396,6 +397,17 @@ async fn cutout(AxState(st): AxState<State>, Json(b): Json<CutoutBody>) -> Respo
 
 async fn gpus(AxState(st): AxState<State>) -> Json<Vec<GpuInfo>> {
     Json(st.controls.gpus())
+}
+
+/// The windows for the window background; 501 `{error}` where window
+/// capture is not available.
+async fn windows(AxState(st): AxState<State>) -> Response {
+    let c = st.controls.clone();
+    match tokio::task::spawn_blocking(move || c.windows()).await {
+        Ok(Ok(v)) => Json::<Vec<WindowDto>>(v).into_response(),
+        Ok(Err(e)) => json_error(StatusCode::NOT_IMPLEMENTED, &e),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 /// The monitors for the screen background; 501 `{error}` where screen
@@ -1312,6 +1324,8 @@ mod tests {
             pub background: Mutex<Option<BackgroundDto>>,
             /// `None`: screen capture unavailable.
             pub screens: Mutex<Option<Vec<ScreenDto>>>,
+            /// `None`: window capture unavailable.
+            pub windows: Mutex<Option<Vec<WindowDto>>>,
             /// (row, byte count) of every image upload that reached the app.
             pub uploads: Mutex<Vec<(ImageRow, usize)>>,
             pub page: Mutex<Option<String>>,
@@ -1561,6 +1575,13 @@ mod tests {
                     .then(|| self.full_image.lock().unwrap().clone())
                     .flatten()
                     .map(|b| (Arc::new(b), "image/jpeg"))
+            }
+            fn windows(&self) -> Result<Vec<WindowDto>, String> {
+                self.windows
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| "window capture is Windows-only for now".to_string())
             }
             fn screens(&self) -> Result<Vec<ScreenDto>, String> {
                 self.screens
@@ -1971,6 +1992,51 @@ mod tests {
         assert_eq!(r.status(), StatusCode::OK);
         let v: Vec<ScreenDto> = serde_json::from_str(&body_string(r).await).unwrap();
         assert_eq!(v, vec![one]);
+    }
+
+    #[tokio::test]
+    async fn windows_route_lists_or_says_why_not() {
+        let fake = Arc::new(Fake::default());
+        let get = |f: Arc<Fake>| {
+            app(f).oneshot(req(
+                "GET",
+                "/api/windows",
+                "127.0.0.1:8765",
+                Some(TOKEN),
+                None,
+            ))
+        };
+        let r = get(fake.clone()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_IMPLEMENTED);
+        let v: serde_json::Value = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v["error"], "window capture is Windows-only for now");
+        let one = WindowDto {
+            id: 1234,
+            title: "A - Twitch - Microsoft Edge".into(),
+            exe: "msedge.exe".into(),
+            app: "Microsoft Edge".into(),
+            width: 1280,
+            height: 720,
+            minimized: false,
+            browser: true,
+        };
+        *fake.windows.lock().unwrap() = Some(vec![one.clone()]);
+        let r = get(fake.clone()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let v: Vec<WindowDto> = serde_json::from_str(&body_string(r).await).unwrap();
+        assert_eq!(v, vec![one]);
+        // Token and Host checked like every route.
+        let r = app(fake)
+            .oneshot(req(
+                "GET",
+                "/api/windows",
+                "evil.test:8765",
+                Some(TOKEN),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

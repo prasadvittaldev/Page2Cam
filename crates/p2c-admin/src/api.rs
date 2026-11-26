@@ -368,7 +368,7 @@ pub struct UpdateInfo {
 /// Background choices as JSON (`GET`/`POST /api/background`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundDto {
-    /// "page" | "image" | "colour" | "youtube" | "screen" | "blurred-room"
+    /// "page" | "image" | "colour" | "youtube" | "screen" | "window" | "blurred-room"
     pub full: String,
     /// `#rrggbb` for "colour" (the last one chosen when reading).
     #[serde(default)]
@@ -380,6 +380,11 @@ pub struct BackgroundDto {
     /// index, or empty/"primary" (the last one chosen when reading).
     #[serde(default)]
     pub full_screen: Option<String>,
+    /// The window for "window": an id from `GET /api/windows` or title text
+    /// (exact, else a unique case-insensitive part). Reading:
+    /// `"<title> (<exe>)"` of the saved window (sending that back keeps it).
+    #[serde(default)]
+    pub full_window: Option<String>,
     /// "room" | "blur" | "image" | "colour"
     pub in_box: String,
     /// `#rrggbb` for an in-box "colour".
@@ -407,6 +412,23 @@ pub struct ScreenDto {
     pub width: u32,
     pub height: u32,
     pub primary: bool,
+}
+
+/// One application window for the window background (`GET /api/windows`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowDto {
+    /// The window handle (valid while the window lives).
+    pub id: u64,
+    pub title: String,
+    /// Executable file name (`chrome.exe`; empty when it can't be read).
+    pub exe: String,
+    /// The program's name (`Google Chrome`).
+    pub app: String,
+    pub width: u32,
+    pub height: u32,
+    pub minimized: bool,
+    /// A browser: its sound is everything playing in it.
+    pub browser: bool,
 }
 
 /// Which background picture (`?row=full|box`).
@@ -486,6 +508,11 @@ pub trait Controls: Overlays + Send + Sync + 'static {
     /// The monitors the screen background can show; an error where screen
     /// capture isn't available ("screen capture is Windows-only for now").
     fn screens(&self) -> Result<Vec<ScreenDto>, String>;
+    /// The windows the window background can show; an error where window
+    /// capture isn't available. May enumerate processes: call it off the runtime.
+    fn windows(&self) -> Result<Vec<WindowDto>, String> {
+        Err("window capture is Windows-only for now".into())
+    }
 }
 
 /// Overlay layers (titles, tickers, HTML, pictures, videos, YouTube) drawn

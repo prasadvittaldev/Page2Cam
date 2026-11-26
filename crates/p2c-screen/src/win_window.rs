@@ -224,3 +224,17 @@ pub fn status(id: u64) -> WindowStatus {
         }
     }
 }
+
+/// The window's title as listed (trimmed); `None` once it is gone.
+pub fn title(id: u64) -> Option<String> {
+    let h = hwnd(id);
+    // SAFETY: plain queries; a stale handle just reports "not a window".
+    unsafe {
+        if !IsWindow(Some(h)).as_bool() {
+            return None;
+        }
+        let mut buf = [0u16; 512];
+        let n = GetWindowTextW(h, &mut buf);
+        Some(wide_to_string(&buf[..n.max(0) as usize]).trim().to_string())
+    }
+}

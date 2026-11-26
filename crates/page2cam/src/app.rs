@@ -342,6 +342,8 @@ pub struct App {
     pub page_fps: Mutex<crate::page_fps::PageQuality>,
     /// The screen background's capture.
     pub screen: crate::screen::ScreenShare,
+    /// The window background's capture (picture and sound).
+    pub window: crate::window::WindowShare,
     /// Chromium's paints are dropped while set (the screen fills the page);
     /// shared with the browser (`BrowserConfig.paused`).
     pub page_paused: Arc<std::sync::atomic::AtomicBool>,
@@ -753,6 +755,13 @@ const NOTE_TO_CUTOUT: &str =
 /// Note shown when choosing Box put the full frame back to the page.
 /// `last_page_url` is written at most this often while the page moves.
 const PAGE_URL_SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+/// Spacing of saves of the window background's title as it changes.
+const WINDOW_SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How a saved window reads back in the admin page: `"<title> (<exe>)"`.
+fn window_label(m: &p2c_screen::WindowMatch) -> String {
+    format!("{} ({})", m.title, m.exe)
+}
 
 const NOTE_TO_PAGE: &str = "Full-frame background set back to Page: the Box style shows the page";
 
@@ -870,19 +879,37 @@ impl App {
         self.sync_screen();
     }
 
-    /// Capture the chosen monitor while the screen background shows, with
-    /// Chromium's paints paused (paused before the first captured frame,
-    /// resumed after the capture stopped, then repainted).
+    /// Capture the chosen monitor or window while the screen or window
+    /// background shows, with Chromium's paints paused (paused before the
+    /// first captured frame, resumed after the capture stopped, then
+    /// repainted). The old capture stops before a new one starts. A window
+    /// start may block for seconds (accepted on this explicit path; the
+    /// start-up one is deferred to the window thread).
     fn sync_screen(&self) {
         use std::sync::atomic::Ordering::SeqCst;
-        let want = self.bg.lock().full.screen().map(str::to_string);
-        match want {
-            Some(id) => {
+        let (screen, window) = {
+            let s = self.bg.lock();
+            (
+                s.full.screen().map(str::to_string),
+                s.full.window().cloned(),
+            )
+        };
+        if screen.is_none() {
+            self.screen.sync(None);
+        }
+        if window.is_none() {
+            self.window.sync(None);
+        }
+        match (screen, window) {
+            (Some(id), _) => {
                 self.page_paused.store(true, SeqCst);
                 self.screen.sync(Some(&id));
             }
-            None => {
-                self.screen.sync(None);
+            (None, Some(m)) => {
+                self.page_paused.store(true, SeqCst);
+                self.window.sync(Some(&m));
+            }
+            (None, None) => {
                 if self.page_paused.swap(false, SeqCst) {
                     self.with_browser(|b| b.repaint());
                 }
@@ -927,6 +954,10 @@ impl App {
         if let Some(u) = &url {
             self.load_url(u);
         }
+        // A saved window is started by the window thread's next tick (a
+        // start can block for seconds; start-up shouldn't wait for it).
+        let window = self.bg.lock().full.window().cloned();
+        self.window.defer(window.as_ref());
         self.sync_backdrop();
         url
     }
@@ -964,6 +995,10 @@ impl App {
                 FullBg::Colour(col) => s.full_colour = col.clone(),
                 FullBg::YouTube(id) => s.youtube = id.clone(),
                 FullBg::Screen(id) => s.screen = id.clone(),
+                FullBg::Window(m) => {
+                    s.window = m.clone();
+                    s.window_unsaved = false;
+                }
                 _ => {}
             }
             if let crate::background::BoxBg::Colour(col) = &s.in_box {
@@ -979,6 +1014,10 @@ impl App {
                 FullBg::Colour(col) => saves.push(("background_colour", col.as_str().into())),
                 FullBg::YouTube(id) => saves.push(("background_youtube", id.as_str().into())),
                 FullBg::Screen(id) => saves.push(("background_screen", id.as_str().into())),
+                FullBg::Window(m) => {
+                    saves.push(("background_window_exe", m.exe.as_str().into()));
+                    saves.push(("background_window_title", m.title.as_str().into()));
+                }
                 _ => {}
             }
             if let crate::background::BoxBg::Colour(col) = &s.in_box {
@@ -1042,12 +1081,70 @@ impl App {
         if let Some(n) = self.bg.lock().recent_note() {
             return n.to_string();
         }
+        if let Some(n) = self.window.note() {
+            return n;
+        }
         self.ticker_stats.compose_note().as_str().to_string()
+    }
+
+    /// The window for `full: "window"`: `full_window` as an id or title text
+    /// (its read-back form `"<title> (<exe>)"` keeps the saved window), else
+    /// the saved window. Lists windows without holding the background lock.
+    fn pick_window(&self, d: &BackgroundDto) -> anyhow::Result<p2c_screen::WindowMatch> {
+        let saved = self.bg.lock().window.clone();
+        let text = d.full_window.as_deref().map(str::trim).unwrap_or("");
+        if text.is_empty() || (!saved.exe.is_empty() && text == window_label(&saved)) {
+            anyhow::ensure!(
+                !saved.exe.is_empty(),
+                "choose a window first (GET /api/windows lists them)"
+            );
+            return Ok(saved);
+        }
+        self.window.resolve(text)
+    }
+
+    /// Run the window background's checks (every ~2 s, on the engine's
+    /// window thread): a saved window that wasn't found is looked for again,
+    /// the running one's state and title are followed. A new title is
+    /// remembered at once and written at most every 10 s.
+    pub fn tick_window(&self, now: std::time::Instant) {
+        use crate::background::FullBg;
+        let changed = self.window.tick();
+        let save = {
+            let mut s = self.bg.lock();
+            if let Some(m) = changed {
+                if let FullBg::Window(w) = &mut s.full {
+                    *w = m.clone();
+                    s.window = m;
+                    s.window_unsaved = true;
+                }
+            }
+            let due = s
+                .window_saved_at
+                .is_none_or(|t| now.saturating_duration_since(t) >= WINDOW_SAVE_EVERY);
+            (s.window_unsaved && due).then(|| {
+                s.window_unsaved = false;
+                s.window_saved_at = Some(now);
+                s.window.clone()
+            })
+        };
+        if let Some(m) = save {
+            tracing::info!("window background title changed: saved");
+            self.save_values(&[
+                ("background_window_exe", m.exe.as_str().into()),
+                ("background_window_title", m.title.as_str().into()),
+            ]);
+        }
     }
 
     /// Parse the admin page's choices (nothing is changed on an error).
     fn parse_background(&self, d: &BackgroundDto) -> anyhow::Result<BgChange> {
         use crate::background::{normalize_colour, youtube_id, BoxBg, FullBg};
+        let window = if d.full == "window" {
+            Some(self.pick_window(d)?)
+        } else {
+            None
+        };
         let s = self.bg.lock();
         let colour = |given: &Option<String>, last: &str| {
             normalize_colour(given.as_deref().unwrap_or(last)).map_err(anyhow::Error::msg)
@@ -1067,9 +1164,10 @@ impl App {
                 self.screen
                     .resolve(d.full_screen.as_deref().unwrap_or(&s.screen))?,
             ),
+            "window" => FullBg::Window(window.expect("picked above")),
             "blurred-room" => FullBg::BlurredRoom,
             other => anyhow::bail!(
-                "unknown full-frame background {other:?} (page, image, colour, youtube, screen or blurred-room)"
+                "unknown full-frame background {other:?} (page, image, colour, youtube, screen, window or blurred-room)"
             ),
         };
         let in_box = match d.in_box.as_str() {
@@ -1547,6 +1645,7 @@ impl Controls for App {
             full_colour: Some(s.full_colour.clone()),
             full_youtube: (!s.youtube.is_empty()).then(|| s.youtube.clone()),
             full_screen: Some(s.screen.clone()),
+            full_window: (!s.window.exe.is_empty()).then(|| window_label(&s.window)),
             in_box: s.in_box.as_str().into(),
             box_colour: Some(s.box_colour.clone()),
             refined_edges: s.refined,
@@ -1638,6 +1737,23 @@ impl Controls for App {
             ImageRow::Box => s.box_image.as_ref(),
         }?;
         Some((img.bytes.clone(), img.content_type))
+    }
+
+    fn windows(&self) -> Result<Vec<p2c_admin::WindowDto>, String> {
+        let list = self.window.list().map_err(|e| format!("{e:#}"))?;
+        Ok(list
+            .into_iter()
+            .map(|w| p2c_admin::WindowDto {
+                browser: p2c_screen::is_browser(&w.exe),
+                id: w.id,
+                title: w.title,
+                exe: w.exe,
+                app: w.app,
+                width: w.width,
+                height: w.height,
+                minimized: w.minimized,
+            })
+            .collect())
     }
 
     fn screens(&self) -> Result<Vec<p2c_admin::ScreenDto>, String> {
@@ -2063,6 +2179,9 @@ mod tests {
             screen: crate::screen::ScreenShare::new(Box::new(
                 crate::screen::tests::FakeScreens::default(),
             )),
+            window: crate::window::WindowShare::new(Box::new(
+                crate::window::tests::FakeWindows::default(),
+            )),
             page_paused: Arc::default(),
             output_frame: FrameSlot::new(),
             overlay: crate::overlay::OverlayLayers::new(None, 30),
@@ -2304,6 +2423,131 @@ mod tests {
         assert_eq!(app.screen.running().as_deref(), Some("DISPLAY2"));
         app.set_background(bg("page", "room")).unwrap();
         assert_eq!(fake.live.load(SeqCst), 0);
+    }
+
+    /// The window background: an exact window captured with the page paused,
+    /// the style forced to cutout-full, saved by exe and title.
+    #[test]
+    fn window_background_pauses_the_page_and_saves() {
+        use crate::window::tests::{win, FakeWindows};
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bg_app(dir.path());
+        let fake = FakeWindows::default();
+        *fake.list.lock() = vec![
+            win(1, "chrome.exe", "Gmail"),
+            win(2, "chrome.exe", "A - Twitch"),
+            win(3, "", "Elevated"),
+        ];
+        app.window = crate::window::WindowShare::new(Box::new(fake.clone()));
+        app.navigate("https://user.test/a");
+        let twitch = BackgroundDto {
+            full_window: Some("twitch".into()),
+            ..bg("window", "room")
+        };
+        app.set_background(twitch).unwrap();
+        assert_eq!(*fake.starts.lock(), vec![2]);
+        assert!(app.page_paused.load(SeqCst));
+        assert!(shown(&app).starts_with(BG_BASE), "black page under it");
+        assert_eq!(app.layout.read().style, OverlayStyle::CutoutFull);
+        let c = settings(dir.path());
+        assert_eq!(
+            (
+                c.background.as_str(),
+                c.background_window_exe.as_str(),
+                c.background_window_title.as_str(),
+                c.overlay_style.as_str()
+            ),
+            ("window", "chrome.exe", "A - Twitch", "cutout-full")
+        );
+        assert_eq!(
+            app.background().full_window.as_deref(),
+            Some("A - Twitch (chrome.exe)")
+        );
+        // Under the 10 s style note for now, then in the background note.
+        assert_eq!(
+            app.window.note().as_deref(),
+            Some("Sound: everything playing in Google Chrome")
+        );
+        app.bg.lock().note = None;
+        assert_eq!(
+            app.status().background_note,
+            "Sound: everything playing in Google Chrome"
+        );
+        // Sending the read value back (another field changed): no restart.
+        let again = BackgroundDto {
+            full_window: app.background().full_window,
+            refined_edges: true,
+            ..bg("window", "room")
+        };
+        app.set_background(again).unwrap();
+        assert_eq!(fake.starts.lock().len(), 1);
+        // Ambiguous text and unidentifiable programs change nothing.
+        let e = app
+            .set_background(BackgroundDto {
+                full_window: Some("a".into()),
+                ..bg("window", "room")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("matches several windows"), "{e}");
+        let e = app
+            .set_background(BackgroundDto {
+                full_window: Some("elevated".into()),
+                ..bg("window", "room")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("can't be identified"), "{e}");
+        assert_eq!(fake.live.load(SeqCst), 1);
+        // The title follows the window and is saved (spaced 10 s apart).
+        let t0 = std::time::Instant::now();
+        fake.run.lock().title = Some("B - Twitch".into());
+        app.tick_window(t0);
+        assert_eq!(settings(dir.path()).background_window_title, "B - Twitch");
+        assert_eq!(
+            app.background().full_window.as_deref(),
+            Some("B - Twitch (chrome.exe)")
+        );
+        fake.run.lock().title = Some("C - Twitch".into());
+        app.tick_window(t0 + std::time::Duration::from_secs(2));
+        assert_eq!(settings(dir.path()).background_window_title, "B - Twitch");
+        app.tick_window(t0 + std::time::Duration::from_secs(11));
+        assert_eq!(settings(dir.path()).background_window_title, "C - Twitch");
+        assert_eq!(fake.starts.lock().len(), 1, "followed, not restarted");
+        // Back to the page: capture stopped, paints resumed.
+        app.set_background(bg("page", "room")).unwrap();
+        assert_eq!(fake.live.load(SeqCst), 0);
+        assert!(!app.page_paused.load(SeqCst));
+        // The saved window (with its latest title) is offered again.
+        fake.list.lock()[1].title = "C - Twitch".into();
+        app.set_background(bg("window", "room")).unwrap();
+        assert_eq!(*fake.starts.lock(), vec![2, 2]);
+    }
+
+    #[test]
+    fn window_background_unavailable_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bg_app(dir.path());
+        app.window = crate::window::WindowShare::new(Box::new(crate::window::tests::FakeWindows {
+            unsupported: true,
+            ..Default::default()
+        }));
+        let e = app
+            .set_background(BackgroundDto {
+                full_window: Some("x".into()),
+                ..bg("window", "room")
+            })
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, p2c_screen::WINDOW_UNSUPPORTED);
+        let e = app
+            .set_background(bg("window", "room"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("choose a window"), "{e}");
+        assert_eq!(app.background().full, "page");
+        assert_eq!(app.windows().unwrap_err(), p2c_screen::WINDOW_UNSUPPORTED);
     }
 
     #[test]

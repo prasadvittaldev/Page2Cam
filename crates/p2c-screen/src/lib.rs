@@ -17,8 +17,8 @@ mod win_window;
 mod window;
 
 pub use window::{
-    find_exact, is_browser, list_windows, resolve_text, WindowInfo, WindowMatch, WindowStatus,
-    WINDOW_UNSUPPORTED,
+    find_exact, is_browser, list_windows, resolve_text, window_title, WindowInfo, WindowMatch,
+    WindowStatus, WINDOW_UNSUPPORTED,
 };
 
 /// The error on platforms without screen capture.

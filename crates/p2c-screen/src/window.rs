@@ -59,6 +59,19 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
     }
 }
 
+/// A window's current title (`None` once it is gone, and off Windows).
+pub fn window_title(id: u64) -> Option<String> {
+    #[cfg(windows)]
+    {
+        crate::win_window::title(id)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = id;
+        None
+    }
+}
+
 /// The window with the same exe (case-insensitive) and exactly the title.
 /// Never a near miss: another window must not end up on camera.
 pub fn find_exact<'a>(l: &'a [WindowInfo], m: &WindowMatch) -> Option<&'a WindowInfo> {

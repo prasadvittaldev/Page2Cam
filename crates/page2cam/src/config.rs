@@ -44,7 +44,7 @@ pub struct Config {
     /// Webcam crop as [x, y, width, height], fractions of the camera frame.
     /// A list of the wrong length or with NaN means no crop.
     pub webcam_crop: Vec<f32>,
-    /// Full-frame background: page | image | colour | youtube | screen | blurred-room
+    /// Full-frame background: page | image | colour | youtube | screen | window | blurred-room
     pub background: String,
     /// The full-frame picture (re-encoded copy in the data folder).
     pub background_image: String,
@@ -54,6 +54,9 @@ pub struct Config {
     pub background_youtube: String,
     /// Full-frame screen: a monitor id (`DISPLAY1`); empty = the primary one.
     pub background_screen: String,
+    /// Full-frame window: its executable (`chrome.exe`) and exact title.
+    pub background_window_exe: String,
+    pub background_window_title: String,
     /// In-box background (Box style): room | blur | image | colour
     pub box_background: String,
     pub box_background_image: String,
@@ -92,6 +95,8 @@ impl Default for Config {
             background_colour: "#0b63f0".into(),
             background_youtube: String::new(),
             background_screen: String::new(),
+            background_window_exe: String::new(),
+            background_window_title: String::new(),
             box_background: "room".into(),
             box_background_image: String::new(),
             box_background_colour: "#0b63f0".into(),
