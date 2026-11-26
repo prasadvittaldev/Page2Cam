@@ -348,8 +348,11 @@ pub fn redact(s: &str, key: &str) -> String {
     }
 }
 
-/// `redact` for every non-empty key.
+/// `redact` for every non-empty key, longest first (a key inside another
+/// key must not leave part of the longer one visible).
 pub fn redact_all(s: &str, keys: &[&str]) -> String {
+    let mut keys = keys.to_vec();
+    keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
     keys.iter().fold(s.to_string(), |acc, k| redact(&acc, k))
 }
 
@@ -638,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn ffmpeg_args_shape() {
+    fn encoder_args_shape() {
         let a = encoder_args(&cfg(), 50123);
         let s = a.join(" ");
         assert_eq!(s.matches("-analyzeduration 0").count(), 2, "{s}");
@@ -699,6 +702,15 @@ mod tests {
         let s = "push rtmp://a/live2/yt-key-1 and rtmp://b/app/live_tw_2";
         let r = redact_all(s, &["yt-key-1", "live_tw_2", ""]);
         assert!(!r.contains("yt-key-1") && !r.contains("live_tw_2"));
+    }
+
+    #[test]
+    fn a_key_inside_another_key_leaves_nothing_visible() {
+        let s = "rtmp://a/live2/abc and rtmp://b/app/abcdef";
+        for keys in [["abc", "abcdef"], ["abcdef", "abc"]] {
+            let r = redact_all(s, &keys);
+            assert_eq!(r, "rtmp://a/live2/**** and rtmp://b/app/****", "{keys:?}");
+        }
     }
 
     #[test]
