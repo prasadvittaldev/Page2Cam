@@ -47,15 +47,33 @@ pub enum SenderExit {
     Other(String),
 }
 
-const AUTH_WORDS: [&str; 7] = [
-    "401",
-    "403",
+const AUTH_PHRASES: [&str; 5] = [
     "unauthorized",
     "forbidden",
     "invalid stream key",
     "authentication",
     "netstream.publish.badname",
 ];
+
+/// True if `code` appears in `line` as a standalone number (not inside hex
+/// pointers, longer numbers or words).
+fn has_standalone(line: &str, code: &str) -> bool {
+    let b = line.as_bytes();
+    line.match_indices(code).any(|(i, _)| {
+        let before = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+        let after = b
+            .get(i + code.len())
+            .is_none_or(|c| !c.is_ascii_alphanumeric());
+        before && after
+    })
+}
+
+fn is_auth_line(line: &str) -> bool {
+    let l = line.to_lowercase();
+    AUTH_PHRASES.iter().any(|w| l.contains(w))
+        || has_standalone(&l, "401")
+        || has_standalone(&l, "403")
+}
 
 /// Classify a sender's last output lines. The reason is the last non-empty line.
 pub fn classify_exit(lines: &[String]) -> SenderExit {
@@ -66,10 +84,7 @@ pub fn classify_exit(lines: &[String]) -> SenderExit {
         .find(|l| !l.is_empty())
         .unwrap_or("sender exited")
         .to_string();
-    let auth = lines.iter().any(|l| {
-        let l = l.to_lowercase();
-        AUTH_WORDS.iter().any(|w| l.contains(w))
-    });
+    let auth = lines.iter().any(|l| is_auth_line(l));
     if auth {
         SenderExit::Auth(reason)
     } else {
@@ -157,5 +172,32 @@ mod tests {
             classify_exit(&l),
             SenderExit::Auth("HTTP error 403 Forbidden".into())
         );
+    }
+
+    #[test]
+    fn numbers_inside_other_text_are_not_auth() {
+        let n = vec!["[rtmp @ 0x55d1403a2c0] Connection refused".to_string()];
+        assert!(matches!(classify_exit(&n), SenderExit::Other(_)));
+        let p = vec!["size= 14031kB time=00:04:03 port 4013".to_string()];
+        assert!(matches!(classify_exit(&p), SenderExit::Other(_)));
+        let a = vec!["HTTP error 403 Forbidden".to_string()];
+        assert!(matches!(classify_exit(&a), SenderExit::Auth(_)));
+        let b = vec!["Server returned 401".to_string()];
+        assert!(matches!(classify_exit(&b), SenderExit::Auth(_)));
+        let c = vec!["error (403)".to_string()];
+        assert!(matches!(classify_exit(&c), SenderExit::Auth(_)));
+    }
+    #[test]
+    fn overall_edge_cases() {
+        use SiteState::*;
+        assert_eq!(overall(&[], None), (StreamState::Connecting, false));
+        assert_eq!(
+            overall(
+                &[(Site::YouTube, Error("x".into())), (Site::Twitch, Idle)],
+                None
+            ),
+            (StreamState::Connecting, false)
+        );
+        assert!(matches!(classify_exit(&[]), SenderExit::Other(_)));
     }
 }
