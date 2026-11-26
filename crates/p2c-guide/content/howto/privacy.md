@@ -11,7 +11,8 @@ Everything Page2Cam shows goes live to the people in the call and to anyone reco
 - `set_background` with `screen` shares a whole monitor, notifications and all: tell the user before choosing it and suggest closing private windows.
 - Prefer the blurred-room background when the room behind the user is private (a home, a clinic, an office with whiteboards).
 - Clear graphics at the end (`clear_layers`) so the next call doesn't start with old ones.
-- Stream keys are never readable; `start_stream` uses the destination saved in the control page.
+- `set_background` with `window` shows one application window, but its title and content can still be private: call `list_windows` only when asked, say which window you will share, and never choose between look-alike windows yourself. A browser window carries the sound of everything playing in that browser (other tabs, calls): use a separate browser for shared content and never have a call in it.
+- Stream keys are never readable; `start_stream` streams to the sites ticked in the control page (YouTube and/or Twitch), with the keys entered there. A missing key is for the user to enter in the control page.
 
 **Medical and therapy**
 - Never show patient names, dates of birth, diagnoses, medications, test results or case notes in a graphic, even if the user mentions them in the chat.

@@ -53,7 +53,7 @@ Coordinates are 0..1 of the 1920×1080 output.
 | `set_audio(mic_on, mic_gain, page_on, page_gain)` | stream sound (give only what changes) |
 | `list_gpus`, `set_gpu(choice)` | video processing; restarts Page2Cam when needed |
 | `install_update` | installs the update on offer |
-| `get_background`, `set_background(full, full_colour, youtube|screen|window|blurred-room, screen, window, in_box, box_colour, refined_edges)` | backgrounds: full frame `page\|image\|colour\|youtube\|screen\|blurred-room`, in box `room\|blur\|image\|colour`, refined edges (give only what changes); `screen` = a monitor id from `list_screens` (default: the main monitor); `window` = a window id from `list_windows` or title text (exact title, else a unique case-insensitive substring; an error lists the candidates). The answer carries the engine's `note` (e.g. "Sound: everything playing in <browser>"). A browser window's sound is everything in that browser: use a separate browser; games need borderless or windowed mode |
+| `get_background`, `set_background(full, full_colour, youtube, screen, window, in_box, box_colour, refined_edges)` | backgrounds: full frame `page\|image\|colour\|youtube\|screen\|window\|blurred-room`, in box `room\|blur\|image\|colour`, refined edges (give only what changes); `screen` = a monitor id from `list_screens` (default: the main monitor); `window` = a window id from `list_windows` or title text (exact title, else a unique case-insensitive substring; an error lists the candidates). The answer carries the engine's `note` (e.g. "Sound: everything playing in <browser>"). A browser window's sound is everything in that browser: use a separate browser; games need borderless or windowed mode |
 | `list_screens` | the monitors the screen background can show: `id`, `index`, `name`, `width`, `height`, `primary` (Windows; elsewhere an error) |
 | `list_windows` | the open application windows the window background can show: `id`, `title`, `app`, `exe`, `width`, `height`, `minimized`, `browser` (titles can be private: list only when the user asked; Windows only, elsewhere an error) |
 | `upload_background_image(row: full\|box, path \| base64)` | a PNG/JPEG/WebP picture (≤ 20 MB) for a background row, shown at once |
@@ -71,6 +71,10 @@ Coordinates are 0..1 of the 1920×1080 output.
 Tools that need the running engine answer "Page2Cam is stopped — call start first" while it is stopped. No tool returns the stream key or any token.
 
 **Screen background.** `set_background(full: "screen")` shows a whole monitor, live, to the call or stream (everything on it: notifications, other windows, the pointer). The tray always shows a notification "Agent “…” is sharing your screen" for it, also while Page2Cam is stopped. While the screen shows, `snapshot` contains that monitor's picture. Choosing a page (`open_url`, the control page's address bar) or another background stops the capture. A monitor that can't be captured (unplugged) leaves a black background and says why in `status` (`background_note`).
+
+**Window background.** `set_background(full: "window", window: …)` shows one application window, live, with that app's sound as page sound (stream only, never into calls). Call `list_windows` first; `window` is an `id` from it, an exact title, or a unique case-insensitive substring of one (otherwise the error lists the candidates). Only that window is shown, not the rest of the screen, but titles can be private, so list only when the user asked. For browsers the engine's note says "Sound: everything playing in <app>": use a second browser for the content. Games need borderless or windowed mode. Notes in `status.background_note`: window not found, several windows with the same title, minimized (restore it), closed, sound unavailable. After a restart it resumes only on the same exe and exact saved title. The tray shows a "sharing a window" notification. Windows only; elsewhere "window capture is Windows-only for now".**Streaming to YouTube and Twitch.** `set_stream_sites {youtube?, twitch?}` ticks the sites, `start_stream {sites?}` streams to them (default: the ones ticked in the control page), `stop_stream {sites?}` stops some or all; `status.streams` shows each site's state. Keys are never readable or passable: a "<Site> has no stream key" error means the user enters it in the control page. Twitch accepts up to 6000 kbps; `start_stream` says so when the video bitrate is higher.
+
+**Streaming to YouTube and Twitch.** `set_stream_sites {youtube?, twitch?}` ticks the sites, `start_stream {sites?}` streams to them (default: the ones ticked in the control page), `stop_stream {sites?}` stops some or all; `status.streams` shows each site's state. Keys are never readable or passable: a "<Site> has no stream key" error means the user enters it in the control page. Twitch accepts up to 6000 kbps; `start_stream` says so when the video bitrate is higher.
 
 ## Overlay layers
 
@@ -120,7 +124,7 @@ Then `update_layer({ "id": "news", "items": ["Breaking: …"] })`, `hide_layer({
 
 ## Templates, scenes and the guide
 
-The full agent guide (playbooks for 24 user groups, how-tos, every template's parameters) is in [`docs/agent-guide/`](agent-guide/README.md); it is generated from the same sources the `guide` tool answers from.
+The full agent guide (playbooks for 25 user groups, how-tos, every template's parameters) is in [`docs/agent-guide/`](agent-guide/README.md); it is generated from the same sources the `guide` tool answers from.
 
 **Templates** are named, tested, parameterised graphics (48 built in: lower thirds, badges, timers, full-frame cards, agendas, charts, polls, QR and product cards, code, terminal, release-notes and status cards, …):
 

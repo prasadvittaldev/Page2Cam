@@ -9,7 +9,7 @@ What AI agents read about Page2Cam: the same texts reach them through the MCP `g
 
 ## Playbooks
 
-- **Creators:** [Game and live streamers](playbooks/streaming.md), [Podcasters and commentators](playbooks/podcast.md), [Musicians and performers](playbooks/music.md), [Cooking, craft and DIY creators](playbooks/cooking-diy.md), [Fitness and yoga instructors](playbooks/fitness.md)
+- **Creators:** [Game and live streamers](playbooks/streaming.md), [Reaction and watch-along streams](playbooks/reaction-streams.md), [Podcasters and commentators](playbooks/podcast.md), [Musicians and performers](playbooks/music.md), [Cooking, craft and DIY creators](playbooks/cooking-diy.md), [Fitness and yoga instructors](playbooks/fitness.md)
 - **Business:** [Business presenters and sales demos](playbooks/sales-demo.md), [Webinar hosts and marketers](playbooks/webinar.md), [Live shopping and product launches](playbooks/live-shopping.md), [Team leads and internal meetings](playbooks/team-meeting.md), [Recruiters and job interviews](playbooks/interview.md), [Real estate agents](playbooks/real-estate.md), [Financial advisers and analysts](playbooks/finance.md), [Lawyers and consultants](playbooks/legal-consulting.md), [IT support and helpdesks](playbooks/it-support.md)
 - **Care and education:** [Doctors and telehealth](playbooks/telehealth.md), [Therapists and counsellors](playbooks/therapy.md), [Teachers and tutors](playbooks/teaching.md)
 - **Community:** [Churches and faith groups](playbooks/faith.md), [Conferences and virtual events](playbooks/virtual-event.md), [Nonprofits and fundraisers](playbooks/fundraiser.md)

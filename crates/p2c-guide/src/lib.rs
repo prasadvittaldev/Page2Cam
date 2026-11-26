@@ -33,6 +33,7 @@ pub const GROUPS: &[(&str, &str)] = &[
 /// Every playbook id, by group.
 pub const PLAYBOOK_IDS: &[&str] = &[
     "streaming",
+    "reaction-streams",
     "podcast",
     "music",
     "cooking-diy",
