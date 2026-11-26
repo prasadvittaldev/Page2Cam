@@ -905,7 +905,7 @@ fn run() -> anyhow::Result<i32> {
     let _ = delay_thread.join();
     let _ = window_thread.join();
     // Stop the window capture and its sound.
-    app.window.sync(None);
+    app.window.sync(None, None);
     if let Some(seg) = &app.segmenter {
         seg.request_stop();
     }

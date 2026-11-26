@@ -774,6 +774,9 @@ struct BgChange {
     page_url: Option<String>,
     /// Reload the generated page even if the choice is the same (new picture).
     reload: bool,
+    /// The window picked (by id or text) for a window background: exactly
+    /// that one starts (`None`: the saved match).
+    window_id: Option<u64>,
     /// Extra settings to write with the change.
     extra: Vec<(&'static str, toml_edit::Value)>,
 }
@@ -873,10 +876,16 @@ impl App {
 
     /// Copy the choices to the compositor and run the cut-out when they need it.
     fn sync_backdrop(&self) {
+        self.sync_backdrop_with(None);
+    }
+
+    /// [`App::sync_backdrop`], starting exactly the window `window_id` (an
+    /// explicit pick) when the window background is chosen.
+    fn sync_backdrop_with(&self, window_id: Option<u64>) {
         let b = self.bg.lock().backdrop();
         *self.backdrop.write() = b;
         self.update_segmenter();
-        self.sync_screen();
+        self.sync_screen(window_id);
     }
 
     /// Capture the chosen monitor or window while the screen or window
@@ -885,7 +894,7 @@ impl App {
     /// repainted). The old capture stops before a new one starts. A window
     /// start may block for seconds (accepted on this explicit path; the
     /// start-up one is deferred to the window thread).
-    fn sync_screen(&self) {
+    fn sync_screen(&self, window_id: Option<u64>) {
         use std::sync::atomic::Ordering::SeqCst;
         let (screen, window) = {
             let s = self.bg.lock();
@@ -898,7 +907,7 @@ impl App {
             self.screen.sync(None);
         }
         if window.is_none() {
-            self.window.sync(None);
+            self.window.sync(None, None);
         }
         match (screen, window) {
             (Some(id), _) => {
@@ -907,7 +916,7 @@ impl App {
             }
             (None, Some(m)) => {
                 self.page_paused.store(true, SeqCst);
-                self.window.sync(Some(&m));
+                self.window.sync(Some(&m), window_id);
             }
             (None, None) => {
                 if self.page_paused.swap(false, SeqCst) {
@@ -971,6 +980,7 @@ impl App {
         let shown = self.shown_url();
         let style = self.layout.read().style;
         let to_cutout = c.full != FullBg::Page && style == OverlayStyle::Box;
+        let window_id = c.window_id;
         let mut saves = c.extra;
         let nav = {
             let mut s = self.bg.lock();
@@ -1055,7 +1065,7 @@ impl App {
             tracing::info!(url = %u, "background page");
             self.load_url(&u);
         }
-        self.sync_backdrop();
+        self.sync_backdrop_with(window_id);
         self.save_values(&saves);
     }
 
@@ -1068,6 +1078,7 @@ impl App {
             refined: s.refined,
             page_url: None,
             reload: false,
+            window_id: None,
             extra: Vec::new(),
         }
     }
@@ -1090,7 +1101,10 @@ impl App {
     /// The window for `full: "window"`: `full_window` as an id or title text
     /// (its read-back form `"<title> (<exe>)"` keeps the saved window), else
     /// the saved window. Lists windows without holding the background lock.
-    fn pick_window(&self, d: &BackgroundDto) -> anyhow::Result<p2c_screen::WindowMatch> {
+    fn pick_window(
+        &self,
+        d: &BackgroundDto,
+    ) -> anyhow::Result<(p2c_screen::WindowMatch, Option<u64>)> {
         let saved = self.bg.lock().window.clone();
         let text = d.full_window.as_deref().map(str::trim).unwrap_or("");
         if text.is_empty() || (!saved.exe.is_empty() && text == window_label(&saved)) {
@@ -1098,9 +1112,10 @@ impl App {
                 !saved.exe.is_empty(),
                 "choose a window first (GET /api/windows lists them)"
             );
-            return Ok(saved);
+            return Ok((saved, None));
         }
-        self.window.resolve(text)
+        let (m, id) = self.window.resolve(text)?;
+        Ok((m, Some(id)))
     }
 
     /// Run the window background's checks (every ~2 s, on the engine's
@@ -1112,11 +1127,15 @@ impl App {
         let changed = self.window.tick();
         let save = {
             let mut s = self.bg.lock();
-            if let Some(m) = changed {
+            // Only while the background still is the window that changed
+            // (a newer choice may be on its way to `window.sync`).
+            if let Some(c) = changed {
                 if let FullBg::Window(w) = &mut s.full {
-                    *w = m.clone();
-                    s.window = m;
-                    s.window_unsaved = true;
+                    if *w == c.old {
+                        *w = c.new.clone();
+                        s.window = c.new;
+                        s.window_unsaved = true;
+                    }
                 }
             }
             let due = s
@@ -1164,7 +1183,7 @@ impl App {
                 self.screen
                     .resolve(d.full_screen.as_deref().unwrap_or(&s.screen))?,
             ),
-            "window" => FullBg::Window(window.expect("picked above")),
+            "window" => FullBg::Window(window.clone().expect("picked above").0),
             "blurred-room" => FullBg::BlurredRoom,
             other => anyhow::bail!(
                 "unknown full-frame background {other:?} (page, image, colour, youtube, screen, window or blurred-room)"
@@ -1188,6 +1207,7 @@ impl App {
             refined: d.refined_edges,
             page_url: None,
             reload: false,
+            window_id: window.and_then(|(_, id)| id),
             extra: Vec::new(),
         })
     }
@@ -2523,6 +2543,39 @@ mod tests {
         fake.list.lock()[1].title = "C - Twitch".into();
         app.set_background(bg("window", "room")).unwrap();
         assert_eq!(*fake.starts.lock(), vec![2, 2]);
+    }
+
+    /// Fix 1 (app): a pick by id starts that window even with a same-titled
+    /// twin. Fix 3: a title change of the window being left is not written
+    /// into the newer choice.
+    #[test]
+    fn window_pick_by_id_and_stale_title_changes() {
+        use crate::background::FullBg;
+        use crate::window::tests::{m, win, FakeWindows};
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bg_app(dir.path());
+        let fake = FakeWindows::default();
+        *fake.list.lock() = vec![
+            win(1, "chrome.exe", "New Tab"),
+            win(2, "chrome.exe", "New Tab"),
+            win(3, "chrome.exe", "Gmail"),
+        ];
+        app.window = crate::window::WindowShare::new(Box::new(fake.clone()));
+        app.set_background(BackgroundDto {
+            full_window: Some("2".into()),
+            ..bg("window", "room")
+        })
+        .unwrap();
+        assert_eq!(*fake.starts.lock(), vec![2]);
+        // The operator picks Gmail; before the share follows it, the old
+        // window's title changes: the new choice keeps its own title.
+        app.bg.lock().full = FullBg::Window(m("chrome.exe", "Gmail"));
+        app.bg.lock().window = m("chrome.exe", "Gmail");
+        fake.run.lock().title = Some("Twitch".into());
+        app.tick_window(std::time::Instant::now());
+        assert_eq!(app.bg.lock().full, FullBg::Window(m("chrome.exe", "Gmail")));
+        assert_eq!(app.bg.lock().window, m("chrome.exe", "Gmail"));
+        assert_eq!(settings(dir.path()).background_window_title, "New Tab");
     }
 
     #[test]

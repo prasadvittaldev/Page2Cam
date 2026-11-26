@@ -111,14 +111,27 @@ impl WindowBackend for RealWindows {
 
 /// The note for a match nothing exactly matches.
 fn not_found(m: &WindowMatch) -> String {
+    if m.exe.is_empty() {
+        return NONE_CHOSEN.into();
+    }
     format!("window not found: {} ({}): choose it again", m.title, m.exe)
 }
 
 const MINIMIZED: &str = "window minimized: restore it (it can sit behind other windows)";
 const CLOSED: &str = "window closed";
+/// A saved window without a program (e.g. a hand-edited config).
+const NONE_CHOSEN: &str = "no window chosen for the window background: choose a window";
 /// Titles of the running window remembered (so a `sync` with a title the
 /// app hasn't caught up with yet is no restart).
 const TITLES_KEPT: usize = 32;
+
+/// A title change of the running window (`tick`): the match before and
+/// after. The app applies it only while it still shows `old`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TitleChange {
+    pub old: WindowMatch,
+    pub new: WindowMatch,
+}
 
 struct Running {
     run: Box<dyn WindowRun>,
@@ -135,6 +148,9 @@ struct State {
     running: Option<Running>,
     /// A start of this window failed: not retried by `tick`.
     failed_id: Option<u64>,
+    /// A black frame went out since the last run stopped (the page slot
+    /// holds no window picture).
+    blank: bool,
 }
 
 /// The running window capture, if any.
@@ -157,10 +173,12 @@ impl WindowShare {
         self.backend.list()
     }
 
-    /// The window an id or title text names (see `p2c_screen::resolve_text`),
-    /// as the match to save. A window whose program can't be identified is
-    /// refused: it could never be found again safely.
-    pub fn resolve(&self, text: &str) -> anyhow::Result<WindowMatch> {
+    /// The window an id or title text names (see `p2c_screen::resolve_text`):
+    /// the match to save and the chosen window's id (pass it to
+    /// [`WindowShare::sync`], so exactly that window starts). A window whose
+    /// program can't be identified is refused: it could never be found
+    /// again safely.
+    pub fn resolve(&self, text: &str) -> anyhow::Result<(WindowMatch, u64)> {
         let list = self.list()?;
         let w = p2c_screen::resolve_text(&list, text).map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
@@ -168,36 +186,61 @@ impl WindowShare {
             "can't capture \"{}\": its program can't be identified (is it running as administrator?)",
             w.title
         );
-        Ok(WindowMatch {
-            exe: w.exe.clone(),
-            title: w.title.clone(),
-        })
+        Ok((
+            WindowMatch {
+                exe: w.exe.clone(),
+                title: w.title.clone(),
+            },
+            w.id,
+        ))
     }
 
-    /// Whether `m` is what is wanted already: the same match, or the running
-    /// window under a title it had (the app may not have caught up yet).
-    fn is_current(st: &State, m: &WindowMatch) -> bool {
-        st.want.as_ref() == Some(m)
-            || st
-                .running
-                .as_ref()
-                .is_some_and(|r| r.exe.eq_ignore_ascii_case(&m.exe) && r.titles.contains(&m.title))
+    /// Whether the wish is what runs (or is wanted) already. With an id
+    /// (an explicit choice): that very window runs. Without (the saved
+    /// match): the same match, or the running window under a title it had
+    /// (the app may not have caught up yet).
+    fn is_current(st: &State, m: &WindowMatch, id: Option<u64>) -> bool {
+        match id {
+            Some(id) => st.running.as_ref().is_some_and(|r| r.id == id),
+            None => {
+                st.want.as_ref() == Some(m)
+                    || st.running.as_ref().is_some_and(|r| {
+                        r.exe.eq_ignore_ascii_case(&m.exe) && r.titles.contains(&m.title)
+                    })
+            }
+        }
     }
 
-    /// Record a new wish (stopping the old capture first).
-    fn set_want(&self, st: &mut State, want: Option<&WindowMatch>) -> bool {
+    /// Show black once since the last run stopped (never the old window's
+    /// last frame under another choice).
+    fn blank(&self, st: &mut State) {
+        if !st.blank {
+            self.backend.black();
+            st.blank = true;
+        }
+    }
+
+    /// Record a new wish, stopping the old capture first. True when it
+    /// changed (a start is due).
+    fn set_want(&self, st: &mut State, want: Option<&WindowMatch>, id: Option<u64>) -> bool {
         match want {
             None => {
+                // The page comes back (repainted by the app): no black.
                 st.running = None;
                 st.want = None;
                 st.failed_id = None;
                 *self.note.lock() = None;
                 false
             }
-            Some(m) if Self::is_current(st, m) => false,
+            Some(m) if Self::is_current(st, m, id) => false,
             Some(m) => {
-                st.running = None;
-                st.failed_id = None;
+                if st.running.take().is_some() {
+                    st.blank = false;
+                }
+                // An explicit choice retries a window that failed before.
+                if id.is_some() {
+                    st.failed_id = None;
+                }
                 st.want = Some(m.clone());
                 *self.note.lock() = None;
                 true
@@ -206,11 +249,14 @@ impl WindowShare {
     }
 
     /// Capture `want` (`None`: stop), starting now if it is found (may block
-    /// for seconds). The same wish again is no restart.
-    pub fn sync(&self, want: Option<&WindowMatch>) {
+    /// for seconds). `id` is the window the operator picked (from
+    /// [`WindowShare::resolve`]): exactly that one starts. Without it only a
+    /// single window with the same exe and exactly the title starts. The
+    /// same wish again is no restart.
+    pub fn sync(&self, want: Option<&WindowMatch>, id: Option<u64>) {
         let mut st = self.state.lock();
-        if self.set_want(&mut st, want) {
-            self.try_start(&mut st);
+        if self.set_want(&mut st, want, id) {
+            self.try_start(&mut st, id);
         }
     }
 
@@ -218,30 +264,59 @@ impl WindowShare {
     /// does, off the caller's thread).
     pub fn defer(&self, want: Option<&WindowMatch>) {
         let mut st = self.state.lock();
-        self.set_want(&mut st, want);
+        if self.set_want(&mut st, want, None) {
+            self.blank(&mut st);
+        }
     }
 
-    /// Start the wanted window if exactly it is listed.
-    fn try_start(&self, st: &mut State) {
+    /// Start the wanted window: the one with `id` (an explicit choice), else
+    /// the only one listed with the same exe and exactly the title. Never a
+    /// guess: anything else leaves black and a note.
+    fn try_start(&self, st: &mut State, id: Option<u64>) {
         let Some(m) = st.want.clone() else { return };
-        let note = |n: String| *self.note.lock() = Some(n);
         if m.exe.is_empty() {
-            return note(not_found(&m));
+            *self.note.lock() = Some(not_found(&m));
+            return self.blank(st);
         }
         let list = match self.backend.list() {
             Ok(l) => l,
-            Err(e) => return note(format!("window capture failed: {e:#}")),
+            Err(e) => {
+                *self.note.lock() = Some(format!("window capture failed: {e:#}"));
+                return self.blank(st);
+            }
         };
-        let Some(w) = p2c_screen::find_exact(&list, &m) else {
-            return note(not_found(&m));
+        let found: Vec<&WindowInfo> = match id {
+            Some(id) => list
+                .iter()
+                .filter(|w| w.id == id && w.exe.eq_ignore_ascii_case(&m.exe))
+                .collect(),
+            None => list
+                .iter()
+                .filter(|w| w.exe.eq_ignore_ascii_case(&m.exe) && w.title == m.title)
+                .collect(),
+        };
+        let w = match found.as_slice() {
+            [w] => *w,
+            [] => {
+                *self.note.lock() = Some(not_found(&m));
+                return self.blank(st);
+            }
+            _ => {
+                *self.note.lock() = Some(format!(
+                    "several windows are called {} ({}): choose one again",
+                    m.title, m.exe
+                ));
+                return self.blank(st);
+            }
         };
         if st.failed_id == Some(w.id) {
-            return; // its failure note stays; not retried
+            return self.blank(st); // its failure note stays; not retried
         }
         match self.backend.start(w) {
             Ok(run) => {
-                tracing::info!(exe = %w.exe, "window background on");
+                tracing::info!(exe = %w.exe, window = w.id, "window background on");
                 st.failed_id = None;
+                st.blank = false;
                 st.running = Some(Running {
                     run,
                     id: w.id,
@@ -249,13 +324,18 @@ impl WindowShare {
                     app: w.app.clone(),
                     titles: vec![w.title.clone()],
                 });
+                // An explicit pick by id may carry an older title.
+                if let Some(want) = st.want.as_mut() {
+                    want.title = w.title.clone();
+                }
                 self.update_note(st);
             }
             Err(e) => {
                 let msg = format!("window capture failed: {e:#}");
                 tracing::warn!("{msg}");
                 st.failed_id = Some(w.id);
-                note(msg);
+                *self.note.lock() = Some(msg);
+                self.blank(st);
             }
         }
     }
@@ -277,19 +357,20 @@ impl WindowShare {
     }
 
     /// Every ~2 s: retry a match that wasn't found, follow the running
-    /// window's state and title. Returns the new match when the title
-    /// changed (the app saves it).
-    pub fn tick(&self) -> Option<WindowMatch> {
+    /// window's state and title. Returns the old and new match when the
+    /// title changed (the app saves it if it still shows the old one).
+    pub fn tick(&self) -> Option<TitleChange> {
         let mut st = self.state.lock();
         st.want.as_ref()?;
         let Some(r) = st.running.as_mut() else {
-            self.try_start(&mut st);
+            self.try_start(&mut st, None);
             return None;
         };
         if r.run.status() == WindowStatus::Closed {
             tracing::info!(window = r.id, "captured window closed");
             st.running = None;
-            self.backend.black();
+            st.blank = false;
+            self.blank(&mut st);
             *self.note.lock() = Some(CLOSED.into());
             return None;
         }
@@ -301,8 +382,12 @@ impl WindowShare {
                     r.titles.remove(0);
                 }
                 let want = st.want.as_mut().expect("checked above");
+                let old = want.clone();
                 want.title = t;
-                Some(want.clone())
+                Some(TitleChange {
+                    old,
+                    new: want.clone(),
+                })
             }
             _ => None,
         };
@@ -427,7 +512,7 @@ pub mod tests {
     fn exact_match_starts_and_near_miss_does_not() {
         let (f, s) = share();
         *f.list.lock() = vec![win(1, "chrome.exe", "Gmail")];
-        s.sync(Some(&m("chrome.exe", "A - Twitch")));
+        s.sync(Some(&m("chrome.exe", "A - Twitch")), None);
         assert!(f.starts.lock().is_empty(), "never a near miss");
         assert_eq!(s.running(), None);
         assert_eq!(
@@ -435,7 +520,7 @@ pub mod tests {
             Some("window not found: A - Twitch (chrome.exe): choose it again")
         );
         f.list.lock().push(win(2, "chrome.exe", "A - Twitch"));
-        assert_eq!(s.tick(), None);
+        assert_eq!(s.tick().map(|c| c.new), None);
         assert_eq!(*f.starts.lock(), vec![2]);
         assert_eq!(s.running(), Some(2));
         assert_eq!(
@@ -444,12 +529,12 @@ pub mod tests {
             "browser warning only"
         );
         // The same wish again: no restart. None: stopped.
-        s.sync(Some(&m("chrome.exe", "A - Twitch")));
+        s.sync(Some(&m("chrome.exe", "A - Twitch")), None);
         assert_eq!(f.live.load(Ordering::SeqCst), 1);
-        s.sync(None);
+        s.sync(None, None);
         assert_eq!(f.live.load(Ordering::SeqCst), 0);
         assert_eq!(s.note(), None);
-        assert_eq!(s.tick(), None);
+        assert_eq!(s.tick().map(|c| c.new), None);
         assert_eq!(f.starts.lock().len(), 1, "nothing wanted: nothing started");
     }
 
@@ -457,15 +542,15 @@ pub mod tests {
     fn title_change_while_running_is_followed_and_saved() {
         let (f, s) = share();
         *f.list.lock() = vec![win(2, "chrome.exe", "A - Twitch")];
-        s.sync(Some(&m("chrome.exe", "A - Twitch")));
-        assert_eq!(s.tick(), None, "unchanged title");
+        s.sync(Some(&m("chrome.exe", "A - Twitch")), None);
+        assert_eq!(s.tick().map(|c| c.new), None, "unchanged title");
         f.run.lock().title = Some("B - Twitch".into());
-        assert_eq!(s.tick(), Some(m("chrome.exe", "B - Twitch")));
-        assert_eq!(s.tick(), None, "reported once");
+        assert_eq!(s.tick().map(|c| c.new), Some(m("chrome.exe", "B - Twitch")));
+        assert_eq!(s.tick().map(|c| c.new), None, "reported once");
         assert_eq!(*f.starts.lock(), vec![2], "not restarted");
         // The app may still hold the old title for a moment: no restart.
-        s.sync(Some(&m("chrome.exe", "A - Twitch")));
-        s.sync(Some(&m("chrome.exe", "B - Twitch")));
+        s.sync(Some(&m("chrome.exe", "A - Twitch")), None);
+        s.sync(Some(&m("chrome.exe", "B - Twitch")), None);
         assert_eq!(*f.starts.lock(), vec![2]);
         assert_eq!(f.live.load(Ordering::SeqCst), 1);
     }
@@ -474,7 +559,7 @@ pub mod tests {
     fn minimized_then_closed() {
         let (f, s) = share();
         *f.list.lock() = vec![win(2, "chrome.exe", "A - Twitch")];
-        s.sync(Some(&m("chrome.exe", "A - Twitch")));
+        s.sync(Some(&m("chrome.exe", "A - Twitch")), None);
         f.run.lock().status = Some(WindowStatus::Minimized);
         s.tick();
         assert_eq!(
@@ -483,7 +568,7 @@ pub mod tests {
         );
         f.run.lock().status = Some(WindowStatus::Ok);
         f.run.lock().title = Some("B - Twitch".into());
-        assert_eq!(s.tick(), Some(m("chrome.exe", "B - Twitch")));
+        assert_eq!(s.tick().map(|c| c.new), Some(m("chrome.exe", "B - Twitch")));
         assert_eq!(s.note().as_deref(), Some(CHROME_SOUND));
         f.run.lock().status = Some(WindowStatus::Closed);
         s.tick();
@@ -510,7 +595,7 @@ pub mod tests {
         let (f, s) = share();
         *f.list.lock() = vec![win(2, "game.exe", "Game")];
         *f.fail.lock() = Some("access denied".into());
-        s.sync(Some(&m("game.exe", "Game")));
+        s.sync(Some(&m("game.exe", "Game")), None);
         assert_eq!(
             s.note().as_deref(),
             Some("window capture failed: access denied")
@@ -522,8 +607,8 @@ pub mod tests {
             Some("window capture failed: access denied")
         );
         *f.fail.lock() = None;
-        s.sync(None);
-        s.sync(Some(&m("game.exe", "Game")));
+        s.sync(None, None);
+        s.sync(Some(&m("game.exe", "Game")), None);
         assert_eq!(s.running(), Some(2));
         f.run.lock().sound_error = Some("no audio device".into());
         s.tick();
@@ -537,7 +622,7 @@ pub mod tests {
     fn browser_sound_warning() {
         let (f, s) = share();
         *f.list.lock() = vec![win(7, "msedge.exe", "A - Twitch")];
-        s.sync(Some(&m("msedge.exe", "A - Twitch")));
+        s.sync(Some(&m("msedge.exe", "A - Twitch")), None);
         assert_eq!(
             s.note().as_deref(),
             Some("Sound: everything playing in Microsoft Edge")
@@ -559,15 +644,22 @@ pub mod tests {
             win(2, "chrome.exe", "A - Twitch"),
             win(3, "", "Admin tool"),
         ];
-        assert_eq!(s.resolve("twitch").unwrap(), m("chrome.exe", "A - Twitch"));
-        assert_eq!(s.resolve("1").unwrap(), m("chrome.exe", "Gmail"));
+        assert_eq!(
+            s.resolve("twitch").unwrap(),
+            (m("chrome.exe", "A - Twitch"), 2)
+        );
+        assert_eq!(s.resolve("1").unwrap(), (m("chrome.exe", "Gmail"), 1));
         let e = s.resolve("a").unwrap_err().to_string();
         assert!(e.contains("matches several windows"), "{e}");
         let e = s.resolve("admin").unwrap_err().to_string();
         assert!(e.contains("can't be identified"), "{e}");
-        // An empty exe is never started either.
-        s.sync(Some(&m("", "Admin tool")));
+        // An empty exe is never started either, and the note says why.
+        s.sync(Some(&m("", "Admin tool")), None);
         assert!(f.starts.lock().is_empty());
+        assert_eq!(
+            s.note().as_deref(),
+            Some("no window chosen for the window background: choose a window")
+        );
         let u = WindowShare::new(Box::new(FakeWindows {
             unsupported: true,
             ..Default::default()
@@ -584,9 +676,115 @@ pub mod tests {
         *f.list.lock() = vec![win(2, "chrome.exe", "A - Twitch")];
         s.defer(Some(&m("chrome.exe", "A - Twitch")));
         assert!(f.starts.lock().is_empty());
-        s.sync(Some(&m("chrome.exe", "A - Twitch")));
+        s.sync(Some(&m("chrome.exe", "A - Twitch")), None);
         assert!(f.starts.lock().is_empty(), "same wish: left to tick");
         s.tick();
         assert_eq!(*f.starts.lock(), vec![2]);
+    }
+
+    /// Fix 1: the picked window starts, by id, even when another one has the
+    /// same exe and title; resuming by match never guesses between them.
+    #[test]
+    fn the_picked_window_starts_and_twins_are_never_guessed() {
+        let (f, s) = share();
+        *f.list.lock() = vec![
+            win(1, "chrome.exe", "New Tab"),
+            win(2, "chrome.exe", "New Tab"),
+        ];
+        let (want, id) = s.resolve("2").unwrap();
+        s.sync(Some(&want), Some(id));
+        assert_eq!(*f.starts.lock(), vec![2], "the second one, as picked");
+        // Same pick again: no restart. The first one picked: switched.
+        s.sync(Some(&want), Some(2));
+        assert_eq!(f.starts.lock().len(), 1);
+        s.sync(Some(&want), Some(1));
+        assert_eq!(*f.starts.lock(), vec![2, 1]);
+        assert_eq!(f.live.load(Ordering::SeqCst), 1);
+        // Another window of the same exe now carrying an old title of the
+        // running one: picked by id, it replaces it.
+        f.run.lock().title = Some("Docs".into());
+        s.tick();
+        f.list.lock()[0].title = "Docs".into();
+        f.list.lock()[1].title = "New Tab".into();
+        s.sync(Some(&m("chrome.exe", "New Tab")), Some(2));
+        assert_eq!(s.running(), Some(2));
+        // Resuming by match with two exact twins: nothing starts.
+        s.sync(None, None);
+        *f.list.lock() = vec![
+            win(5, "chrome.exe", "New Tab"),
+            win(6, "chrome.exe", "New Tab"),
+        ];
+        s.sync(Some(&m("chrome.exe", "New Tab")), None);
+        assert_eq!(s.running(), None);
+        assert_eq!(
+            s.note().as_deref(),
+            Some("several windows are called New Tab (chrome.exe): choose one again")
+        );
+        s.tick();
+        assert_eq!(s.running(), None, "never a guess");
+    }
+
+    /// Fix 2: no old window picture stays up: a switch to a window that
+    /// isn't there, a failed start and a first choice that isn't found all
+    /// show black.
+    #[test]
+    fn black_whenever_no_window_replaces_the_last_one() {
+        let (f, s) = share();
+        let blacks = || f.blacks.load(Ordering::SeqCst);
+        *f.list.lock() = vec![win(1, "app.exe", "A")];
+        s.sync(Some(&m("app.exe", "Missing")), None);
+        assert_eq!(blacks(), 1, "first choice not found");
+        s.tick();
+        assert_eq!(blacks(), 1, "once");
+        s.sync(Some(&m("app.exe", "A")), Some(1));
+        assert_eq!(s.running(), Some(1));
+        s.sync(Some(&m("app.exe", "B")), None);
+        assert_eq!(
+            (s.running(), blacks()),
+            (None, 2),
+            "switch to a missing one"
+        );
+        s.sync(Some(&m("app.exe", "A")), Some(1));
+        *f.fail.lock() = Some("access denied".into());
+        f.list.lock().push(win(2, "app.exe", "C"));
+        s.sync(Some(&m("app.exe", "C")), Some(2));
+        assert_eq!((s.running(), blacks()), (None, 3), "failed start");
+        // Stopping (back to the page) needs no black: the page repaints.
+        s.sync(None, None);
+        assert_eq!(blacks(), 3);
+    }
+
+    /// Fix 4: picking a window again after its start failed retries it.
+    #[test]
+    fn picking_a_failed_window_again_retries_it() {
+        let (f, s) = share();
+        *f.list.lock() = vec![win(2, "game.exe", "Game")];
+        *f.fail.lock() = Some("access denied".into());
+        s.sync(Some(&m("game.exe", "Game")), Some(2));
+        assert_eq!(s.running(), None);
+        *f.fail.lock() = None;
+        s.tick();
+        assert_eq!(s.running(), None, "tick doesn't retry it");
+        s.sync(Some(&m("game.exe", "Game")), None);
+        assert_eq!(s.running(), None, "the saved wish unchanged: no retry");
+        s.sync(Some(&m("game.exe", "Game")), Some(2));
+        assert_eq!(s.running(), Some(2), "picked again: retried");
+        assert_eq!(s.note(), None);
+    }
+
+    /// Fix 3: a title change names the match it replaces.
+    #[test]
+    fn title_change_names_the_old_match() {
+        let (f, s) = share();
+        *f.list.lock() = vec![win(2, "chrome.exe", "A")];
+        s.sync(Some(&m("chrome.exe", "A")), Some(2));
+        f.run.lock().title = Some("B".into());
+        assert_eq!(
+            s.tick(),
+            Some(TitleChange {
+                old: m("chrome.exe", "A"),
+                new: m("chrome.exe", "B"),
+            })
+        );
     }
 }
