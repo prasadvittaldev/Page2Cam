@@ -96,6 +96,14 @@ pub fn resolve_text<'a>(l: &'a [WindowInfo], text: &str) -> Result<&'a WindowInf
         if let Some(w) = l.iter().find(|w| w.id == id) {
             return Ok(w);
         }
+        // A stale id must never fall through to substring matching (a near
+        // miss could put another window on camera). Only a window whose
+        // whole title is exactly this text may still match.
+        let exact: Vec<&WindowInfo> = l.iter().filter(|w| w.title == text).collect();
+        return match exact.as_slice() {
+            [one] => Ok(one),
+            _ => Err("that window is gone: choose it again".into()),
+        };
     }
     let exact: Vec<&WindowInfo> = l.iter().filter(|w| w.title == text).collect();
     let found = if exact.is_empty() {
@@ -192,6 +200,23 @@ mod tests {
         assert!(resolve_text(&[], "x")
             .unwrap_err()
             .contains("(windows: none)"));
+    }
+
+    /// An id that is no longer listed never falls through to title
+    /// matching ("7" must not pick "Invoice 1007"), except a window whose
+    /// whole title is exactly that text.
+    #[test]
+    fn a_gone_id_is_not_a_title() {
+        let l = [
+            w(1, "excel.exe", "Invoice 1007"),
+            w(2, "game.exe", "2048"),
+        ];
+        assert_eq!(
+            resolve_text(&l, "7").unwrap_err(),
+            "that window is gone: choose it again"
+        );
+        assert_eq!(resolve_text(&l, " 2048 ").unwrap().id, 2);
+        assert_eq!(resolve_text(&l, "1").unwrap().id, 1);
     }
 
     #[test]
