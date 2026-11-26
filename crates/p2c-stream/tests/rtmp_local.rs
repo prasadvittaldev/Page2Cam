@@ -39,8 +39,11 @@ fn streams_h264_and_aac_to_rtmp() {
     let c = StreamController::new(mixer);
     let mut sink = c.sink();
     let cfg = StreamConfig {
-        url: "rtmp://127.0.0.1:19350/live".into(),
-        key: "testkey".into(),
+        destinations: vec![p2c_stream::Destination {
+            site: p2c_stream::Site::YouTube,
+            url: "rtmp://127.0.0.1:19350/live".into(),
+            key: "testkey".into(),
+        }],
         width: 320,
         height: 180,
         fps: 30,

@@ -13,7 +13,7 @@ use p2c_compositor::{FrameSink, Output};
 use p2c_core::{Frame, Nv12Frame, Slot};
 use parking_lot::Mutex;
 
-use crate::{ffmpeg_args, redact, Encoder, StreamConfig};
+use crate::{encoder_args, redact_all, Encoder, StreamConfig};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamState {
@@ -188,13 +188,20 @@ impl StreamController {
 impl Inner {
     /// Start ffmpeg and its writer threads (the caller stores the result).
     fn launch(inner: &Arc<Inner>, mut cfg: StreamConfig, ffmpeg: &Path) -> anyhow::Result<Running> {
-        anyhow::ensure!(!cfg.url.trim().is_empty(), "enter the stream server URL");
+        let dest = cfg.destinations.first().context("no stream destination")?;
+        anyhow::ensure!(!dest.url.trim().is_empty(), "enter the stream server URL");
+        let target = dest.target();
+        let key = dest.key.clone();
         let listener = TcpListener::bind("127.0.0.1:0").context("opening the audio socket")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         cfg.encoder = *inner.encoder.lock();
-        let args = ffmpeg_args(&cfg, port);
-        tracing::info!("starting ffmpeg: {}", redact(&args.join(" "), &cfg.key));
+        // Until the encoder/sender split (Task 3): one process publishes to the first
+        // destination, so swap the encoder's MPEG-TS output for FLV to RTMP.
+        let mut args = encoder_args(&cfg, port);
+        args.truncate(args.len() - 5);
+        args.extend(["-f".to_string(), "flv".to_string(), target]);
+        tracing::info!("starting ffmpeg: {}", redact_all(&args.join(" "), &[&key]));
         let mut cmd = Command::new(ffmpeg);
         cmd.args(&args)
             .stdin(Stdio::piped())
@@ -243,7 +250,7 @@ impl Inner {
             }));
         }
         {
-            let (state, stop, key) = (inner.state.clone(), stop.clone(), cfg.key.clone());
+            let (state, stop, key) = (inner.state.clone(), stop.clone(), key);
             let (weak, encoder) = (Arc::downgrade(inner), cfg.encoder);
             threads.push(thread("p2c-stream-log", move || {
                 let lines = watch_stderr(stderr, &state, &key);
@@ -452,7 +459,7 @@ fn watch_stderr(
         if n == 0 {
             break;
         }
-        let line = redact(String::from_utf8_lossy(&buf).trim(), key);
+        let line = redact_all(String::from_utf8_lossy(&buf).trim(), &[key]);
         if line.is_empty() {
             continue;
         }
@@ -745,8 +752,11 @@ mod tests {
             p2c_audio::MixSettings::default(),
         ));
         let cfg = crate::StreamConfig {
-            url: "rtmp://127.0.0.1:1/live".into(),
-            key: "k".into(),
+            destinations: vec![crate::Destination {
+                site: crate::Site::YouTube,
+                url: "rtmp://127.0.0.1:1/live".into(),
+                key: "k".into(),
+            }],
             width: 64,
             height: 36,
             fps: 30,
@@ -827,8 +837,11 @@ mod tests {
             p2c_audio::MixSettings::default(),
         ));
         let cfg = crate::StreamConfig {
-            url: "rtmp://127.0.0.1:1/live".into(),
-            key: "k".into(),
+            destinations: vec![crate::Destination {
+                site: crate::Site::YouTube,
+                url: "rtmp://127.0.0.1:1/live".into(),
+                key: "k".into(),
+            }],
             width: 64,
             height: 36,
             fps: 30,

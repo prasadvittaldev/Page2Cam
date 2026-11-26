@@ -2609,6 +2609,7 @@ dependencies = [
  "p2c-compositor",
  "p2c-core",
  "parking_lot",
+ "serde",
  "tempfile",
  "tracing",
  "tracing-subscriber",

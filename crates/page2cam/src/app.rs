@@ -986,8 +986,11 @@ impl Controls for App {
         })?;
         *self.stream_url.lock() = req.url.trim().to_string();
         let cfg = StreamConfig {
-            url: req.url.trim().to_string(),
-            key,
+            destinations: vec![p2c_stream::Destination {
+                site: p2c_stream::Site::YouTube,
+                url: req.url.trim().to_string(),
+                key,
+            }],
             width: self.width,
             height: self.height,
             fps: self.fps,
