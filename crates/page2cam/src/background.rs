@@ -24,6 +24,9 @@ pub enum FullBg {
     /// A monitor, by id (`DISPLAY1`; empty = primary), captured into the
     /// page while Chromium shows a black generated page with its paints paused.
     Screen(String),
+    /// An application window (same exe, exactly this title), captured into
+    /// the page like the screen.
+    Window(p2c_screen::WindowMatch),
     /// The webcam's room, blurred (drawn by the compositor).
     BlurredRoom,
 }
@@ -36,6 +39,7 @@ impl FullBg {
             FullBg::Colour(_) => "colour",
             FullBg::YouTube(_) => "youtube",
             FullBg::Screen(_) => "screen",
+            FullBg::Window(_) => "window",
             FullBg::BlurredRoom => "blurred-room",
         }
     }
@@ -44,7 +48,11 @@ impl FullBg {
     pub fn is_generated(&self) -> bool {
         matches!(
             self,
-            FullBg::Image | FullBg::Colour(_) | FullBg::YouTube(_) | FullBg::Screen(_)
+            FullBg::Image
+                | FullBg::Colour(_)
+                | FullBg::YouTube(_)
+                | FullBg::Screen(_)
+                | FullBg::Window(_)
         )
     }
 
@@ -52,6 +60,14 @@ impl FullBg {
     pub fn screen(&self) -> Option<&str> {
         match self {
             FullBg::Screen(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// The window to capture, for [`FullBg::Window`].
+    pub fn window(&self) -> Option<&p2c_screen::WindowMatch> {
+        match self {
+            FullBg::Window(m) => Some(m),
             _ => None,
         }
     }
@@ -164,7 +180,9 @@ pub fn background_html(kind: &FullBg, image_url: Option<&str>) -> String {
             ),
         ),
         // Screen: black (its paints are paused while the capture fills the page).
-        FullBg::Page | FullBg::BlurredRoom | FullBg::Screen(_) => (String::new(), String::new()),
+        FullBg::Page | FullBg::BlurredRoom | FullBg::Screen(_) | FullBg::Window(_) => {
+            (String::new(), String::new())
+        }
     };
     format!(
         "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>Page2Cam background</title>\
@@ -407,6 +425,12 @@ pub struct BgState {
     pub youtube: String,
     /// Last monitor chosen for the screen background (empty = primary).
     pub screen: String,
+    /// Last window chosen for the window background (exe + exact title).
+    pub window: p2c_screen::WindowMatch,
+    /// The window's title changed and isn't written yet (writes are spaced).
+    pub window_unsaved: bool,
+    /// When the window's title was last written after a change.
+    pub window_saved_at: Option<Instant>,
     pub full_image: Option<StoredImage>,
     pub box_image: Option<StoredImage>,
     /// The operator's page, restored when the full frame goes back to Page.
@@ -460,6 +484,10 @@ impl BgState {
                 String::new()
             })
         };
+        let window = p2c_screen::WindowMatch {
+            exe: cfg.background_window_exe.trim().to_string(),
+            title: cfg.background_window_title.clone(),
+        };
         let full = match cfg.background.as_str() {
             "image" if full_image.is_some() => FullBg::Image,
             "colour" => match normalize_colour(&cfg.background_colour) {
@@ -472,6 +500,8 @@ impl BgState {
             "youtube" if !youtube.is_empty() => FullBg::YouTube(youtube.clone()),
             // A missing monitor is reported when the capture starts.
             "screen" => FullBg::Screen(cfg.background_screen.trim().to_string()),
+            // Not found (or no exe saved): the note says so, nothing else shows.
+            "window" => FullBg::Window(window.clone()),
             "blurred-room" => FullBg::BlurredRoom,
             "page" => FullBg::Page,
             other => {
@@ -507,6 +537,9 @@ impl BgState {
             box_colour,
             youtube,
             screen: cfg.background_screen.trim().to_string(),
+            window,
+            window_unsaved: false,
+            window_saved_at: None,
             full_image,
             box_image,
             last_page_url,
@@ -1089,5 +1122,35 @@ mod screen_tests {
             BgState::from_config(&cfg, String::new()).0.full,
             FullBg::Screen(String::new())
         );
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn window_background_is_a_generated_black_page_saved_with_its_match() {
+        let m = p2c_screen::WindowMatch {
+            exe: "chrome.exe".into(),
+            title: "A - Twitch".into(),
+        };
+        let w = FullBg::Window(m.clone());
+        assert_eq!(w.as_str(), "window");
+        assert!(w.is_generated());
+        assert_eq!(w.window(), Some(&m));
+        assert_eq!(FullBg::Page.window(), None);
+        assert!(background_html(&w, None).contains("background:#000"));
+        assert!(backdrop(&w, &BoxBg::Room, None, false).hides_room);
+        let cfg = crate::config::Config {
+            background: "window".into(),
+            background_window_exe: " chrome.exe ".into(),
+            background_window_title: "A - Twitch".into(),
+            ..Default::default()
+        };
+        let (st, warn) = BgState::from_config(&cfg, String::new());
+        assert!(warn.is_empty(), "{warn:?}");
+        assert_eq!(st.full, FullBg::Window(m.clone()));
+        assert_eq!(st.window, m);
     }
 }

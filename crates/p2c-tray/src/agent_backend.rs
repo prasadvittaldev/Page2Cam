@@ -255,24 +255,43 @@ impl TrayBackend {
                     &json!({ "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "save": true }),
                 )
                 .map(BackendReply::Json),
-            C::StartStream => {
-                let st = self.state()?;
-                let url = st["status"]["stream_url"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                if url.is_empty() || st["status"]["has_saved_key"] != json!(true) {
-                    return Err("No saved stream destination and key: save them once in the Page2Cam control page".into());
-                }
-                self.post(
-                    "/api/stream/start",
-                    &json!({ "url": url, "key": "", "remember": false }),
-                )?;
+            C::StartStream { sites } => {
+                // No keys, no urls: the engine uses the saved ones and answers
+                // with its own message (e.g. "Twitch has no stream key").
+                let body = match sites {
+                    Some(list) => {
+                        let on = |s: &str| list.iter().any(|x| x == s);
+                        json!({ "sites": {
+                            "youtube": { "on": on("youtube") },
+                            "twitch": { "on": on("twitch") },
+                        } })
+                    }
+                    None => json!({ "sites": {} }),
+                };
+                self.post("/api/stream/start", &body)?;
                 Ok(BackendReply::Done("stream starting".into()))
             }
-            C::StopStream => {
+            C::StopStream { sites: Some(list) } => {
+                let mut m = serde_json::Map::new();
+                for s in list {
+                    m.insert(s.clone(), json!({ "on": false }));
+                }
+                self.post("/api/stream/sites", &Value::Object(m))?;
+                Ok(BackendReply::Done("stream sites stopped".into()))
+            }
+            C::StopStream { sites: None } => {
                 self.post("/api/stream/stop", &json!({}))?;
                 Ok(BackendReply::Done("stream stopped".into()))
+            }
+            C::SetStreamSites { youtube, twitch } => {
+                let mut m = serde_json::Map::new();
+                for (name, v) in [("youtube", youtube), ("twitch", twitch)] {
+                    if let Some(on) = v {
+                        m.insert(name.into(), json!({ "on": on }));
+                    }
+                }
+                self.post("/api/stream/sites", &Value::Object(m))?;
+                Ok(BackendReply::Done("stream sites updated".into()))
             }
             C::SetAudio(partial) => {
                 let cur = self.state()?["audio"].clone();
@@ -304,11 +323,31 @@ impl TrayBackend {
             }
             C::GetBackground => self.get("/api/background").map(BackendReply::Json),
             C::ListScreens => self.get("/api/screens").map(BackendReply::Json),
+            C::ListWindows => self.get("/api/windows").map(BackendReply::Json),
             C::SetBackground(partial) => {
                 let cur = self.get("/api/background")?;
                 let new = Self::merged(&cur, partial);
-                self.json("POST", "/api/background", Some(&new), SLOW_TIMEOUT)
-                    .map(BackendReply::Json)
+                let mut out = self.json("POST", "/api/background", Some(&new), SLOW_TIMEOUT)?;
+                // The engine's notes (a style switched with it, a browser
+                // window's shared sound, a minimized window...) reach the
+                // agent too: the window note separately, since the style
+                // note hides it in `background_note`.
+                if let Some(note) = self.state().ok().and_then(|s| {
+                    let mut notes: Vec<&str> = Vec::new();
+                    for k in ["background_note", "window_note"] {
+                        if let Some(n) = s["status"][k].as_str().filter(|n| !n.is_empty()) {
+                            if !notes.contains(&n) {
+                                notes.push(n);
+                            }
+                        }
+                    }
+                    (!notes.is_empty()).then(|| notes.join("; "))
+                }) {
+                    if let Some(m) = out.as_object_mut() {
+                        m.insert("note".into(), note.into());
+                    }
+                }
+                Ok(BackendReply::Json(out))
             }
             C::UploadBackgroundImage { row, bytes } => {
                 let (code, out) = self.http(
@@ -481,6 +520,31 @@ fn overlay_out(pip: &Value) -> Value {
     v
 }
 
+/// The partial `set_background` names the window background (`full: window`
+/// or a `full_window` value).
+fn touches_window(p: &Value) -> bool {
+    p["full"] == "window" || p.get("full_window").is_some()
+}
+
+/// The title part of the engine's window label "<title> (<exe>)": the
+/// trailing " (xxx.exe)" is dropped, the rest (or the whole text when it has
+/// no such suffix) is kept, one line and short.
+fn window_title(label: &str) -> String {
+    if label.trim().is_empty() {
+        return "(untitled)".into();
+    }
+    let t = match label.rfind(" (") {
+        Some(i) if label.ends_with(')') && label[i..].to_lowercase().ends_with(".exe)") => {
+            &label[..i]
+        }
+        _ => label,
+    };
+    t.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(80)
+        .collect()
+}
+
 /// The engine's error body (`{"error": …}` or text) as a message.
 fn error_text(code: u16, body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
@@ -529,6 +593,40 @@ impl Backend for TrayBackend {
                     text.push_str(" (stream ended)");
                 }
                 self.ctl.balloon(text);
+            }
+            // A shared window: said always, with the title the engine resolved.
+            let short: String = agent.chars().take(40).collect();
+            match (&req, &r) {
+                // Decided from the engine's merged answer, so a partial that
+                // only names `window` counts too (balloon_for stays quiet for
+                // those; the generic balloon is sent here when it isn't window).
+                (BackendCall::SetBackground(p), Ok(BackendReply::Json(v))) if touches_window(p) => {
+                    if v["full"] == "window" {
+                        self.ctl.balloon(format!(
+                            "Agent \u{201c}{short}\u{201d} is sharing a window: {}",
+                            window_title(v["full_window"].as_str().unwrap_or(""))
+                        ));
+                    } else if running {
+                        self.ctl.balloon(format!(
+                            "Agent \u{201c}{short}\u{201d} changed your background"
+                        ));
+                    }
+                }
+                (BackendCall::LoadScene { .. }, Ok(BackendReply::Json(v)))
+                    if v["background_full"] == "window" =>
+                {
+                    // The scene answer has no title: ask for the current background.
+                    let label = self
+                        .get("/api/background")
+                        .ok()
+                        .and_then(|b| b["full_window"].as_str().map(String::from))
+                        .unwrap_or_default();
+                    self.ctl.balloon(format!(
+                        "Agent \u{201c}{short}\u{201d} is sharing a window: {}",
+                        window_title(&label)
+                    ));
+                }
+                _ => {}
             }
             // A scene may bring back a screen-sharing background: said always.
             if let (BackendCall::LoadScene { .. }, Ok(BackendReply::Json(v))) = (&req, &r) {
@@ -863,7 +961,156 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stream_uses_the_saved_destination_and_never_a_key() {
+    fn window_sharing_is_announced() {
+        const STATE: &[u8] = concat!(
+            r#"{"status":{"background_note":"Style set to full-height cut-out: "#,
+            r#"a full-frame background needs the person cut out","#,
+            r#""window_note":"Sound: everything playing in Google Chrome"}}"#
+        )
+        .as_bytes();
+        let (port, log) = fake_engine(|m, p, body| match (m, p) {
+            ("GET", "/api/state") => (200, STATE.to_vec()),
+            ("GET", "/api/windows") => (
+                200,
+                br#"[{"id":"123","title":"Twitch","exe":"chrome.exe"}]"#.to_vec(),
+            ),
+            ("GET", "/api/background") => (
+                200,
+                br#"{"full":"page","full_window":"","in_box":"room"}"#.to_vec(),
+            ),
+            ("POST", "/api/background") => {
+                if String::from_utf8_lossy(body).contains("nomatch") {
+                    (
+                        400,
+                        br#"{"error":"no window matches \"nomatch\""}"#.to_vec(),
+                    )
+                } else {
+                    (
+                        200,
+                        br#"{"full":"window","full_window":"Twitch - Home (chrome.exe)"}"#.to_vec(),
+                    )
+                }
+            }
+            _ => (200, b"{}".to_vec()),
+        });
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "running".into();
+        *tray.engine.lock() = Some((port, "tok".into()));
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(tray.clone(), d.path());
+        let r = b.call("Claude", BackendCall::ListWindows).unwrap();
+        assert!(matches!(r, BackendReply::Json(ref v) if v[0]["title"] == "Twitch"));
+        assert!(tray.balloons.lock().is_empty(), "listing is quiet");
+        let r = b
+            .call(
+                "Claude",
+                BackendCall::SetBackground(json!({ "full": "window", "full_window": "Twitch" })),
+            )
+            .unwrap();
+        let BackendReply::Json(v) = r else { panic!() };
+        assert_eq!(v["full_window"], "Twitch - Home (chrome.exe)");
+        // The style note and the window note both reach the agent.
+        assert_eq!(
+            v["note"],
+            "Style set to full-height cut-out: a full-frame background needs the person cut out; Sound: everything playing in Google Chrome"
+        );
+        assert_eq!(
+            tray.balloons.lock().as_slice(),
+            ["Agent “Claude” is sharing a window: Twitch - Home"]
+        );
+        assert!(log
+            .lock()
+            .iter()
+            .any(|r| r.1 == "/api/background" && r.0 == "POST"));
+        // An engine error reaches the agent intact, with no balloon.
+        let e = b
+            .call(
+                "Claude",
+                BackendCall::SetBackground(json!({ "full": "window", "full_window": "nomatch" })),
+            )
+            .unwrap_err();
+        assert!(e.contains("no window matches"), "{e}");
+        assert_eq!(tray.balloons.lock().len(), 1);
+    }
+
+    #[test]
+    fn window_only_partial_and_scene_load_are_announced() {
+        let bg_ok = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let bg = bg_ok.clone();
+        let (port, _log) = fake_engine(move |m, p, body| match (m, p) {
+            ("GET", "/api/state") => (200, br#"{"status":{}}"#.to_vec()),
+            ("GET", "/api/background") => {
+                if bg.load(std::sync::atomic::Ordering::SeqCst) {
+                    (
+                        200,
+                        br#"{"full":"window","full_window":"Notes (notepad.exe)"}"#.to_vec(),
+                    )
+                } else {
+                    (500, br#"{"error":"boom"}"#.to_vec())
+                }
+            }
+            ("POST", "/api/background") => {
+                if String::from_utf8_lossy(body).contains("blank") {
+                    (200, br#"{"full":"window","full_window":""}"#.to_vec())
+                } else {
+                    (
+                        200,
+                        br#"{"full":"window","full_window":"Other (chrome.exe)"}"#.to_vec(),
+                    )
+                }
+            }
+            ("POST", "/api/scenes/s/load") => (
+                200,
+                br#"{"added":[],"skipped":[],"background_full":"window"}"#.to_vec(),
+            ),
+            _ => (200, b"{}".to_vec()),
+        });
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "running".into();
+        *tray.engine.lock() = Some((port, "tok".into()));
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(tray.clone(), d.path());
+        // Only `window` given: still the sharing balloon, not the generic one.
+        b.call(
+            "Claude",
+            BackendCall::SetBackground(json!({ "full_window": "Other" })),
+        )
+        .unwrap();
+        // An empty resolved title gets a placeholder, never the agent's text.
+        b.call(
+            "Claude",
+            BackendCall::SetBackground(json!({ "full": "window", "full_window": "blank-7" })),
+        )
+        .unwrap();
+        let scene = || BackendCall::LoadScene {
+            id: "s".into(),
+            replace: true,
+        };
+        b.call("Claude", scene()).unwrap();
+        bg_ok.store(false, std::sync::atomic::Ordering::SeqCst);
+        b.call("Claude", scene()).unwrap();
+        assert_eq!(
+            tray.balloons.lock().as_slice(),
+            [
+                "Agent “Claude” is sharing a window: Other",
+                "Agent “Claude” is sharing a window: (untitled)",
+                "Agent “Claude” is sharing a window: Notes",
+                "Agent “Claude” is sharing a window: (untitled)",
+            ]
+        );
+    }
+
+    #[test]
+    fn window_title_drops_the_exe_suffix() {
+        assert_eq!(window_title(""), "(untitled)");
+        assert_eq!(window_title("Twitch - Home (chrome.exe)"), "Twitch - Home");
+        assert_eq!(window_title("Notes (draft) (Notepad.EXE)"), "Notes (draft)");
+        assert_eq!(window_title("Report (final)"), "Report (final)");
+        assert_eq!(window_title("a\nb"), "a b");
+    }
+
+    #[test]
+    fn start_stream_posts_sites() {
         let (port, log) = fake_engine(|m, p, _| match (m, p) {
             ("GET", "/api/state") => (200, state_json()),
             _ => (200, Vec::new()),
@@ -873,17 +1120,96 @@ pub(crate) mod tests {
         *tray.engine.lock() = Some((port, "tok".into()));
         let d = tempfile::tempdir().unwrap();
         let b = backend(tray.clone(), d.path());
-        b.call("Claude", BackendCall::StartStream).unwrap();
+        b.call(
+            "Claude",
+            BackendCall::StartStream {
+                sites: Some(vec!["twitch".into()]),
+            },
+        )
+        .unwrap();
+        b.call("Claude", BackendCall::StartStream { sites: None })
+            .unwrap();
         let log = log.lock();
-        let r = log.iter().find(|r| r.1 == "/api/stream/start").unwrap();
-        let body: Value = serde_json::from_slice(&r.2).unwrap();
+        let bodies: Vec<Value> = log
+            .iter()
+            .filter(|r| r.1 == "/api/stream/start")
+            .map(|r| serde_json::from_slice(&r.2).unwrap())
+            .collect();
         assert_eq!(
-            body,
-            json!({ "url": "rtmp://a.rtmp.youtube.com/live2", "key": "", "remember": false })
+            bodies,
+            vec![
+                json!({ "sites": { "youtube": { "on": false }, "twitch": { "on": true } } }),
+                json!({ "sites": {} }),
+            ]
         );
         assert_eq!(
             tray.balloons.lock().as_slice(),
-            ["Agent “Claude” started your stream"]
+            [
+                "Agent “Claude” started your stream",
+                "Agent “Claude” started your stream"
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_key_message_reaches_the_agent() {
+        let (port, _log) = fake_engine(|m, p, _| match (m, p) {
+            ("POST", "/api/stream/start") => (500, b"Twitch has no stream key".to_vec()),
+            _ => (200, state_json()),
+        });
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "running".into();
+        *tray.engine.lock() = Some((port, "tok".into()));
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(tray, d.path());
+        let e = b
+            .call("Claude", BackendCall::StartStream { sites: None })
+            .unwrap_err();
+        assert!(e.contains("Twitch has no stream key"), "{e}");
+    }
+
+    #[test]
+    fn stop_stream_sites_and_set_sites_post_to_sites() {
+        let (port, log) = fake_engine(|_, _, _| (200, b"{}".to_vec()));
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "running".into();
+        *tray.engine.lock() = Some((port, "tok".into()));
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(tray, d.path());
+        b.call(
+            "A",
+            BackendCall::StopStream {
+                sites: Some(vec!["twitch".into()]),
+            },
+        )
+        .unwrap();
+        b.call(
+            "A",
+            BackendCall::SetStreamSites {
+                youtube: Some(true),
+                twitch: None,
+            },
+        )
+        .unwrap();
+        b.call("A", BackendCall::StopStream { sites: None })
+            .unwrap();
+        let log = log.lock();
+        let posts: Vec<(&str, Value)> = log
+            .iter()
+            .map(|r| {
+                (
+                    r.1.as_str(),
+                    serde_json::from_slice(&r.2).unwrap_or(Value::Null),
+                )
+            })
+            .collect();
+        assert_eq!(
+            posts,
+            vec![
+                ("/api/stream/sites", json!({ "twitch": { "on": false } })),
+                ("/api/stream/sites", json!({ "youtube": { "on": true } })),
+                ("/api/stream/stop", json!({})),
+            ]
         );
     }
 

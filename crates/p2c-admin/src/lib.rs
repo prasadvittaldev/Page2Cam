@@ -10,7 +10,8 @@ mod tray;
 
 pub use api::{
     AudioSettings, BackgroundDto, Controls, CropDto, GpuInfo, Health, ImageRow, InputEvent,
-    KeyAction, MouseBtn, NavAction, Overlays, PipDto, ScreenDto, Status, StreamRequest, UpdateInfo,
+    KeyAction, MouseBtn, NavAction, Overlays, PipDto, ScreenDto, SiteRequest, SiteStatusDto,
+    SitesRequest, Status, StreamRequest, UpdateInfo, WindowDto,
 };
 pub use input::{map_preview, normalize_url};
 pub use preview::{encode_snapshot, PreviewSink};

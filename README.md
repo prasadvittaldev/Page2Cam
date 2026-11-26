@@ -40,7 +40,7 @@ You run it from a simple control page on your own computer, or you just ask your
   - **Box**: your webcam in a small box that you can move and resize anywhere on the page.
   - **Cut-out small**: just you, with your room removed, standing at the bottom of the page.
   - **Cut-out full**: like a Teams background, except the background is the live website.
-- **Change the background**: a picture, a colour, a YouTube video, your blurred room, or **one of your screens**, live.
+- **Change the background**: a picture, a colour, a YouTube video, your blurred room, **one of your screens**, or **one application window** (a game, a video player, a browser) with that app's sound, live.
 - **48 ready-made graphics** you fill in: name badges and lower thirds, countdowns, agendas, polls, charts, QR codes, product cards, release notes, code cards and more. Their values change live.
 - **Make your own**: save your own graphics as templates, and save a whole look (graphics, background, webcam) as a **scene** you can bring back with one click.
 
@@ -48,7 +48,8 @@ You run it from a simple control page on your own computer, or you just ask your
 
 - **Show a website as your camera**, and click, scroll and type in it from the control page while people are watching.
 - **Add overlays on top of everything**: titles, a scrolling ticker, animated charts, pictures and video clips.
-- **Go live on YouTube** with the same picture, and choose the sound: the website's, your microphone, or both, each with its own volume.
+- **Go live on YouTube and Twitch at the same time** with the same picture (tick one or both), and choose the sound: the website's (or the shared window's), your microphone, or both, each with its own volume.
+- **Share one window with its sound**: put a game or a reaction video behind you and stream it; only that window is shown, never the rest of the screen.
 - **Choose the cut-out quality**: **Quality** gives cleaner edges around your hair, **Fast** runs smoothly on any computer. If your computer can't keep up with Quality, Page2Cam switches to Fast by itself so your video stays smooth.
 
 ### 3. Agentic Control
@@ -173,7 +174,7 @@ Overlays come back hidden when Page2Cam starts again, so nothing appears in a ca
 Agents act without asking, so the tray shows a notification when one starts or stops Page2Cam or your stream, or shares your screen, and the **Agents** panel on the control page lists every change. Untick **Allow agents** to switch it off. Details for developers: [`docs/agent-api.md`](docs/agent-api.md).
 
 ### What agents can do for you
-Agents get a built-in guide with playbooks for 24 kinds of users and 48 ready-made graphics (lower thirds, timers, agendas, charts, polls, QR codes, product cards, code and release-notes cards…) whose values change live. Just say who you are and what you're doing:
+Agents get a built-in guide with playbooks for 25 kinds of users and 48 ready-made graphics (lower thirds, timers, agendas, charts, polls, QR codes, product cards, code and release-notes cards…) whose values change live. Just say who you are and what you're doing:
 
 - **Creators:** *"Set me up for my game stream: starting-soon card with a 5-minute countdown, then my handles in a corner."* *"I'm teaching a yoga class: interval timer, 40 seconds on, 20 off, 8 rounds."*
 - **Business:** *"I'm hosting a webinar on our Q4 plans: agenda on the right, highlight item 2 now."* *"Live shopping: show the headphones card at 79 euros, 7 left, offer ends at 20:00."*

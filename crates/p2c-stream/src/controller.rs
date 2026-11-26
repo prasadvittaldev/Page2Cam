@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,7 +13,10 @@ use p2c_compositor::{FrameSink, Output};
 use p2c_core::{Frame, Nv12Frame, Slot};
 use parking_lot::Mutex;
 
-use crate::{ffmpeg_args, redact, Encoder, StreamConfig};
+use crate::fanout::{pump, supervise, ChildSlot, SenderCtx, Taps};
+use crate::{
+    encoder_args, overall, redact_all, Destination, Encoder, Site, SiteState, StreamConfig,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamState {
@@ -89,18 +92,75 @@ impl FrameSink for StreamSink {
     }
 }
 
+/// One site's sender supervisor.
+struct SiteRun {
+    dest: Destination,
+    stop: Arc<AtomicBool>,
+    child: ChildSlot,
+    state: Arc<Mutex<SiteState>>,
+    thread: JoinHandle<()>,
+}
+
+impl SiteRun {
+    /// Stop the supervisor and its sender, and wait for them.
+    fn halt(self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(c) = self.child.lock().as_ref() {
+            let _ = c.lock().kill();
+        }
+        let _ = self.thread.join();
+    }
+}
+
 struct Running {
+    /// The encoder.
     child: Arc<Mutex<Child>>,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
-    /// What it was started with, for a retry with x264.
+    /// One per destination, in site order.
+    sites: Vec<SiteRun>,
+    taps: Taps,
+    next_tap: Arc<AtomicU64>,
+    /// What it was started with, for a retry with x264 (destinations kept
+    /// up to date by `set_destinations`).
     cfg: StreamConfig,
     ffmpeg: PathBuf,
     /// Which start this is (a retry only replaces the run that failed).
     generation: u64,
 }
 
-/// Starts/stops one ffmpeg RTMP publish at a time.
+/// Every site, in the order states and messages list them.
+const ALL_SITES: [Site; 2] = [Site::YouTube, Site::Twitch];
+
+fn site_order(s: Site) -> usize {
+    ALL_SITES.iter().position(|&x| x == s).unwrap_or(usize::MAX)
+}
+
+/// One destination per site (the first wins), in site order.
+fn dedup(mut d: Vec<Destination>) -> Vec<Destination> {
+    let mut seen = Vec::new();
+    d.retain(|x| {
+        let new = !seen.contains(&x.site);
+        seen.push(x.site);
+        new
+    });
+    d.sort_by_key(|x| site_order(x.site));
+    d
+}
+
+fn check_destinations(d: &[Destination]) -> anyhow::Result<()> {
+    anyhow::ensure!(!d.is_empty(), "Choose YouTube and/or Twitch.");
+    for x in d {
+        anyhow::ensure!(
+            !x.url.trim().is_empty(),
+            "enter the {} server URL",
+            x.site.label()
+        );
+    }
+    Ok(())
+}
+
+/// One encoder ffmpeg, fanned out to a sender ffmpeg per site.
 pub struct StreamController {
     inner: Arc<Inner>,
 }
@@ -109,7 +169,12 @@ struct Inner {
     mixer: Mixer,
     slot: VideoSlot,
     active: Arc<AtomicBool>,
+    /// `Idle` or `Error` when stopped; `Connecting` while running (the
+    /// shown state then comes from the sites).
     state: Arc<Mutex<StreamState>>,
+    /// States of the running sites, in site order (after an automatic stop:
+    /// the sites that ended in error).
+    site_states: Mutex<Vec<(Site, Arc<Mutex<SiteState>>)>>,
     running: Mutex<Option<Running>>,
     /// Used by the next `start` (a live stream keeps the one it began with).
     encoder: Mutex<Encoder>,
@@ -127,6 +192,7 @@ impl StreamController {
                 slot: VideoSlot::new(),
                 active: Arc::new(AtomicBool::new(false)),
                 state: Arc::new(Mutex::new(StreamState::Idle)),
+                site_states: Mutex::new(Vec::new()),
                 running: Mutex::new(None),
                 encoder: Mutex::new(Encoder::X264),
                 x264_pinned: Mutex::new(None),
@@ -157,11 +223,35 @@ impl StreamController {
         self.inner.x264_pinned.lock().clone()
     }
 
+    /// The overall state: idle, the error that stopped the stream, or while
+    /// running the sites combined (`overall`).
     pub fn state(&self) -> StreamState {
-        self.inner.state.lock().clone()
+        let base = self.inner.state.lock().clone();
+        if base != StreamState::Connecting {
+            return base;
+        }
+        overall(&self.inner.running_sites(), None).0
     }
 
-    pub fn start(&self, cfg: StreamConfig, ffmpeg: &Path) -> anyhow::Result<()> {
+    /// Every site with its state (`Idle` when it isn't streaming).
+    pub fn sites(&self) -> Vec<(Site, SiteState)> {
+        let running = self.inner.running_sites();
+        ALL_SITES
+            .iter()
+            .map(|&s| {
+                let st = running
+                    .iter()
+                    .find(|(x, _)| *x == s)
+                    .map(|(_, st)| st.clone())
+                    .unwrap_or(SiteState::Idle);
+                (s, st)
+            })
+            .collect()
+    }
+
+    pub fn start(&self, mut cfg: StreamConfig, ffmpeg: &Path) -> anyhow::Result<()> {
+        cfg.destinations = dedup(cfg.destinations);
+        check_destinations(&cfg.destinations)?;
         self.stop();
         let mut running = self.inner.running.lock();
         match Inner::launch(&self.inner, cfg, ffmpeg) {
@@ -176,29 +266,128 @@ impl StreamController {
         }
     }
 
+    /// Change the sites while running: senders start for new sites and stop
+    /// for removed ones (a changed server or key restarts that site). An
+    /// empty list stops the stream. Does nothing while idle.
+    pub fn set_destinations(&self, d: Vec<Destination>) -> anyhow::Result<()> {
+        if d.is_empty() {
+            if self.inner.running.lock().is_some() {
+                self.stop();
+            }
+            return Ok(());
+        }
+        let d = dedup(d);
+        check_destinations(&d)?;
+        let mut running = self.inner.running.lock();
+        let Some(r) = running.as_mut() else {
+            return Ok(());
+        };
+        let same = |a: &Destination, b: &Destination| a.url == b.url && a.key == b.key;
+        let (keep, gone): (Vec<SiteRun>, Vec<SiteRun>) = std::mem::take(&mut r.sites)
+            .into_iter()
+            .partition(|s| d.iter().any(|x| x.site == s.dest.site && same(x, &s.dest)));
+        for s in gone {
+            tracing::info!("{} sender stopped", s.dest.site.label());
+            s.halt();
+        }
+        r.sites = keep;
+        let keys: Vec<String> = d.iter().map(|x| x.key.clone()).collect();
+        for x in &d {
+            if !r.sites.iter().any(|s| s.dest.site == x.site) {
+                let s = Inner::start_site(&self.inner, r, x.clone(), keys.clone());
+                r.sites.push(s);
+            }
+        }
+        r.sites.sort_by_key(|s| site_order(s.dest.site));
+        r.cfg.destinations = d;
+        self.inner.publish_sites(r);
+        // The sites left may all be in error already.
+        let generation = r.generation;
+        drop(running);
+        if let (StreamState::Error(m), true) = overall(&self.inner.running_sites(), None) {
+            self.inner.fail(generation, m);
+        }
+        Ok(())
+    }
+
     pub fn stop(&self) {
         let Some(r) = self.inner.running.lock().take() else {
             return;
         };
         self.inner.halt(r);
+        self.inner.site_states.lock().clear();
         *self.inner.state.lock() = StreamState::Idle;
+    }
+
+    /// Test hook: running encoder processes (0 or 1).
+    #[doc(hidden)]
+    pub fn encoder_count(&self) -> usize {
+        self.inner.running.lock().as_ref().map_or(0, |r| {
+            usize::from(matches!(r.child.lock().try_wait(), Ok(None)))
+        })
+    }
+
+    /// Test hook: running sender processes.
+    #[doc(hidden)]
+    pub fn sender_count(&self) -> usize {
+        self.inner.running.lock().as_ref().map_or(0, |r| {
+            r.sites
+                .iter()
+                .filter(|s| {
+                    s.child
+                        .lock()
+                        .as_ref()
+                        .is_some_and(|c| matches!(c.lock().try_wait(), Ok(None)))
+                })
+                .count()
+        })
+    }
+
+    /// Test hook: kill the encoder process (as if it crashed).
+    #[doc(hidden)]
+    pub fn kill_encoder(&self) {
+        if let Some(r) = self.inner.running.lock().as_ref() {
+            let _ = r.child.lock().kill();
+        }
     }
 }
 
 impl Inner {
-    /// Start ffmpeg and its writer threads (the caller stores the result).
+    fn running_sites(&self) -> Vec<(Site, SiteState)> {
+        self.site_states
+            .lock()
+            .iter()
+            .map(|(s, st)| (*s, st.lock().clone()))
+            .collect()
+    }
+
+    fn publish_sites(&self, r: &Running) {
+        *self.site_states.lock() = r
+            .sites
+            .iter()
+            .map(|s| (s.dest.site, s.state.clone()))
+            .collect();
+    }
+
+    /// Start the encoder, the fan-out and a sender per destination (the
+    /// caller stores the result).
     fn launch(inner: &Arc<Inner>, mut cfg: StreamConfig, ffmpeg: &Path) -> anyhow::Result<Running> {
-        anyhow::ensure!(!cfg.url.trim().is_empty(), "enter the stream server URL");
+        check_destinations(&cfg.destinations)?;
+        let keys: Vec<String> = cfg.destinations.iter().map(|d| d.key.clone()).collect();
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
         let listener = TcpListener::bind("127.0.0.1:0").context("opening the audio socket")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         cfg.encoder = *inner.encoder.lock();
-        let args = ffmpeg_args(&cfg, port);
-        tracing::info!("starting ffmpeg: {}", redact(&args.join(" "), &cfg.key));
+        let args = encoder_args(&cfg, port);
+        tracing::info!(
+            "starting the encoder: ffmpeg {}",
+            redact_all(&args.join(" "), &key_refs)
+        );
         let mut cmd = Command::new(ffmpeg);
         cmd.args(&args)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(windows)]
         {
@@ -211,8 +400,13 @@ impl Inner {
                 ffmpeg.display()
             )
         })?;
-        let stdin = child.stdin.take().context("ffmpeg stdin")?;
-        let stderr = child.stderr.take().context("ffmpeg stderr")?;
+        let (Some(stdin), Some(stdout), Some(stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("ffmpeg pipes missing");
+        };
         let child = Arc::new(Mutex::new(child));
         let stop = Arc::new(AtomicBool::new(false));
         let generation = inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -242,25 +436,83 @@ impl Inner {
                 write_audio(listener, mixer, stop, t0, skip)
             }));
         }
+        let taps: Taps = Arc::default();
         {
-            let (state, stop, key) = (inner.state.clone(), stop.clone(), cfg.key.clone());
+            let taps = taps.clone();
+            threads.push(thread("p2c-stream-fanout", move || pump(stdout, taps)));
+        }
+        {
+            let (state, stop, keys) = (inner.state.clone(), stop.clone(), keys.clone());
             let (weak, encoder) = (Arc::downgrade(inner), cfg.encoder);
             threads.push(thread("p2c-stream-log", move || {
-                let lines = watch_stderr(stderr, &state, &key);
-                ended(&lines, &state, &stop, encoder, weak, generation);
+                let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+                let mut encoding = false;
+                let lines = watch_stderr(stderr, &keys, || encoding = true);
+                ended(&lines, encoding, &state, &stop, encoder, weak, generation);
             }));
         }
-        Ok(Running {
+        let mut r = Running {
             child,
             stop,
             threads,
+            sites: Vec::new(),
+            taps,
+            next_tap: Arc::new(AtomicU64::new(0)),
             cfg,
             ffmpeg: ffmpeg.to_path_buf(),
             generation,
-        })
+        };
+        for d in r.cfg.destinations.clone() {
+            let s = Inner::start_site(inner, &r, d, keys.clone());
+            r.sites.push(s);
+        }
+        inner.publish_sites(&r);
+        Ok(r)
     }
 
-    /// Stop a run: its threads end and ffmpeg is killed.
+    /// Start the sender supervisor of one destination.
+    fn start_site(
+        inner: &Arc<Inner>,
+        r: &Running,
+        dest: Destination,
+        keys: Vec<String>,
+    ) -> SiteRun {
+        let stop = Arc::new(AtomicBool::new(false));
+        let child: ChildSlot = Arc::default();
+        let state = Arc::new(Mutex::new(SiteState::Connecting));
+        let (weak, generation) = (Arc::downgrade(inner), r.generation);
+        let ctx = SenderCtx {
+            site: dest.site,
+            target: dest.target(),
+            keys,
+            ffmpeg: r.ffmpeg.clone(),
+            taps: r.taps.clone(),
+            next_tap: r.next_tap.clone(),
+            stop_all: r.stop.clone(),
+            stop: stop.clone(),
+            child: child.clone(),
+            state: state.clone(),
+            on_error: Box::new(move || {
+                if let Some(inner) = weak.upgrade() {
+                    let _ = std::thread::Builder::new()
+                        .name("p2c-stream-check".into())
+                        .spawn(move || inner.stop_if_all_failed(generation));
+                }
+            }),
+        };
+        let thread = thread(&format!("p2c-stream-{}", dest.site.as_str()), move || {
+            supervise(ctx)
+        });
+        SiteRun {
+            dest,
+            stop,
+            child,
+            state,
+            thread,
+        }
+    }
+
+    /// Stop a run: its threads end and every ffmpeg is killed.
     fn halt(&self, r: Running) {
         r.stop.store(true, Ordering::SeqCst);
         self.active.store(false, Ordering::Relaxed);
@@ -269,9 +521,45 @@ impl Inner {
             let _ = c.kill();
             let _ = c.wait();
         }
+        for s in r.sites {
+            s.halt();
+        }
         for t in r.threads {
             let _ = t.join();
         }
+    }
+
+    /// Stop run `generation` by itself (the encoder died, or every site
+    /// failed), keeping `why` as the state and the sites in error.
+    fn fail(&self, generation: u64, why: String) {
+        let mut running = self.running.lock();
+        let Some(r) = running.take_if(|r| r.generation == generation) else {
+            return;
+        };
+        *self.state.lock() = StreamState::Error(why.clone());
+        self.halt(r);
+        // Pruned before the run lock goes: a start right after must not
+        // have its fresh sites pruned (lock order: running, site_states).
+        self.site_states
+            .lock()
+            .retain(|(_, s)| matches!(*s.lock(), SiteState::Error(_)));
+        drop(running);
+        tracing::warn!("stream stopped: {why}");
+    }
+
+    /// A site went to error: when every site has, stop the stream.
+    fn stop_if_all_failed(self: Arc<Inner>, generation: u64) {
+        let msg = {
+            let running = self.running.lock();
+            if running.as_ref().is_none_or(|r| r.generation != generation) {
+                return;
+            }
+            match overall(&self.running_sites(), None) {
+                (StreamState::Error(m), true) => m,
+                _ => return,
+            }
+        };
+        self.fail(generation, msg);
     }
 
     /// The hardware encoder of run `generation` failed to open: start the
@@ -289,7 +577,10 @@ impl Inner {
         *self.encoder.lock() = Encoder::X264;
         match Inner::launch(&self, cfg, &ffmpeg) {
             Ok(r) => *running = Some(r),
-            Err(e) => *self.state.lock() = StreamState::Error(format!("{e:#}")),
+            Err(e) => {
+                self.site_states.lock().clear();
+                *self.state.lock() = StreamState::Error(format!("{e:#}"));
+            }
         }
     }
 }
@@ -434,12 +725,13 @@ fn write_audio(
     }
 }
 
-/// Track ffmpeg's progress: "frame=" stats mean we're live; exit means error.
-/// Returns ffmpeg's last log lines (redacted) once it has exited.
-fn watch_stderr(
-    stderr: std::process::ChildStderr,
-    state: &Mutex<StreamState>,
-    key: &str,
+/// Read an ffmpeg's stderr until it closes: `on_progress` runs for each
+/// "frame=" stats line (encoding / publishing). Returns the last log lines,
+/// redacted with every key.
+pub(crate) fn watch_stderr(
+    stderr: impl Read,
+    keys: &[&str],
+    mut on_progress: impl FnMut(),
 ) -> Vec<String> {
     const KEEP: usize = 20;
     let mut reader = BufReader::new(stderr);
@@ -452,16 +744,12 @@ fn watch_stderr(
         if n == 0 {
             break;
         }
-        let line = redact(String::from_utf8_lossy(&buf).trim(), key);
+        let line = redact_all(String::from_utf8_lossy(&buf).trim(), keys);
         if line.is_empty() {
             continue;
         }
         if line.starts_with("frame=") || line.contains(" frame=") {
-            let mut s = state.lock();
-            if *s == StreamState::Connecting {
-                tracing::info!("stream is live");
-                *s = StreamState::Live;
-            }
+            on_progress();
         } else {
             tracing::debug!(target: "ffmpeg", "{line}");
             lines.push_back(line);
@@ -473,12 +761,13 @@ fn watch_stderr(
     lines.into()
 }
 
-/// ffmpeg exited (stderr closed). Unless we stopped it: a hardware encoder
-/// that failed to open before the stream went live is retried once with
-/// x264 (on another thread: the retry joins this one); anything else is
-/// shown as the stream's error.
+/// The encoder exited (stderr closed). Unless we stopped it: a hardware
+/// encoder that failed to open before encoding anything is retried once
+/// with x264 (on another thread: the retry joins this one); anything else
+/// stops the whole stream with the encoder's error (also on another thread).
 fn ended(
     lines: &[String],
+    encoding: bool,
     state: &Mutex<StreamState>,
     stop: &AtomicBool,
     encoder: Encoder,
@@ -488,8 +777,7 @@ fn ended(
     if stop.load(Ordering::SeqCst) {
         return;
     }
-    let connecting = *state.lock() == StreamState::Connecting;
-    if crate::retry_with_x264(encoder, connecting, lines) {
+    if crate::retry_with_x264(encoder, !encoding, lines) {
         if let Some(inner) = inner.upgrade() {
             let detail = lines.last().map(String::as_str).unwrap_or_default();
             tracing::warn!(%encoder, "the {encoder} encoder failed to open: {detail}");
@@ -502,12 +790,28 @@ fn ended(
             }
         }
     }
-    let why = lines
-        .last()
+    let why = encoder_failure(lines);
+    tracing::warn!("the encoder ended: {why}");
+    *state.lock() = StreamState::Error(why.clone());
+    if let Some(inner) = inner.upgrade() {
+        let _ = std::thread::Builder::new()
+            .name("p2c-stream-fail".into())
+            .spawn(move || inner.fail(generation, why));
+    }
+}
+
+/// Why the encoder ended: its last error line (a killed ffmpeg's last line
+/// is often just stream info), else a plain note.
+fn encoder_failure(lines: &[String]) -> String {
+    lines
+        .iter()
+        .rev()
+        .find(|l| {
+            let l = l.to_ascii_lowercase();
+            l.contains("error") || l.contains("failed") || l.contains("invalid")
+        })
         .cloned()
-        .unwrap_or_else(|| "ffmpeg exited".to_string());
-    tracing::warn!("stream ended: {why}");
-    *state.lock() = StreamState::Error(why);
+        .unwrap_or_else(|| "the encoder stopped unexpectedly".to_string())
 }
 
 fn read_until_any(r: &mut impl BufRead, out: &mut Vec<u8>) -> usize {
@@ -745,8 +1049,11 @@ mod tests {
             p2c_audio::MixSettings::default(),
         ));
         let cfg = crate::StreamConfig {
-            url: "rtmp://127.0.0.1:1/live".into(),
-            key: "k".into(),
+            destinations: vec![crate::Destination {
+                site: crate::Site::YouTube,
+                url: "rtmp://127.0.0.1:1/live".into(),
+                key: "k".into(),
+            }],
             width: 64,
             height: 36,
             fps: 30,
@@ -761,14 +1068,17 @@ mod tests {
         assert!(matches!(c.state(), StreamState::Error(_)));
     }
 
-    /// A fake ffmpeg that appends its arguments to `log`, then fails: with
-    /// "No capable devices found" for h264_nvenc, else with a network error.
+    /// A fake ffmpeg. As a sender (no `pipe:1` output) it just fails. As the
+    /// encoder it appends its arguments to `log`, then fails: with "No
+    /// capable devices found" for h264_nvenc, else with a network error.
     fn fake_ffmpeg(dir: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
         #[cfg(windows)]
         {
             let p = dir.join("ffmpeg.cmd");
             let script = format!(
                 "@echo off\r\n\
+                 echo %* | findstr /c:\"pipe:1\" >nul\r\n\
+                 if errorlevel 1 exit /b 1\r\n\
                  echo %* >> \"{}\"\r\n\
                  echo %* | findstr /c:\"h264_nvenc\" >nul\r\n\
                  if not errorlevel 1 (\r\n\
@@ -789,6 +1099,7 @@ mod tests {
             let p = dir.join("ffmpeg");
             let script = format!(
                 "#!/bin/sh\n\
+                 case \"$*\" in *pipe:1*) ;; *) exit 1;; esac\n\
                  echo \"$*\" >> '{}'\n\
                  case \"$*\" in *h264_nvenc*)\n\
                  echo '[h264_nvenc @ 0x1] No capable devices found' >&2\n\
@@ -827,8 +1138,11 @@ mod tests {
             p2c_audio::MixSettings::default(),
         ));
         let cfg = crate::StreamConfig {
-            url: "rtmp://127.0.0.1:1/live".into(),
-            key: "k".into(),
+            destinations: vec![crate::Destination {
+                site: crate::Site::YouTube,
+                url: "rtmp://127.0.0.1:1/live".into(),
+                key: "k".into(),
+            }],
             width: 64,
             height: 36,
             fps: 30,
@@ -863,6 +1177,57 @@ mod tests {
         assert_eq!(r.len(), 3, "{r:?}");
         assert!(r[2].contains("libx264"), "{}", r[2]);
         c.stop();
+    }
+
+    fn test_mixer() -> Mixer {
+        p2c_audio::Mixer::new(
+            p2c_core::AudioRing::new(100),
+            p2c_core::AudioRing::new(100),
+            p2c_audio::MixSettings::default(),
+        )
+    }
+
+    fn cfg_with(destinations: Vec<crate::Destination>) -> StreamConfig {
+        StreamConfig {
+            destinations,
+            width: 64,
+            height: 36,
+            fps: 30,
+            video_kbps: 500,
+            pix_fmt: "bgra",
+            encoder: Encoder::X264,
+        }
+    }
+
+    /// The real ffmpeg if there is one (refused starts never run it).
+    fn ffmpeg_or_skip() -> PathBuf {
+        crate::find_ffmpeg().unwrap_or_else(|| PathBuf::from("ffmpeg"))
+    }
+
+    #[test]
+    fn encoder_failure_is_the_last_error_line() {
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            encoder_failure(&l(&[
+                "[tcp @ 1] Connection to tcp://127.0.0.1:5 failed: refused",
+                "    encoder         : Lavc61.19.101 aac",
+            ])),
+            "[tcp @ 1] Connection to tcp://127.0.0.1:5 failed: refused"
+        );
+        assert_eq!(
+            encoder_failure(&l(&["    encoder         : Lavc61.19.101 aac"])),
+            "the encoder stopped unexpectedly"
+        );
+    }
+
+    #[test]
+    fn no_destination_is_refused() {
+        let c = StreamController::new(test_mixer());
+        let e = c
+            .start(cfg_with(vec![]), &ffmpeg_or_skip())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "Choose YouTube and/or Twitch.");
     }
 
     #[test]

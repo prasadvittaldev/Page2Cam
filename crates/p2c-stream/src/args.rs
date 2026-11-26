@@ -6,10 +6,8 @@ use p2c_core::{CHANNELS, SAMPLE_RATE};
 
 #[derive(Clone, Debug)]
 pub struct StreamConfig {
-    /// RTMP server URL (e.g. rtmp://a.rtmp.youtube.com/live2).
-    pub url: String,
-    /// Stream key, appended as the last path segment. Empty: `url` is complete.
-    pub key: String,
+    /// Where the stream goes (one sender per destination).
+    pub destinations: Vec<Destination>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -20,6 +18,62 @@ pub struct StreamConfig {
     /// H.264 encoder. `StreamController::start` replaces this with the
     /// controller's own (`set_encoder`).
     pub encoder: Encoder,
+}
+
+/// A streaming site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Site {
+    YouTube,
+    Twitch,
+}
+
+impl Site {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Site::YouTube => "youtube",
+            Site::Twitch => "twitch",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Site::YouTube => "YouTube",
+            Site::Twitch => "Twitch",
+        }
+    }
+}
+
+/// One RTMP destination.
+#[derive(Clone)]
+pub struct Destination {
+    pub site: Site,
+    /// RTMP server URL (e.g. rtmp://a.rtmp.youtube.com/live2).
+    pub url: String,
+    /// Stream key, appended as the last path segment. Empty: `url` is complete.
+    pub key: String,
+}
+
+/// Never prints the key (`****` when there is one).
+impl std::fmt::Debug for Destination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Destination")
+            .field("site", &self.site)
+            .field("url", &redact(&self.url, &self.key))
+            .field("key", &if self.key.is_empty() { "" } else { "****" })
+            .finish()
+    }
+}
+
+impl Destination {
+    /// Full publish URL. Contains the key: never log it unredacted.
+    pub fn target(&self) -> String {
+        if self.key.is_empty() {
+            self.url.clone()
+        } else {
+            format!("{}/{}", self.url.trim_end_matches('/'), self.key)
+        }
+    }
 }
 
 /// H.264 encoder behind the RTMP stream.
@@ -157,18 +211,9 @@ pub fn probe(ffmpeg: &Path, e: Encoder, fps: u32, video_kbps: u32) -> bool {
     }
 }
 
-/// Full publish URL. Contains the key: never log it unredacted.
-pub fn target_url(cfg: &StreamConfig) -> String {
-    if cfg.key.is_empty() {
-        cfg.url.clone()
-    } else {
-        format!("{}/{}", cfg.url.trim_end_matches('/'), cfg.key)
-    }
-}
-
-/// ffmpeg command line: raw BGRA or NV12 video on stdin, f32le stereo audio from a TCP
-/// socket we listen on, H.264 + AAC in FLV to the RTMP target.
-pub fn ffmpeg_args(cfg: &StreamConfig, audio_port: u16) -> Vec<String> {
+/// Encoder command line: raw BGRA or NV12 video on stdin, f32le stereo audio from a TCP
+/// socket we listen on, H.264 + AAC as MPEG-TS on stdout (the senders copy it to RTMP).
+pub fn encoder_args(cfg: &StreamConfig, audio_port: u16) -> Vec<String> {
     let mut a: Vec<String> = [
         "-hide_banner",
         "-loglevel",
@@ -250,11 +295,33 @@ pub fn ffmpeg_args(cfg: &StreamConfig, audio_port: u16) -> Vec<String> {
             .map(String::from),
         );
     }
-    for s in ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-f", "flv"] {
+    for s in ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"] {
         a.push(s.to_string());
     }
-    a.push(target_url(cfg));
+    a.extend(["-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"].map(String::from));
     a
+}
+
+/// Sender command line: MPEG-TS on stdin copied unchanged into FLV for one RTMP target.
+pub fn sender_args(target: &str) -> Vec<String> {
+    [
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-stats_period",
+        "1",
+        "-f",
+        "mpegts",
+        "-i",
+        "pipe:0",
+        "-c",
+        "copy",
+        "-f",
+        "flv",
+        target,
+    ]
+    .map(String::from)
+    .to_vec()
 }
 
 /// ffmpeg stderr text that means the video encoder could not be opened
@@ -292,6 +359,14 @@ pub fn redact(s: &str, key: &str) -> String {
     }
 }
 
+/// `redact` for every non-empty key, longest first (a key inside another
+/// key must not leave part of the longer one visible).
+pub fn redact_all(s: &str, keys: &[&str]) -> String {
+    let mut keys = keys.to_vec();
+    keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+    keys.iter().fold(s.to_string(), |acc, k| redact(&acc, k))
+}
+
 /// `ffmpeg(.exe)` next to our executable, else on PATH.
 pub fn find_ffmpeg() -> Option<PathBuf> {
     let name = if cfg!(windows) {
@@ -315,9 +390,16 @@ mod tests {
     use super::*;
 
     fn cfg() -> StreamConfig {
-        StreamConfig {
+        cfg_with(vec![Destination {
+            site: Site::YouTube,
             url: "rtmp://a.rtmp.youtube.com/live2/".into(),
             key: "abcd-1234-secret".into(),
+        }])
+    }
+
+    fn cfg_with(destinations: Vec<Destination>) -> StreamConfig {
+        StreamConfig {
+            destinations,
             width: 1920,
             height: 1080,
             fps: 30,
@@ -327,8 +409,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn debug_hides_the_keys() {
+        let c = cfg_with(vec![
+            Destination {
+                site: Site::YouTube,
+                url: "rtmp://a.rtmp.youtube.com/live2".into(),
+                key: "yt-secret-key".into(),
+            },
+            Destination {
+                site: Site::Twitch,
+                url: "rtmp://live.twitch.tv/app".into(),
+                key: String::new(),
+            },
+        ]);
+        let d = format!("{c:?}");
+        assert!(!d.contains("yt-secret-key"), "{d}");
+        assert!(
+            d.contains("****") && d.contains("rtmp://live.twitch.tv/app"),
+            "{d}"
+        );
+        assert!(!format!("{:?}", c.destinations[0]).contains("yt-secret-key"));
+    }
+
     fn with(e: Encoder) -> String {
-        ffmpeg_args(
+        encoder_args(
             &StreamConfig {
                 encoder: e,
                 video_kbps: 6000,
@@ -433,7 +538,7 @@ mod tests {
     #[test]
     fn nv12_output_is_tagged_bt709_limited() {
         for e in [Encoder::Nvenc, Encoder::Qsv, Encoder::Amf, Encoder::X264] {
-            let s = ffmpeg_args(
+            let s = encoder_args(
                 &StreamConfig {
                     pix_fmt: "nv12",
                     encoder: e,
@@ -467,7 +572,7 @@ mod tests {
             let opts = encoder_options(e, 30, 6000);
             let mut want = vec![e.ffmpeg_name().to_string()];
             want.extend(opts.iter().cloned());
-            let stream = ffmpeg_args(
+            let stream = encoder_args(
                 &StreamConfig {
                     encoder: e,
                     video_kbps: 6000,
@@ -542,7 +647,7 @@ mod tests {
             pix_fmt: "nv12",
             ..cfg()
         };
-        let s = ffmpeg_args(&c, 50123).join(" ");
+        let s = encoder_args(&c, 50123).join(" ");
         assert!(
             s.contains(
                 "-f rawvideo -pix_fmt nv12 -colorspace bt709 -color_range tv \
@@ -551,7 +656,7 @@ mod tests {
             "{s}"
         );
         // BGRA input is not tagged (it is RGB) and otherwise identical.
-        let b = ffmpeg_args(&cfg(), 50123).join(" ");
+        let b = encoder_args(&cfg(), 50123).join(" ");
         assert!(
             !b.contains("-colorspace") && !b.contains("-color_range"),
             "{b}"
@@ -570,8 +675,8 @@ mod tests {
     }
 
     #[test]
-    fn ffmpeg_args_shape() {
-        let a = ffmpeg_args(&cfg(), 50123);
+    fn encoder_args_shape() {
+        let a = encoder_args(&cfg(), 50123);
         let s = a.join(" ");
         assert_eq!(s.matches("-analyzeduration 0").count(), 2, "{s}");
         assert!(
@@ -589,21 +694,71 @@ mod tests {
         assert!(s.contains("-c:a aac -b:a 128k"), "{s}");
         // YouTube recommends B-frames; zerolatency would turn them off.
         assert!(!s.contains("zerolatency") && s.contains("-bf 2"), "{s}");
-        assert_eq!(
-            a.last().unwrap(),
-            "rtmp://a.rtmp.youtube.com/live2/abcd-1234-secret"
-        );
-        assert_eq!(a[a.len() - 2], "flv");
+        assert_eq!(a.last().unwrap(), "pipe:1");
+        assert!(!s.contains("abcd-1234-secret"), "{s}");
     }
 
     #[test]
-    fn target_url_without_key_is_unchanged() {
-        let c = StreamConfig {
+    fn target_without_key_is_unchanged() {
+        let d = Destination {
+            site: Site::YouTube,
             key: String::new(),
             url: "rtmp://host/app/k".into(),
-            ..cfg()
         };
-        assert_eq!(target_url(&c), "rtmp://host/app/k");
+        assert_eq!(d.target(), "rtmp://host/app/k");
+    }
+
+    #[test]
+    fn encoder_writes_mpegts_to_stdout() {
+        let a = encoder_args(&cfg_with(vec![]), 5000);
+        let n = a.len();
+        assert_eq!(
+            &a[n - 5..],
+            ["-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
+        );
+        assert!(!a.iter().any(|s| s.starts_with("rtmp")));
+        assert!(
+            a.windows(2).any(|w| w == ["-g", "60"]),
+            "2 s keyframes at 30 fps"
+        );
+    }
+
+    #[test]
+    fn sender_copies_to_flv() {
+        let t = "rtmp://live.twitch.tv/app/live_123";
+        let a = sender_args(t);
+        assert!(a.ends_with(&["-c", "copy", "-f", "flv", t].map(String::from)));
+        assert!(a.windows(2).any(|w| w == ["-i", "pipe:0"]));
+    }
+
+    #[test]
+    fn every_key_is_redacted() {
+        let s = "push rtmp://a/live2/yt-key-1 and rtmp://b/app/live_tw_2";
+        let r = redact_all(s, &["yt-key-1", "live_tw_2", ""]);
+        assert!(!r.contains("yt-key-1") && !r.contains("live_tw_2"));
+    }
+
+    #[test]
+    fn a_key_inside_another_key_leaves_nothing_visible() {
+        let s = "rtmp://a/live2/abc and rtmp://b/app/abcdef";
+        for keys in [["abc", "abcdef"], ["abcdef", "abc"]] {
+            let r = redact_all(s, &keys);
+            assert_eq!(r, "rtmp://a/live2/**** and rtmp://b/app/****", "{keys:?}");
+        }
+    }
+
+    #[test]
+    fn destination_target_appends_the_key() {
+        let d = Destination {
+            site: Site::Twitch,
+            url: "rtmp://live.twitch.tv/app/".into(),
+            key: "k".into(),
+        };
+        assert_eq!(d.target(), "rtmp://live.twitch.tv/app/k");
+        assert_eq!(
+            (Site::Twitch.as_str(), Site::Twitch.label()),
+            ("twitch", "Twitch")
+        );
     }
 
     #[test]

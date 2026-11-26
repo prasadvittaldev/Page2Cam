@@ -56,9 +56,21 @@ pub enum BackendCall {
     /// `{x, y, w, h}` in 0..1 of the camera picture.
     SetCrop(Value),
     ResetCrop,
-    /// To the saved destination with the saved key.
-    StartStream,
-    StopStream,
+    /// `sites` ("youtube" | "twitch"): exactly these on; `None` = the sites
+    /// ticked in the control page. Keys are the saved ones, never passed.
+    StartStream {
+        sites: Option<Vec<String>>,
+    },
+    /// `sites`: stop only these (the stream ends when none is left); `None`
+    /// = stop everything.
+    StopStream {
+        sites: Option<Vec<String>>,
+    },
+    /// Tick/untick sites (live while streaming, saved while stopped).
+    SetStreamSites {
+        youtube: Option<bool>,
+        twitch: Option<bool>,
+    },
     /// Partial `AudioSettings`.
     SetAudio(Value),
     ListGpus,
@@ -66,6 +78,8 @@ pub enum BackendCall {
     InstallUpdate,
     /// The monitors for the screen background.
     ListScreens,
+    /// The open application windows for the window background.
+    ListWindows,
     GetBackground,
     /// Partial `BackgroundDto`.
     SetBackground(Value),
@@ -125,6 +139,7 @@ impl BackendCall {
                 | BackendCall::ListGpus
                 | BackendCall::GetBackground
                 | BackendCall::ListScreens
+                | BackendCall::ListWindows
                 | BackendCall::ListLayers
                 | BackendCall::Guide(_)
                 | BackendCall::ListTemplates(_)
@@ -137,6 +152,24 @@ impl BackendCall {
     pub fn summary(&self) -> String {
         match self {
             BackendCall::OpenUrl(u) => format!("open {}", crate::redact(u)),
+            BackendCall::StartStream { sites } => match sites {
+                Some(s) => format!("start stream to {}", s.join(" and ")),
+                None => "start stream".into(),
+            },
+            BackendCall::StopStream { sites } => match sites {
+                Some(s) => format!("stop stream to {}", s.join(" and ")),
+                None => "stop stream".into(),
+            },
+            BackendCall::SetStreamSites { youtube, twitch } => {
+                let on = |n: &str, v: &Option<bool>| {
+                    v.map(|b| format!("{n} {}", if b { "on" } else { "off" }))
+                };
+                let parts: Vec<String> = [on("YouTube", youtube), on("Twitch", twitch)]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                format!("stream sites: {}", parts.join(", "))
+            }
             BackendCall::Navigate(n) => format!("navigate {}", n.as_str()),
             BackendCall::ShowPage { name, html } => {
                 format!("show page {name:?} ({} KB)", html.len().div_ceil(1024))
@@ -265,8 +298,17 @@ Choosing box while a full-frame background other than page is on returns the bac
             &json!({ "type": "object", "required": ["x", "y", "w", "h"], "additionalProperties": false,
                 "properties": { "x": unit, "y": unit, "w": unit, "h": unit } })),
         t("reset_crop", "Use the whole webcam picture again.".into(), &none),
-        t("start_stream", "Start streaming (e.g. YouTube Live) to the destination and key saved in the control page. You cannot pass or read the key.".into(), &none),
-        t("stop_stream", "Stop the stream.".into(), &none),
+        t("start_stream", "Start streaming to YouTube and/or Twitch with the destinations and keys saved in the control page. Give 'sites' to choose (those on, the others off); without it the sites ticked in the control page are used. Keys are never passed to you and cannot be read; if a site has no key the error says so and the user must enter it in the control page.".into(),
+            &json!({ "type": "object", "additionalProperties": false,
+                "properties": { "sites": { "type": "array", "minItems": 1, "uniqueItems": true,
+                    "items": { "enum": ["youtube", "twitch"] } } } })),
+        t("stop_stream", "Stop the stream (all sites), or only the sites in 'sites' (the stream ends when none is left).".into(),
+            &json!({ "type": "object", "additionalProperties": false,
+                "properties": { "sites": { "type": "array", "minItems": 1, "uniqueItems": true,
+                    "items": { "enum": ["youtube", "twitch"] } } } })),
+        t("set_stream_sites", "Tick or untick YouTube and Twitch as stream destinations. While streaming it adds or drops that site live; while stopped it is saved for the next start. Give only what changes. Keys are never passed to you; a missing key must be entered by the user in the control page.".into(),
+            &json!({ "type": "object", "additionalProperties": false, "minProperties": 1,
+                "properties": { "youtube": { "type": "boolean" }, "twitch": { "type": "boolean" } } })),
         t("set_audio", "Stream audio: microphone and page sound on/off and gain (0-4, 1 = unchanged). Give only what changes. Audio goes to the stream only.".into(),
             &json!({ "type": "object", "additionalProperties": false, "minProperties": 1,
                 "properties": { "mic_on": { "type": "boolean" }, "mic_gain": { "type": "number", "minimum": 0, "maximum": 4 },
@@ -278,18 +320,20 @@ Choosing box while a full-frame background other than page is on returns the bac
         t("install_update", "Download, verify and install the newer Page2Cam version on offer (status shows it). Page2Cam restarts.".into(), &none),
         t("get_background", "The background choices: full frame, in box, colours, YouTube video, refined edges, uploaded pictures.".into(), &none),
         t("set_background", "Choose what is behind the person. Give only what changes. \
-full = full-frame background: page (the web page), image (the uploaded picture), colour, youtube (a video link, plays full screen looping with sound on the stream only), screen (a whole monitor, live: everything on it is shown to the call or stream; screen = an id from list_screens, default the primary monitor), blurred-room (the webcam's room, blurred). \
+full = full-frame background: page (the web page), image (the uploaded picture), colour, youtube (a video link, plays full screen looping with sound on the stream only), screen (a whole monitor, live: everything on it is shown to the call or stream; screen = an id from list_screens, default the primary monitor), window (one application window, live, with that app's sound on the stream; window = an id from list_windows or title text (exact title, else a unique case-insensitive substring); a browser window's sound is everything playing in that browser, so suggest a separate browser for the content; games need borderless or windowed mode), blurred-room (the webcam's room, blurred). \
 Any full other than page switches the overlay style to cutout_full. \
 in_box = behind the person inside the box (box style): room, blur, image, colour. \
 refined_edges = smoother hair and shoulder edges (a little more GPU/CPU).".into(),
             &json!({ "type": "object", "additionalProperties": false, "minProperties": 1,
                 "properties": {
-                    "full": { "enum": ["page", "image", "colour", "youtube", "screen", "blurred-room"] },
+                    "full": { "enum": ["page", "image", "colour", "youtube", "screen", "window", "blurred-room"] },
                     "full_colour": colour, "youtube": { "type": "string", "maxLength": 2048 },
                     "screen": { "type": "string", "maxLength": 64 },
+                    "window": { "type": "string", "maxLength": 200 },
                     "in_box": { "enum": ["room", "blur", "image", "colour"] },
                     "box_colour": colour, "refined_edges": { "type": "boolean" } } })),
         t("list_screens", "The monitors the screen background can show: id, index, name, resolution, primary. Fails where screen capture is not available (Windows only).".into(), &none),
+        t("list_windows", "The open application windows the window background can show (title, app, exe, size, minimized, browser). Titles can be private: list them only when the user asked for a window background.".into(), &none),
         t("upload_background_image", "Upload the picture for a background row (full = full frame, box = in box) and show it there. \
 Give a local file path or base64 file bytes (PNG, JPEG or WebP, up to 20 MB).".into(),
             &json!({ "type": "object", "required": ["row"], "additionalProperties": false,
@@ -757,6 +801,32 @@ fn bool_arg(args: &Args, k: &str) -> Result<Option<bool>, String> {
     }
 }
 
+/// `sites`: a non-empty list of "youtube" / "twitch" (duplicates dropped).
+fn sites_arg(args: &Args) -> Result<Option<Vec<String>>, String> {
+    const MSG: &str = "sites must be a list of youtube and/or twitch";
+    match args.get("sites") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(a)) if !a.is_empty() && a.len() <= 8 => {
+            let mut out: Vec<String> = Vec::new();
+            for v in a {
+                let s = v.as_str().ok_or(MSG)?;
+                let s = one_of(
+                    "sites",
+                    s.trim().to_ascii_lowercase().as_str(),
+                    &["youtube", "twitch"],
+                )
+                .map_err(|_| MSG.to_string())?
+                .to_string();
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err(MSG.into()),
+    }
+}
+
 fn one_of<'a>(k: &str, v: &'a str, allowed: &[&str]) -> Result<&'a str, String> {
     if allowed.contains(&v) {
         Ok(v)
@@ -804,12 +874,31 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
         "get_overlay" => return simple(C::GetOverlay),
         "get_crop" => return simple(C::GetCrop),
         "reset_crop" => return simple(C::ResetCrop),
-        "start_stream" => return simple(C::StartStream),
-        "stop_stream" => return simple(C::StopStream),
+        "start_stream" => (|| {
+            only(args, &["sites"])?;
+            Ok(C::StartStream {
+                sites: sites_arg(args)?,
+            })
+        })(),
+        "stop_stream" => (|| {
+            only(args, &["sites"])?;
+            Ok(C::StopStream {
+                sites: sites_arg(args)?,
+            })
+        })(),
+        "set_stream_sites" => (|| {
+            only(args, &["youtube", "twitch"])?;
+            let (youtube, twitch) = (bool_arg(args, "youtube")?, bool_arg(args, "twitch")?);
+            if youtube.is_none() && twitch.is_none() {
+                return Err("give youtube and/or twitch (true or false)".into());
+            }
+            Ok(C::SetStreamSites { youtube, twitch })
+        })(),
         "list_gpus" => return simple(C::ListGpus),
         "install_update" => return simple(C::InstallUpdate),
         "get_background" => return simple(C::GetBackground),
         "list_screens" => return simple(C::ListScreens),
+        "list_windows" => return simple(C::ListWindows),
         "open_url" => (|| {
             only(args, &["url"])?;
             let u = req_str(args, "url")?.trim();
@@ -950,6 +1039,7 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
                     "full_colour",
                     "youtube",
                     "screen",
+                    "window",
                     "in_box",
                     "box_colour",
                     "refined_edges",
@@ -966,6 +1056,7 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
                         "colour",
                         "youtube",
                         "screen",
+                        "window",
                         "blurred-room",
                     ],
                 )?;
@@ -987,6 +1078,13 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
                     return Err("screen must be an id from list_screens".into());
                 }
                 m.insert("full_screen".into(), s.into());
+            }
+            if let Some(w) = str_arg(args, "window")? {
+                let w = w.trim();
+                if w.len() > 200 {
+                    return Err("window must be an id from list_windows or title text".into());
+                }
+                m.insert("full_window".into(), w.into());
             }
             if let Some(b) = str_arg(args, "in_box")? {
                 let b = one_of("in_box", b, &["room", "blur", "image", "colour"])?;

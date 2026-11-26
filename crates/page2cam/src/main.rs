@@ -15,6 +15,7 @@ mod restart;
 mod screen;
 mod update;
 mod video;
+mod window;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -430,6 +431,8 @@ fn run() -> anyhow::Result<i32> {
     let mic_ring = AudioRing::new(500);
     // Overlay-layer sound (videos, YouTube): part of page sound.
     let overlay_ring = AudioRing::new(500);
+    // The window background's process sound: part of page sound too.
+    let window_ring = AudioRing::new(500);
     let mixer = Mixer::new(
         page_ring.clone(),
         mic_ring.clone(),
@@ -438,7 +441,8 @@ fn run() -> anyhow::Result<i32> {
             ..MixSettings::default()
         },
     )
-    .with_overlay(overlay_ring.clone());
+    .with_overlay(overlay_ring.clone())
+    .with_window(window_ring.clone());
     let stream = StreamController::new(mixer.clone());
     sinks.push(Box::new(stream.sink()));
 
@@ -598,7 +602,10 @@ fn run() -> anyhow::Result<i32> {
         bg_base: OnceLock::new(),
         data_dir,
         thumbs: background::ThumbCache::new(Box::new(|url| p2c_update::fetch_small(url, 8))),
-        stream,
+        stream: Box::new(stream),
+        keys: Box::new(app::Keyring),
+        stream_sites: Mutex::new(app::StreamSites::from_config(&cfg)),
+        stream_ops: Mutex::new(()),
         mixer,
         mic_ring,
         mic: Mutex::new(None),
@@ -611,7 +618,6 @@ fn run() -> anyhow::Result<i32> {
             OutputFormat::Nv12 => "nv12",
             OutputFormat::Bgra => "bgra",
         },
-        stream_url: Mutex::new(cfg.rtmp_url.clone()),
         width: cfg.width,
         height: cfg.height,
         fps: cfg.fps,
@@ -640,6 +646,11 @@ fn run() -> anyhow::Result<i32> {
         screen: screen::ScreenShare::new(Box::new(screen::RealScreens {
             max_fps: cfg.fps,
             out: screen_out(gpu_video.as_ref()),
+        })),
+        window: window::WindowShare::new(Box::new(window::RealWindows {
+            max_fps: cfg.fps,
+            out: screen_out(gpu_video.as_ref()),
+            ring: window_ring,
         })),
         page_paused: Arc::default(),
         output_frame: preview.clone(),
@@ -724,6 +735,25 @@ fn run() -> anyhow::Result<i32> {
                     }
                     if round % 120 == 20 {
                         helpers.sweep();
+                    }
+                    round = round.wrapping_add(1);
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            })?
+    };
+
+    // The window background's checks, every 2 s, on their own thread: a
+    // window start (borderless request, audio client) can block for seconds,
+    // which must not stall the 250 ms loop above (mic delay, health).
+    let window_thread = {
+        let (app, quit) = (app.clone(), quit.clone());
+        std::thread::Builder::new()
+            .name("p2c-window".into())
+            .spawn(move || {
+                let mut round = 0u32;
+                while !quit.load(std::sync::atomic::Ordering::Relaxed) {
+                    if round.is_multiple_of(8) {
+                        app.tick_window(std::time::Instant::now());
                     }
                     round = round.wrapping_add(1);
                     std::thread::sleep(std::time::Duration::from_millis(250));
@@ -873,6 +903,9 @@ fn run() -> anyhow::Result<i32> {
     tracing::info!("shutting down");
     quit.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = delay_thread.join();
+    let _ = window_thread.join();
+    // Stop the window capture and its sound.
+    app.window.sync(None, None);
     if let Some(seg) = &app.segmenter {
         seg.request_stop();
     }

@@ -23,8 +23,14 @@ pub struct Config {
     pub admin_port: u16,
     /// Open the admin page in the default browser at startup.
     pub open_admin: bool,
-    /// RTMP server pre-filled in the admin page.
+    /// YouTube's RTMP server (the name predates Twitch; it stays YouTube's).
     pub rtmp_url: String,
+    /// Twitch's RTMP server.
+    pub twitch_url: String,
+    /// Stream to YouTube (ticked in the control page).
+    pub stream_youtube: bool,
+    /// Stream to Twitch.
+    pub stream_twitch: bool,
     /// Stream video bitrate in kbit/s.
     pub video_kbps: u32,
     /// Webcam overlay style: box | cutout-small | cutout-full
@@ -38,7 +44,7 @@ pub struct Config {
     /// Webcam crop as [x, y, width, height], fractions of the camera frame.
     /// A list of the wrong length or with NaN means no crop.
     pub webcam_crop: Vec<f32>,
-    /// Full-frame background: page | image | colour | youtube | screen | blurred-room
+    /// Full-frame background: page | image | colour | youtube | screen | window | blurred-room
     pub background: String,
     /// The full-frame picture (re-encoded copy in the data folder).
     pub background_image: String,
@@ -48,6 +54,9 @@ pub struct Config {
     pub background_youtube: String,
     /// Full-frame screen: a monitor id (`DISPLAY1`); empty = the primary one.
     pub background_screen: String,
+    /// Full-frame window: its executable (`chrome.exe`) and exact title.
+    pub background_window_exe: String,
+    pub background_window_title: String,
     /// In-box background (Box style): room | blur | image | colour
     pub box_background: String,
     pub box_background_image: String,
@@ -72,6 +81,9 @@ impl Default for Config {
             admin_port: 8765,
             open_admin: true,
             rtmp_url: "rtmp://a.rtmp.youtube.com/live2".into(),
+            twitch_url: "rtmp://live.twitch.tv/app".into(),
+            stream_youtube: true,
+            stream_twitch: false,
             video_kbps: 6000,
             overlay_style: "box".into(),
             cutout_engine: "quality".into(),
@@ -83,6 +95,8 @@ impl Default for Config {
             background_colour: "#0b63f0".into(),
             background_youtube: String::new(),
             background_screen: String::new(),
+            background_window_exe: String::new(),
+            background_window_title: String::new(),
             box_background: "room".into(),
             box_background_image: String::new(),
             box_background_colour: "#0b63f0".into(),
@@ -554,6 +568,31 @@ mod tests {
             ..Config::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn stream_site_defaults() {
+        let c = Config::default();
+        assert_eq!(
+            (
+                c.rtmp_url.as_str(),
+                c.twitch_url.as_str(),
+                c.stream_youtube,
+                c.stream_twitch
+            ),
+            (
+                "rtmp://a.rtmp.youtube.com/live2",
+                "rtmp://live.twitch.tv/app",
+                true,
+                false
+            )
+        );
+        // An older file (YouTube only) still loads, `rtmp_url` still YouTube's.
+        let c: Config = toml::from_str("rtmp_url = \"rtmp://my.server/live\"\n").unwrap();
+        assert_eq!(c.rtmp_url, "rtmp://my.server/live");
+        assert!(c.stream_youtube && !c.stream_twitch);
+        let c: Config = toml::from_str("stream_twitch = true\nstream_youtube = false\n").unwrap();
+        assert!(!c.stream_youtube && c.stream_twitch);
     }
 
     #[test]

@@ -58,16 +58,108 @@ pub enum InputEvent {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub struct StreamRequest {
-    /// RTMP server URL, e.g. rtmp://a.rtmp.youtube.com/live2
-    pub url: String,
-    /// Stream key. Empty: use the key saved in the OS keyring.
+/// One site's part of a stream request. Never log it (it may hold a key).
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SiteRequest {
+    /// Tick (`true`) or untick the site; `None` leaves the saved tick.
+    #[serde(default)]
+    pub on: Option<bool>,
+    /// Stream key. Empty: the key entered earlier in this run, else the one
+    /// saved in the OS keyring.
     #[serde(default)]
     pub key: String,
-    /// Save the key in the OS keyring.
+    /// Save `key` in the OS keyring.
     #[serde(default)]
     pub remember: bool,
+    /// The site's RTMP server; `None` (or empty) leaves the saved one.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+impl std::fmt::Debug for SiteRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiteRequest")
+            .field("on", &self.on)
+            .field("key", &if self.key.is_empty() { "" } else { "****" })
+            .field("remember", &self.remember)
+            .field("url", &self.url)
+            .finish()
+    }
+}
+
+/// Changes to the stream sites; a missing site is left as saved.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SitesRequest {
+    pub youtube: Option<SiteRequest>,
+    pub twitch: Option<SiteRequest>,
+}
+
+/// `POST /api/stream/start`: `{sites: {youtube?, twitch?}}` (an empty
+/// `sites` starts the saved ticks), or the older `{url, key, remember}`,
+/// which means YouTube ticked with that server and key.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum StreamRequest {
+    Sites {
+        sites: SitesRequest,
+    },
+    Legacy {
+        url: String,
+        #[serde(default)]
+        key: String,
+        #[serde(default)]
+        remember: bool,
+    },
+}
+
+/// Never prints the key (`****` when there is one).
+impl std::fmt::Debug for StreamRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamRequest::Sites { sites } => {
+                f.debug_struct("Sites").field("sites", sites).finish()
+            }
+            StreamRequest::Legacy { url, key, remember } => f
+                .debug_struct("Legacy")
+                .field("url", url)
+                .field("key", &if key.is_empty() { "" } else { "****" })
+                .field("remember", remember)
+                .finish(),
+        }
+    }
+}
+
+impl StreamRequest {
+    pub fn normalized(self) -> SitesRequest {
+        match self {
+            StreamRequest::Sites { sites } => sites,
+            StreamRequest::Legacy { url, key, remember } => SitesRequest {
+                youtube: Some(SiteRequest {
+                    on: Some(true),
+                    key,
+                    remember,
+                    url: Some(url),
+                }),
+                twitch: None,
+            },
+        }
+    }
+}
+
+/// One stream site in the status (keys never appear).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteStatusDto {
+    /// "youtube" | "twitch"
+    pub site: String,
+    /// "idle" | "connecting" | "live" | "reconnecting (n)" | "error: <why>"
+    pub state: String,
+    /// Ticked for the stream (saved).
+    pub ticked: bool,
+    /// A key for this site is saved in the OS keyring.
+    pub has_saved_key: bool,
+    /// The site's RTMP server.
+    pub url: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -192,8 +284,14 @@ pub struct Status {
     pub webcam_aspect: f32,
     /// "idle" | "connecting" | "live" | "error: <why>"
     pub stream: String,
+    /// YouTube's server (for older clients; see `streams`).
     pub stream_url: String,
+    /// A YouTube key is saved (for older clients; see `streams`).
     pub has_saved_key: bool,
+    /// Every stream site, YouTube then Twitch.
+    pub streams: Vec<SiteStatusDto>,
+    /// A warning about the stream settings (Twitch's bitrate limit).
+    pub stream_note: Option<String>,
     /// "ok" | "none" | "error: <why>"
     pub mic: String,
     pub log_file: String,
@@ -230,6 +328,9 @@ pub struct Status {
     /// Why the chosen background isn't (fully) showing, or what was changed
     /// with it (e.g. "cut-out not ready"); "" when all is as chosen.
     pub background_note: String,
+    /// The window background's own note (not found, minimized, its sound),
+    /// also while `background_note` shows a more recent one; "" otherwise.
+    pub window_note: String,
     /// Agents may control Page2Cam (read from the tray). `None` without a tray.
     #[serde(default)]
     pub agents_allowed: Option<bool>,
@@ -287,7 +388,7 @@ pub struct UpdateInfo {
 /// Background choices as JSON (`GET`/`POST /api/background`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundDto {
-    /// "page" | "image" | "colour" | "youtube" | "screen" | "blurred-room"
+    /// "page" | "image" | "colour" | "youtube" | "screen" | "window" | "blurred-room"
     pub full: String,
     /// `#rrggbb` for "colour" (the last one chosen when reading).
     #[serde(default)]
@@ -299,6 +400,11 @@ pub struct BackgroundDto {
     /// index, or empty/"primary" (the last one chosen when reading).
     #[serde(default)]
     pub full_screen: Option<String>,
+    /// The window for "window": an id from `GET /api/windows` or title text
+    /// (exact, else a unique case-insensitive part). Reading:
+    /// `"<title> (<exe>)"` of the saved window (sending that back keeps it).
+    #[serde(default)]
+    pub full_window: Option<String>,
     /// "room" | "blur" | "image" | "colour"
     pub in_box: String,
     /// `#rrggbb` for an in-box "colour".
@@ -328,6 +434,23 @@ pub struct ScreenDto {
     pub primary: bool,
 }
 
+/// One application window for the window background (`GET /api/windows`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowDto {
+    /// The window handle (valid while the window lives).
+    pub id: u64,
+    pub title: String,
+    /// Executable file name (`chrome.exe`; empty when it can't be read).
+    pub exe: String,
+    /// The program's name (`Google Chrome`).
+    pub app: String,
+    pub width: u32,
+    pub height: u32,
+    pub minimized: bool,
+    /// A browser: its sound is everything playing in it.
+    pub browser: bool,
+}
+
 /// Which background picture (`?row=full|box`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -352,7 +475,13 @@ pub trait Controls: Overlays + Send + Sync + 'static {
     fn input(&self, ev: InputEvent);
     fn pip(&self) -> PipLayout;
     fn set_pip(&self, l: PipLayout);
-    fn start_stream(&self, req: StreamRequest) -> anyhow::Result<()>;
+    /// Start streaming to the ticked sites (the saved ticks merged with
+    /// `req`). Errors start nothing and never contain a key. May write the
+    /// settings and the keyring: call it off the async runtime.
+    fn start_stream(&self, req: SitesRequest) -> anyhow::Result<()>;
+    /// Change the saved ticks, servers or keys; while streaming, sites start
+    /// or stop at once. Errors change nothing. Call it off the async runtime.
+    fn set_stream_sites(&self, req: SitesRequest) -> anyhow::Result<()>;
     fn stop_stream(&self);
     fn audio(&self) -> AudioSettings;
     fn set_audio(&self, a: AudioSettings);
@@ -399,6 +528,11 @@ pub trait Controls: Overlays + Send + Sync + 'static {
     /// The monitors the screen background can show; an error where screen
     /// capture isn't available ("screen capture is Windows-only for now").
     fn screens(&self) -> Result<Vec<ScreenDto>, String>;
+    /// The windows the window background can show; an error where window
+    /// capture isn't available. May enumerate processes: call it off the runtime.
+    fn windows(&self) -> Result<Vec<WindowDto>, String> {
+        Err("window capture is Windows-only for now".into())
+    }
 }
 
 /// Overlay layers (titles, tickers, HTML, pictures, videos, YouTube) drawn
@@ -491,5 +625,76 @@ pub trait Overlays {
     /// Delete a scene.
     fn delete_scene(&self, _id: &str) -> anyhow::Result<()> {
         anyhow::bail!("scenes are not available")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> SitesRequest {
+        serde_json::from_str::<StreamRequest>(s)
+            .unwrap()
+            .normalized()
+    }
+
+    #[test]
+    fn legacy_stream_body_is_youtube_on() {
+        let r = parse(r#"{"url":"rtmp://x/live2","key":"k-1","remember":true}"#);
+        assert_eq!(
+            r,
+            SitesRequest {
+                youtube: Some(SiteRequest {
+                    on: Some(true),
+                    key: "k-1".into(),
+                    remember: true,
+                    url: Some("rtmp://x/live2".into()),
+                }),
+                twitch: None,
+            }
+        );
+        // The tray's body: no key, nothing remembered.
+        let r = parse(r#"{"url":"rtmp://x/live2","key":"","remember":false}"#);
+        assert_eq!(r.youtube.unwrap().on, Some(true));
+    }
+
+    #[test]
+    fn sites_stream_body() {
+        assert_eq!(parse(r#"{"sites":{}}"#), SitesRequest::default());
+        let r = parse(r#"{"sites":{"twitch":{"on":true,"key":"t"}}}"#);
+        assert_eq!(r.youtube, None);
+        let t = r.twitch.unwrap();
+        assert_eq!(
+            (t.on, t.key.as_str(), t.remember, t.url),
+            (Some(true), "t", false, None)
+        );
+        // A misspelt site is refused, not ignored.
+        assert!(serde_json::from_str::<StreamRequest>(r#"{"sites":{"kick":{}}}"#).is_err());
+    }
+
+    #[test]
+    fn site_request_debug_hides_the_key() {
+        let r = SiteRequest {
+            key: "secret-key".into(),
+            ..Default::default()
+        };
+        assert!(!format!("{r:?}").contains("secret-key"));
+    }
+
+    #[test]
+    fn stream_request_debug_hides_the_key() {
+        let r: StreamRequest = serde_json::from_str(
+            r#"{"url":"rtmp://a.rtmp.youtube.com/live2","key":"legacy-secret"}"#,
+        )
+        .unwrap();
+        let d = format!("{r:?}");
+        assert!(!d.contains("legacy-secret"), "{d}");
+        assert!(
+            d.contains("****") && d.contains("rtmp://a.rtmp.youtube.com/live2"),
+            "{d}"
+        );
+        let r: StreamRequest =
+            serde_json::from_str(r#"{"sites":{"twitch":{"key":"site-secret"}}}"#).unwrap();
+        assert!(!format!("{r:?}").contains("site-secret"));
     }
 }

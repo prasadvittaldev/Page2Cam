@@ -716,14 +716,19 @@ pub fn balloon_for(agent: &str, call: &BackendCall, running: bool) -> Option<Str
         C::Start if !running => format!("{agent} started Page2Cam"),
         C::Stop if running => format!("{agent} stopped Page2Cam"),
         C::ForceRestart => format!("{agent} restarted Page2Cam"),
-        C::StartStream => format!("{agent} started your stream"),
-        C::StopStream => format!("{agent} stopped your stream"),
+        C::StartStream { .. } => format!("{agent} started your stream"),
+        C::StopStream { .. } => format!("{agent} stopped your stream"),
         C::InstallUpdate => format!("{agent} is installing a Page2Cam update"),
         C::SetGpu(_) if running => format!("{agent} changed the GPU; Page2Cam restarts"),
         // The whole monitor goes to the call/stream: always said, also while
         // stopped (it shows from the next start).
         C::SetBackground(v) if v["full"] == "screen" => {
             format!("{agent} is sharing your screen")
+        }
+        // A shared window is announced by the backend once the engine has
+        // resolved its title.
+        C::SetBackground(v) if v["full"] == "window" || v.get("full_window").is_some() => {
+            return None
         }
         C::OpenUrl(_) | C::ShowPage { .. } | C::Navigate(_) if running => {
             format!("{agent} changed the page")
@@ -1169,7 +1174,7 @@ mod tests {
         // An agent can't make a balloon read like Page2Cam or Windows itself.
         let b = balloon_for(
             "Page2Cam: your camera is hacked, call 555",
-            &BackendCall::StartStream,
+            &BackendCall::StartStream { sites: None },
             true,
         )
         .unwrap();
@@ -1177,7 +1182,12 @@ mod tests {
             b.starts_with("Agent “Page2Cam: your camera is hacked"),
             "{b}"
         );
-        let long = balloon_for(&"x".repeat(100), &BackendCall::StopStream, true).unwrap();
+        let long = balloon_for(
+            &"x".repeat(100),
+            &BackendCall::StopStream { sites: None },
+            true,
+        )
+        .unwrap();
         assert_eq!(
             long,
             format!("Agent “{}” stopped your stream", "x".repeat(40))
@@ -1189,11 +1199,11 @@ mod tests {
         use BackendCall as C;
         let a = "Claude";
         assert_eq!(
-            balloon_for(a, &C::StartStream, true).as_deref(),
+            balloon_for(a, &C::StartStream { sites: None }, true).as_deref(),
             Some("Agent “Claude” started your stream")
         );
         assert_eq!(
-            balloon_for(a, &C::StopStream, true).as_deref(),
+            balloon_for(a, &C::StopStream { sites: None }, true).as_deref(),
             Some("Agent “Claude” stopped your stream")
         );
         assert_eq!(
@@ -1234,6 +1244,7 @@ mod tests {
             C::GetBackground,
             C::ListGpus,
             C::ListScreens,
+            C::ListWindows,
         ] {
             assert_eq!(balloon_for(a, &c, true), None, "{c:?}");
         }

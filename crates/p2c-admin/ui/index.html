@@ -372,6 +372,7 @@
         <button class="tile" data-bg-full="colour" aria-pressed="false" title="One colour"><span class="pv" id="bgFullSwatch"></span>Colour</button>
         <button class="tile" data-bg-full="youtube" aria-pressed="false" title="A YouTube video, full screen and looping"><span class="pv yt"><img id="bgYoutubeThumb" alt="" hidden></span>YouTube</button>
         <button class="tile" data-bg-full="screen" aria-pressed="false" title="One of your monitors, live"><span class="pv mon"></span>Screen</button>
+        <button class="tile" data-bg-full="window" aria-pressed="false" title="One application window, live"><span class="pv mon"></span>Window</button>
         <button class="tile" data-bg-full="blurred-room" aria-pressed="false" title="Your own room, blurred, full screen"><span class="pv blur"></span>Blurred room</button>
       </div>
       <div id="bgFullImageOpts" hidden>
@@ -391,6 +392,15 @@
           <select id="bgScreen" aria-label="Monitor to show"></select>
         </div>
         <p class="sub"><b>Everything on this monitor is shown</b> to your call or stream, live (notifications, other windows, the mouse pointer). Windows outlines a shared monitor in yellow.</p>
+      </div>
+      <div id="bgWindowOpts" hidden>
+        <div class="row">
+          <label for="window-pick">Window</label>
+          <select id="window-pick" aria-label="Window to show"></select>
+          <button class="btn" id="window-refresh" type="button">Refresh</button>
+        </div>
+        <div class="state" id="window-warn"></div>
+        <p class="sub"><b>Only that window is shown</b> to your call or stream, live (not the mouse pointer). Its sound goes to the stream only. Keep it open and not minimized; it can sit behind other windows.</p>
       </div>
       <div id="bgYoutubeOpts" hidden>
         <form class="row" id="bgYoutubeForm">
@@ -512,13 +522,29 @@
     </section>
 
     <section class="panel" aria-labelledby="h-stream">
-      <h2 id="h-stream">YouTube Live</h2>
-      <div class="row"><input type="text" id="rtmpUrl" aria-label="Server URL" spellcheck="false"></div>
-      <div class="row"><input type="password" id="streamKey" aria-label="Stream key" placeholder="Stream key" autocomplete="off"></div>
+      <h2 id="h-stream">Stream to</h2>
       <div class="row">
-        <label for="remember">Remember key on this PC</label>
-        <input type="checkbox" id="remember">
+        <input type="checkbox" id="site-youtube-on" aria-label="Stream to YouTube"><label for="site-youtube-on">YouTube</label>
+        <input type="password" id="site-youtube-key" aria-label="YouTube stream key" placeholder="Stream key" autocomplete="off">
       </div>
+      <div class="row">
+        <input type="checkbox" id="site-youtube-remember"><label for="site-youtube-remember">Remember YouTube key on this PC</label>
+      </div>
+      <div class="state" id="site-youtube-state" role="status"></div>
+      <div class="row">
+        <input type="checkbox" id="site-twitch-on" aria-label="Stream to Twitch"><label for="site-twitch-on">Twitch</label>
+        <input type="password" id="site-twitch-key" aria-label="Twitch stream key" placeholder="Stream key" autocomplete="off">
+      </div>
+      <div class="row">
+        <input type="checkbox" id="site-twitch-remember"><label for="site-twitch-remember">Remember Twitch key on this PC</label>
+      </div>
+      <div class="state" id="site-twitch-state" role="status"></div>
+      <details id="stream-advanced">
+        <summary>Advanced</summary>
+        <div class="row"><input type="text" id="site-youtube-url" aria-label="YouTube server URL" spellcheck="false"></div>
+        <div class="row"><input type="text" id="site-twitch-url" aria-label="Twitch server URL" spellcheck="false"></div>
+      </details>
+      <div class="state" id="stream-note" role="status"></div>
       <div class="row"><button class="btn primary" id="goLive" style="flex:1">Go live</button></div>
       <div class="state" id="streamState"></div>
     </section>
@@ -1012,6 +1038,9 @@
     $("bgYoutubeOpts").hidden = !(bg.full === "youtube" || ytEditing);
     $("bgScreenOpts").hidden = bg.full !== "screen";
     if (bg.full === "screen") loadScreens();
+    $("bgWindowOpts").hidden = !(bg.full === "window" || winEditing);
+    if (bg.full === "window" && !winLoaded) loadWindows();
+    else syncWindow();
     $("bgBoxImageOpts").hidden = bg.in_box !== "image";
     $("bgBoxColourOpts").hidden = bg.in_box !== "colour";
     $("refinedEdges").checked = bg.refined_edges;
@@ -1024,7 +1053,8 @@
     if (v === "image" && !bg.full_image) { $("bgFullImageFile").click(); return; }
     if (v === "youtube" && !bg.full_youtube) { ytEditing = true; syncBg(); $("bgYoutube").focus(); return; }
     if (v === "screen" && screensError) { bgMessage("bgErr", screensError); return; }
-    ytEditing = false;
+    if (v === "window") { chooseWindow(); return; }
+    ytEditing = false; winEditing = false;
     setBg({ full: v });
   });
   document.querySelectorAll("[data-bg-box]").forEach((b) => b.onclick = () => {
@@ -1078,23 +1108,138 @@
     else if (main) sel.value = main.value;
   }
   $("bgScreen").onchange = () => setBg({ full: "screen", full_screen: $("bgScreen").value });
+  // Application windows (GET /api/windows). Titles are private, so the list is
+  // fetched only when the Window choice is opened or refreshed, never on a poll.
+  let winEditing = false, winLoaded = false, winList = [], winSentId = "";
+  const winLabel = (w) => w.title + " (" + w.exe + ")";
+  async function loadWindows() {
+    try {
+      const r = await api("/api/windows");
+      if (!r.ok) { bgMessage("bgErr", await errorText(r)); return false; }
+      winList = await r.json();
+      winLoaded = true;
+      const sel = $("window-pick");
+      sel.replaceChildren(...winList.map((w) => new Option(
+        w.title + " — " + w.app + (w.minimized ? " (minimized)" : ""), String(w.id))));
+      syncWindow();
+      return true;
+    } catch { bgMessage("bgErr", "Page2Cam is not responding."); return false; }
+  }
+  function syncWindow() {
+    const sel = $("window-pick");
+    if (!winLoaded) { $("window-warn").textContent = ""; return; }
+    // The saved choice is a label; show it unless the user is picking.
+    // Selected by value (the id), never by index: the "not found" placeholder
+    // shifts the indexes. Of twins with the saved label, the one last picked.
+    if (bg && bg.full === "window" && bg.full_window && document.activeElement !== sel) {
+      const same = winList.filter((w) => winLabel(w) === bg.full_window);
+      const w = same.find((x) => String(x.id) === winSentId) || same[0];
+      const missing = sel.querySelector("option[data-missing]");
+      if (w) {
+        if (missing) missing.remove();
+        sel.value = String(w.id);
+      } else {
+        const text = bg.full_window + " — not found";
+        if (missing) missing.text = text;
+        else {
+          const o = new Option(text, "");
+          o.dataset.missing = "1"; o.disabled = true; sel.add(o, 0);
+        }
+        sel.selectedIndex = 0;
+      }
+    }
+    const w = winList.find((x) => String(x.id) === sel.value);
+    $("window-warn").textContent = w && w.browser
+      ? "Sound: everything playing in " + w.app + ". Use a separate browser for the content." : "";
+  }
+  async function chooseWindow() {
+    winEditing = true;
+    if (!(await loadWindows())) { winEditing = false; return; }
+    // A saved window resumes by itself (same program and exact title).
+    if (bg.full_window) { winEditing = false; await setBg({ full: "window" }); return; }
+    syncBg();
+    if (!winList.length) return;
+    // Nothing chosen yet: wait for the pick (like YouTube without a link).
+    $("window-pick").selectedIndex = -1; $("window-pick").focus();
+  }
+  $("window-pick").onchange = async () => {
+    const id = $("window-pick").value;
+    syncWindow();
+    if (!id) return;
+    winEditing = false;
+    winSentId = id;
+    await setBg({ full: "window", full_window: id });
+  };
+  $("window-refresh").onclick = async () => { await loadWindows(); syncBg(); };
   $("refinedEdges").onchange = () => setBg({ refined_edges: $("refinedEdges").checked });
   loadBg();
   loadScreens();
 
   // ---------- stream ----------
-  $("rtmpUrl").value = store.get("rtmpUrl", "rtmp://a.rtmp.youtube.com/live2");
+  const SITES = ["youtube", "twitch"];
+  // What a site's controls ask for. A typed key is sent once, then the box is cleared.
+  function siteBody(site) {
+    const o = { on: $("site-" + site + "-on").checked };
+    const url = $("site-" + site + "-url").value.trim();
+    if (url) o.url = url;
+    const key = $("site-" + site + "-key").value;
+    if (key) { o.key = key; o.remember = $("site-" + site + "-remember").checked; }
+    return o;
+  }
+  function clearKey(site) {
+    $("site-" + site + "-key").value = "";
+    $("site-" + site + "-remember").checked = false;
+  }
+  const unsaved = {}; // sites whose tick the server refused while stopped: keep the box, Go live carries it
+  let streamErrUntil = 0; // keep a request error visible for a few seconds
+  async function streamError(r) {
+    let m = "";
+    try { m = (await r.json()).error || ""; } catch { /* not JSON */ }
+    setState("streamState", "error: " + (m || "could not change the stream"));
+    streamErrUntil = Date.now() + 6000;
+  }
+  const isLive = () => !!state && /^(live|connecting)/.test(state.status.stream);
   $("goLive").onclick = async () => {
-    const live = state && /^(live|connecting)/.test(state.status.stream);
-    if (live) { await api("/api/stream/stop", {}); refresh(); return; }
-    store.set("rtmpUrl", $("rtmpUrl").value);
+    if (isLive()) { await api("/api/stream/stop", {}); refresh(); return; }
     $("goLive").disabled = true;
-    const r = await api("/api/stream/start", { url: $("rtmpUrl").value, key: $("streamKey").value, remember: $("remember").checked });
+    const sites = {};
+    SITES.forEach((s) => { sites[s] = siteBody(s); });
+    const r = await api("/api/stream/start", { sites });
     $("goLive").disabled = false;
-    if (!r.ok) { setState("streamState", "error: " + await r.text()); }
-    $("streamKey").value = "";
+    if (r.ok) SITES.forEach((s) => { clearKey(s); delete unsaved[s]; }); else await streamError(r);
     refresh();
   };
+  SITES.forEach((s) => {
+    $("site-" + s + "-on").onchange = async () => {
+      // Saved at once, stopped or live. While stopped a refusal (e.g. no key typed yet)
+      // only shows the error: the box stays as set and Go live carries it.
+      const live = isLive();
+      const r = await api("/api/stream/sites", { [s]: siteBody(s) });
+      if (r.ok) { clearKey(s); delete unsaved[s]; }
+      else {
+        await streamError(r);
+        if (!live) unsaved[s] = true;
+        else {
+          const d = ((state && state.status.streams) || []).find((x) => x.site === s);
+          $("site-" + s + "-on").checked = !!(d && d.ticked);
+        }
+      }
+      refresh();
+    };
+  });
+  function syncStreams(s, firstTime) {
+    const list = Array.isArray(s.streams) ? s.streams : [];
+    SITES.forEach((site) => {
+      const d = list.find((x) => x.site === site) || { state: "idle", ticked: false, has_saved_key: false, url: "" };
+      const on = $("site-" + site + "-on"), url = $("site-" + site + "-url");
+      if (firstTime || (!unsaved[site] && document.activeElement !== on)) on.checked = !!d.ticked;
+      if (d.url && (firstTime || document.activeElement !== url)) url.value = d.url;
+      $("site-" + site + "-key").placeholder = d.has_saved_key ? "●●●●●● (saved)" : "Stream key";
+      const txt = d.state === "idle" ? "" : d.state === "live" ? "Live" : d.state === "connecting" ? "Connecting…" : d.state;
+      setState("site-" + site + "-state", txt);
+    });
+    setState("stream-note", s.stream_note || "");
+  }
 
   // ---------- audio ----------
   let audio = null;
@@ -1196,25 +1341,24 @@
       if (first || document.activeElement !== $("url")) $("url").value = s.url;
       syncCropFromState(s);
       if (!dragging) { pip = state.pip; syncControls(); layoutPip(); }
+      syncStreams(s, first);
       if (first) {
         audio = state.audio;
         $("pageOn").checked = audio.page_on; $("pageGain").value = Math.round(audio.page_gain * 100);
         $("micOn").checked = audio.mic_on; $("micGain").value = Math.round(audio.mic_gain * 100);
-        if (s.stream_url) $("rtmpUrl").value = s.stream_url;
         first = false;
       }
-      $("streamKey").placeholder = s.has_saved_key ? "Stream key (saved key will be used)" : "Stream key";
       const live = s.stream === "live", connecting = s.stream === "connecting";
       $("goLive").textContent = live ? "End stream" : connecting ? "Cancel" : "Go live";
       $("goLive").classList.toggle("live", live);
-      setState("streamState", live ? "Live on " + s.stream_url : connecting ? "Connecting…" : s.stream === "idle" ? "" : s.stream);
+      if (Date.now() > streamErrUntil) setState("streamState", live ? "Live" : connecting ? "Connecting…" : s.stream === "idle" ? "" : s.stream);
       setState("webcamState", s.webcam === "none" ? "No webcam found. Plug one in and restart Page2Cam." : /^error/.test(s.webcam) ? s.webcam : /^reconnecting/.test(s.webcam) ? "Webcam " + s.webcam : "");
       document.querySelectorAll("[data-engine]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.engine === s.cutout_engine)));
       setState("cutoutState", s.cutout);
       // Changed elsewhere (another tab, a style switch): take the app's choices.
       if (!bg || s.background !== bg.full || s.box_background !== bg.in_box || s.refined_edges !== bg.refined_edges) loadBg();
       bgMessage("bgNote", s.background_note);
-      $("urlPaused").hidden = !["image", "colour", "youtube", "screen"].includes(s.background);
+      $("urlPaused").hidden = !["image", "colour", "youtube", "screen", "window"].includes(s.background);
       syncGpu();
       if (Date.now() > videoErrUntil) {
         const v = $("videoState");

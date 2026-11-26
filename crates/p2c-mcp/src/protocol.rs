@@ -302,6 +302,7 @@ mod tests {
             "reset_crop",
             "start_stream",
             "stop_stream",
+            "set_stream_sites",
             "set_audio",
             "list_gpus",
             "set_gpu",
@@ -310,6 +311,7 @@ mod tests {
             "set_background",
             "upload_background_image",
             "list_screens",
+            "list_windows",
             "list_layers",
             "add_layer",
             "update_layer",
@@ -328,7 +330,7 @@ mod tests {
             "load_scene",
             "delete_scene",
         ];
-        assert_eq!(want.len(), 46);
+        assert_eq!(want.len(), 48);
         let mut names = tool_names();
         names.sort();
         let mut w: Vec<String> = want.iter().map(|s| s.to_string()).collect();
@@ -341,7 +343,7 @@ mod tests {
             )
             .unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 46);
+        assert_eq!(tools.len(), 48);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert!(
@@ -424,8 +426,23 @@ mod tests {
                 C::SetCrop(json!({ "x": 0.1, "y": 0.0, "w": 0.8, "h": 1.0 })),
             ),
             ("reset_crop", json!({}), C::ResetCrop),
-            ("start_stream", json!({}), C::StartStream),
-            ("stop_stream", json!({}), C::StopStream),
+            ("start_stream", json!({}), C::StartStream { sites: None }),
+            ("stop_stream", json!({}), C::StopStream { sites: None }),
+            (
+                "stop_stream",
+                json!({ "sites": ["youtube"] }),
+                C::StopStream {
+                    sites: Some(vec!["youtube".into()]),
+                },
+            ),
+            (
+                "set_stream_sites",
+                json!({ "twitch": false }),
+                C::SetStreamSites {
+                    youtube: None,
+                    twitch: Some(false),
+                },
+            ),
             (
                 "set_audio",
                 json!({ "mic_on": true, "page_gain": 0.5 }),
@@ -452,6 +469,12 @@ mod tests {
                 C::SetBackground(json!({ "full": "screen", "full_screen": "DISPLAY2" })),
             ),
             ("list_screens", json!({}), C::ListScreens),
+            ("list_windows", json!({}), C::ListWindows),
+            (
+                "set_background",
+                json!({ "full": "window", "window": " Twitch " }),
+                C::SetBackground(json!({ "full": "window", "full_window": "Twitch" })),
+            ),
             (
                 "set_background",
                 json!({ "in_box": "colour", "box_colour": "#AABBCC", "refined_edges": true }),
@@ -477,6 +500,60 @@ mod tests {
             assert_eq!(calls[0].1, want, "{name}");
             assert_eq!(calls[0].0, "Agent");
         }
+    }
+
+    #[test]
+    fn start_stream_takes_sites() {
+        let s = server();
+        let r = call(&s, "start_stream", json!({ "sites": ["twitch"] }));
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        assert_eq!(
+            s.backend().calls.borrow()[0].1,
+            BackendCall::StartStream {
+                sites: Some(vec!["twitch".into()])
+            }
+        );
+        let s = server();
+        let r = call(&s, "start_stream", json!({ "sites": ["kick"] }));
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("youtube") && text.contains("twitch"),
+            "{text}"
+        );
+        assert!(s.backend().calls.borrow().is_empty());
+        for args in [json!({ "sites": [] }), json!({ "sites": "twitch" })] {
+            let r = call(&s, "start_stream", args.clone());
+            assert_eq!(r["result"]["isError"], true, "{args}");
+        }
+    }
+
+    #[test]
+    fn set_stream_sites_needs_one_field() {
+        for args in [
+            json!({}),
+            json!({ "kick": true }),
+            json!({ "twitch": "yes" }),
+        ] {
+            let s = server();
+            let r = call(&s, "set_stream_sites", args.clone());
+            assert_eq!(r["result"]["isError"], true, "{args}: {r}");
+            assert!(s.backend().calls.borrow().is_empty());
+        }
+        let s = server();
+        let r = call(
+            &s,
+            "set_stream_sites",
+            json!({ "youtube": true, "twitch": false }),
+        );
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        assert_eq!(
+            s.backend().calls.borrow()[0].1,
+            BackendCall::SetStreamSites {
+                youtube: Some(true),
+                twitch: Some(false)
+            }
+        );
     }
 
     #[test]
@@ -602,6 +679,9 @@ mod tests {
             ("set_background", json!({ "screen": "x".repeat(65) })),
             ("set_background", json!({ "screen": 2 })),
             ("list_screens", json!({ "id": "DISPLAY1" })),
+            ("set_background", json!({ "window": "x".repeat(201) })),
+            ("set_background", json!({ "window": 2 })),
+            ("list_windows", json!({ "id": "1" })),
             ("set_background", json!({})),
             (
                 "upload_background_image",
