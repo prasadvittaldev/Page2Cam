@@ -372,6 +372,7 @@
         <button class="tile" data-bg-full="colour" aria-pressed="false" title="One colour"><span class="pv" id="bgFullSwatch"></span>Colour</button>
         <button class="tile" data-bg-full="youtube" aria-pressed="false" title="A YouTube video, full screen and looping"><span class="pv yt"><img id="bgYoutubeThumb" alt="" hidden></span>YouTube</button>
         <button class="tile" data-bg-full="screen" aria-pressed="false" title="One of your monitors, live"><span class="pv mon"></span>Screen</button>
+        <button class="tile" data-bg-full="window" aria-pressed="false" title="One application window, live"><span class="pv mon"></span>Window</button>
         <button class="tile" data-bg-full="blurred-room" aria-pressed="false" title="Your own room, blurred, full screen"><span class="pv blur"></span>Blurred room</button>
       </div>
       <div id="bgFullImageOpts" hidden>
@@ -391,6 +392,15 @@
           <select id="bgScreen" aria-label="Monitor to show"></select>
         </div>
         <p class="sub"><b>Everything on this monitor is shown</b> to your call or stream, live (notifications, other windows, the mouse pointer). Windows outlines a shared monitor in yellow.</p>
+      </div>
+      <div id="bgWindowOpts" hidden>
+        <div class="row">
+          <label for="window-pick">Window</label>
+          <select id="window-pick" aria-label="Window to show"></select>
+          <button class="btn" id="window-refresh" type="button">Refresh</button>
+        </div>
+        <div class="state" id="window-warn"></div>
+        <p class="sub"><b>Only that window is shown</b> to your call or stream, live (not the mouse pointer). Its sound goes to the stream only. Keep it open and not minimized; it can sit behind other windows.</p>
       </div>
       <div id="bgYoutubeOpts" hidden>
         <form class="row" id="bgYoutubeForm">
@@ -1028,6 +1038,9 @@
     $("bgYoutubeOpts").hidden = !(bg.full === "youtube" || ytEditing);
     $("bgScreenOpts").hidden = bg.full !== "screen";
     if (bg.full === "screen") loadScreens();
+    $("bgWindowOpts").hidden = !(bg.full === "window" || winEditing);
+    if (bg.full === "window" && !winLoaded) loadWindows();
+    else syncWindow();
     $("bgBoxImageOpts").hidden = bg.in_box !== "image";
     $("bgBoxColourOpts").hidden = bg.in_box !== "colour";
     $("refinedEdges").checked = bg.refined_edges;
@@ -1040,7 +1053,8 @@
     if (v === "image" && !bg.full_image) { $("bgFullImageFile").click(); return; }
     if (v === "youtube" && !bg.full_youtube) { ytEditing = true; syncBg(); $("bgYoutube").focus(); return; }
     if (v === "screen" && screensError) { bgMessage("bgErr", screensError); return; }
-    ytEditing = false;
+    if (v === "window") { chooseWindow(); return; }
+    ytEditing = false; winEditing = false;
     setBg({ full: v });
   });
   document.querySelectorAll("[data-bg-box]").forEach((b) => b.onclick = () => {
@@ -1094,6 +1108,61 @@
     else if (main) sel.value = main.value;
   }
   $("bgScreen").onchange = () => setBg({ full: "screen", full_screen: $("bgScreen").value });
+  // Application windows (GET /api/windows). Titles are private, so the list is
+  // fetched only when the Window choice is opened or refreshed, never on a poll.
+  let winEditing = false, winLoaded = false, winList = [];
+  const winLabel = (w) => w.title + " (" + w.exe + ")";
+  async function loadWindows() {
+    try {
+      const r = await api("/api/windows");
+      if (!r.ok) { bgMessage("bgErr", await errorText(r)); return false; }
+      winList = await r.json();
+      winLoaded = true;
+      const sel = $("window-pick");
+      sel.replaceChildren(...winList.map((w) => new Option(
+        w.title + " — " + w.app + (w.minimized ? " (minimized)" : ""), String(w.id))));
+      syncWindow();
+      return true;
+    } catch { bgMessage("bgErr", "Page2Cam is not responding."); return false; }
+  }
+  function syncWindow() {
+    const sel = $("window-pick");
+    if (!winLoaded) { $("window-warn").textContent = ""; return; }
+    // The saved choice is a label; show it unless the user is picking.
+    if (bg && bg.full === "window" && bg.full_window && document.activeElement !== sel) {
+      const i = winList.findIndex((w) => winLabel(w) === bg.full_window);
+      if (i >= 0) sel.selectedIndex = i;
+      else {
+        sel.selectedIndex = -1;
+        if (!sel.querySelector("option[data-missing]")) {
+          const o = new Option(bg.full_window + " — not found", "");
+          o.dataset.missing = "1"; o.disabled = true; sel.add(o, 0);
+        }
+        sel.selectedIndex = 0;
+      }
+    }
+    const w = winList.find((x) => String(x.id) === sel.value);
+    $("window-warn").textContent = w && w.browser
+      ? "Sound: everything playing in " + w.app + ". Use a separate browser for the content." : "";
+  }
+  async function chooseWindow() {
+    winEditing = true;
+    if (!(await loadWindows())) { winEditing = false; return; }
+    // A saved window resumes by itself (same program and exact title).
+    if (bg.full_window) { winEditing = false; await setBg({ full: "window" }); return; }
+    syncBg();
+    if (!winList.length) return;
+    // Nothing chosen yet: wait for the pick (like YouTube without a link).
+    $("window-pick").selectedIndex = -1; $("window-pick").focus();
+  }
+  $("window-pick").onchange = async () => {
+    const id = $("window-pick").value;
+    syncWindow();
+    if (!id) return;
+    winEditing = false;
+    await setBg({ full: "window", full_window: id });
+  };
+  $("window-refresh").onclick = async () => { await loadWindows(); syncBg(); };
   $("refinedEdges").onchange = () => setBg({ refined_edges: $("refinedEdges").checked });
   loadBg();
   loadScreens();
@@ -1281,7 +1350,7 @@
       // Changed elsewhere (another tab, a style switch): take the app's choices.
       if (!bg || s.background !== bg.full || s.box_background !== bg.in_box || s.refined_edges !== bg.refined_edges) loadBg();
       bgMessage("bgNote", s.background_note);
-      $("urlPaused").hidden = !["image", "colour", "youtube", "screen"].includes(s.background);
+      $("urlPaused").hidden = !["image", "colour", "youtube", "screen", "window"].includes(s.background);
       syncGpu();
       if (Date.now() > videoErrUntil) {
         const v = $("videoState");

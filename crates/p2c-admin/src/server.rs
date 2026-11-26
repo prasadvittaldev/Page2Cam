@@ -1767,10 +1767,21 @@ mod tests {
             "bgErr",
             "refinedEdges",
             "urlPaused",
+            "window-pick",
+            "window-refresh",
+            "window-warn",
         ] {
             assert!(html.contains(&format!("id=\"{id}\"")), "missing id {id}");
         }
-        for v in ["page", "image", "colour", "youtube", "blurred-room"] {
+        assert!(html.contains("/api/windows"));
+        for v in [
+            "page",
+            "image",
+            "colour",
+            "youtube",
+            "window",
+            "blurred-room",
+        ] {
             assert!(html.contains(&format!("data-bg-full=\"{v}\"")), "full {v}");
         }
         for v in ["room", "blur", "image", "colour"] {
