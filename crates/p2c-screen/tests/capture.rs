@@ -17,7 +17,8 @@ fn grabs_a_frame_from_the_primary_monitor() {
         }),
     )
     .expect("start");
-    assert_eq!(cap.screen().id, primary.id);
+    assert_eq!(cap.screen().unwrap().id, primary.id);
+    assert_eq!(cap.window_status(), p2c_screen::WindowStatus::Ok);
     let f = rx
         .recv_timeout(Duration::from_secs(5))
         .expect("a frame within 5 s");

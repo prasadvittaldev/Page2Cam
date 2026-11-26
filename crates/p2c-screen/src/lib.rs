@@ -1,6 +1,8 @@
-//! Screen capture: one monitor as BGRA frames (the `screen` full-frame
-//! background). Windows 11: Windows Graphics Capture. Other platforms:
-//! [`list`] and [`Capture::start`] fail with [`UNSUPPORTED`].
+//! Screen capture: one monitor (the `screen` full-frame background) or one
+//! application window (the `window` background) as BGRA frames.
+//! Windows 11: Windows Graphics Capture. Other platforms: [`list`],
+//! [`Capture::start`] fail with [`UNSUPPORTED`], window capture with
+//! [`WINDOW_UNSUPPORTED`].
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -10,6 +12,14 @@ use p2c_core::Frame;
 
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod win_window;
+mod window;
+
+pub use window::{
+    find_exact, is_browser, list_windows, resolve_text, WindowInfo, WindowMatch, WindowStatus,
+    WINDOW_UNSUPPORTED,
+};
 
 /// The error on platforms without screen capture.
 pub const UNSUPPORTED: &str = "screen capture is Windows-only for now";
@@ -79,18 +89,32 @@ pub fn copy_rows(src: &[u8], row_pitch: usize, w: u32, h: u32) -> Option<Vec<u8>
     Some(out)
 }
 
-/// A running capture of one monitor. Frames go to the sink on the capture
-/// thread, at most `max_fps` a second and only when the screen changed.
-/// Dropping it stops the capture.
+/// A running capture of one monitor or one window. Frames go to the sink on
+/// the capture thread, at most `max_fps` a second and only when the content
+/// changed. Dropping it stops the capture.
 pub struct Capture {
     stop: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
     thread: Option<JoinHandle<()>>,
-    screen: ScreenInfo,
+    target: Target,
+}
+
+enum Target {
+    Screen(ScreenInfo),
+    /// HWND, and set when Windows reports the capture item closed.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Window {
+        id: u64,
+        closed: Arc<AtomicBool>,
+    },
 }
 
 /// Receives captured frames (on the capture thread).
 pub type Sink = Box<dyn FnMut(Frame) + Send>;
+
+fn interval(max_fps: u32) -> Duration {
+    Duration::from_secs_f64(1.0 / f64::from(max_fps.max(1)))
+}
 
 impl Capture {
     /// Start capturing the monitor `id` (see [`pick`]). Fails at once when
@@ -102,18 +126,17 @@ impl Capture {
             .ok_or_else(|| anyhow::anyhow!("no screen {id:?}"))?;
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
-        let interval = Duration::from_secs_f64(1.0 / f64::from(max_fps.max(1)));
         #[cfg(windows)]
         let thread = win::spawn(
-            screen.id.clone(),
-            interval,
+            win::Source::Monitor(screen.id.clone()),
+            interval(max_fps),
             sink,
             stop.clone(),
             error.clone(),
         )?;
         #[cfg(not(windows))]
         let thread = {
-            let _ = (interval, sink);
+            let _ = (interval(max_fps), sink);
             anyhow::bail!(UNSUPPORTED)
         };
         tracing::info!(screen = %screen.id, w = screen.width, h = screen.height, "screen capture on");
@@ -121,13 +144,71 @@ impl Capture {
             stop,
             error,
             thread: Some(thread),
-            screen,
+            target: Target::Screen(screen),
         })
     }
 
-    /// The monitor being captured.
-    pub fn screen(&self) -> &ScreenInfo {
-        &self.screen
+    /// Start capturing the window with this handle (see [`list_windows`]):
+    /// cursor off, borderless where Windows allows it, the frame size
+    /// following the window; no frames while it is minimized.
+    pub fn start_window(id: u64, max_fps: u32, sink: Sink) -> anyhow::Result<Capture> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new(None));
+        let closed = Arc::new(AtomicBool::new(false));
+        #[cfg(windows)]
+        let thread = win::spawn(
+            win::Source::Window {
+                id,
+                closed: closed.clone(),
+            },
+            interval(max_fps),
+            sink,
+            stop.clone(),
+            error.clone(),
+        )?;
+        #[cfg(not(windows))]
+        let thread = {
+            let _ = (interval(max_fps), sink);
+            anyhow::bail!(WINDOW_UNSUPPORTED)
+        };
+        tracing::info!(window = id, "window capture on");
+        Ok(Capture {
+            stop,
+            error,
+            thread: Some(thread),
+            target: Target::Window { id, closed },
+        })
+    }
+
+    /// The monitor being captured (none for a window).
+    pub fn screen(&self) -> Option<&ScreenInfo> {
+        match &self.target {
+            Target::Screen(s) => Some(s),
+            Target::Window { .. } => None,
+        }
+    }
+
+    /// The captured window's state (always `Ok` for a monitor): `Closed`
+    /// once the window is gone or Windows closed the capture item,
+    /// `Minimized` while it is minimized (no frames then).
+    pub fn window_status(&self) -> WindowStatus {
+        match &self.target {
+            Target::Screen(_) => WindowStatus::Ok,
+            Target::Window { id, closed } => {
+                if closed.load(Ordering::SeqCst) {
+                    return WindowStatus::Closed;
+                }
+                #[cfg(windows)]
+                {
+                    win_window::status(*id)
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = id;
+                    WindowStatus::Closed
+                }
+            }
+        }
     }
 
     /// Why capture stopped by itself (e.g. the monitor went away).
@@ -142,7 +223,10 @@ impl Drop for Capture {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        tracing::info!(screen = %self.screen.id, "screen capture off");
+        match &self.target {
+            Target::Screen(s) => tracing::info!(screen = %s.id, "screen capture off"),
+            Target::Window { id, .. } => tracing::info!(window = id, "window capture off"),
+        }
     }
 }
 
@@ -203,5 +287,9 @@ mod tests {
         assert_eq!(list().unwrap_err().to_string(), UNSUPPORTED);
         let e = Capture::start("", 30, Box::new(|_| {})).err().unwrap();
         assert_eq!(e.to_string(), UNSUPPORTED);
+        let e = Capture::start_window(1, 30, Box::new(|_| {}))
+            .err()
+            .unwrap();
+        assert_eq!(e.to_string(), WINDOW_UNSUPPORTED);
     }
 }

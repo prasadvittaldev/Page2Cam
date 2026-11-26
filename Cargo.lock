@@ -2579,6 +2579,7 @@ dependencies = [
  "p2c-core",
  "tracing",
  "windows 0.62.2",
+ "windows-future",
 ]
 
 [[package]]
