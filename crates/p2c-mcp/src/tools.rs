@@ -78,6 +78,8 @@ pub enum BackendCall {
     InstallUpdate,
     /// The monitors for the screen background.
     ListScreens,
+    /// The open application windows for the window background.
+    ListWindows,
     GetBackground,
     /// Partial `BackgroundDto`.
     SetBackground(Value),
@@ -137,6 +139,7 @@ impl BackendCall {
                 | BackendCall::ListGpus
                 | BackendCall::GetBackground
                 | BackendCall::ListScreens
+                | BackendCall::ListWindows
                 | BackendCall::ListLayers
                 | BackendCall::Guide(_)
                 | BackendCall::ListTemplates(_)
@@ -317,18 +320,20 @@ Choosing box while a full-frame background other than page is on returns the bac
         t("install_update", "Download, verify and install the newer Page2Cam version on offer (status shows it). Page2Cam restarts.".into(), &none),
         t("get_background", "The background choices: full frame, in box, colours, YouTube video, refined edges, uploaded pictures.".into(), &none),
         t("set_background", "Choose what is behind the person. Give only what changes. \
-full = full-frame background: page (the web page), image (the uploaded picture), colour, youtube (a video link, plays full screen looping with sound on the stream only), screen (a whole monitor, live: everything on it is shown to the call or stream; screen = an id from list_screens, default the primary monitor), blurred-room (the webcam's room, blurred). \
+full = full-frame background: page (the web page), image (the uploaded picture), colour, youtube (a video link, plays full screen looping with sound on the stream only), screen (a whole monitor, live: everything on it is shown to the call or stream; screen = an id from list_screens, default the primary monitor), window (one application window, live, with that app's sound on the stream; window = an id from list_windows or its exact title text; a browser window's sound is everything playing in that browser, so suggest a separate browser for the content; games need borderless or windowed mode), blurred-room (the webcam's room, blurred). \
 Any full other than page switches the overlay style to cutout_full. \
 in_box = behind the person inside the box (box style): room, blur, image, colour. \
 refined_edges = smoother hair and shoulder edges (a little more GPU/CPU).".into(),
             &json!({ "type": "object", "additionalProperties": false, "minProperties": 1,
                 "properties": {
-                    "full": { "enum": ["page", "image", "colour", "youtube", "screen", "blurred-room"] },
+                    "full": { "enum": ["page", "image", "colour", "youtube", "screen", "window", "blurred-room"] },
                     "full_colour": colour, "youtube": { "type": "string", "maxLength": 2048 },
                     "screen": { "type": "string", "maxLength": 64 },
+                    "window": { "type": "string", "maxLength": 200 },
                     "in_box": { "enum": ["room", "blur", "image", "colour"] },
                     "box_colour": colour, "refined_edges": { "type": "boolean" } } })),
         t("list_screens", "The monitors the screen background can show: id, index, name, resolution, primary. Fails where screen capture is not available (Windows only).".into(), &none),
+        t("list_windows", "The open application windows the window background can show (title, app, exe, size, minimized, browser). Titles can be private: list them only when the user asked for a window background.".into(), &none),
         t("upload_background_image", "Upload the picture for a background row (full = full frame, box = in box) and show it there. \
 Give a local file path or base64 file bytes (PNG, JPEG or WebP, up to 20 MB).".into(),
             &json!({ "type": "object", "required": ["row"], "additionalProperties": false,
@@ -893,6 +898,7 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
         "install_update" => return simple(C::InstallUpdate),
         "get_background" => return simple(C::GetBackground),
         "list_screens" => return simple(C::ListScreens),
+        "list_windows" => return simple(C::ListWindows),
         "open_url" => (|| {
             only(args, &["url"])?;
             let u = req_str(args, "url")?.trim();
@@ -1033,6 +1039,7 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
                     "full_colour",
                     "youtube",
                     "screen",
+                    "window",
                     "in_box",
                     "box_colour",
                     "refined_edges",
@@ -1049,6 +1056,7 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
                         "colour",
                         "youtube",
                         "screen",
+                        "window",
                         "blurred-room",
                     ],
                 )?;
@@ -1070,6 +1078,13 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
                     return Err("screen must be an id from list_screens".into());
                 }
                 m.insert("full_screen".into(), s.into());
+            }
+            if let Some(w) = str_arg(args, "window")? {
+                let w = w.trim();
+                if w.len() > 200 {
+                    return Err("window must be an id from list_windows or title text".into());
+                }
+                m.insert("full_window".into(), w.into());
             }
             if let Some(b) = str_arg(args, "in_box")? {
                 let b = one_of("in_box", b, &["room", "blur", "image", "colour"])?;

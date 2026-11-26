@@ -725,6 +725,9 @@ pub fn balloon_for(agent: &str, call: &BackendCall, running: bool) -> Option<Str
         C::SetBackground(v) if v["full"] == "screen" => {
             format!("{agent} is sharing your screen")
         }
+        // A shared window is announced by the backend once the engine has
+        // resolved its title.
+        C::SetBackground(v) if v["full"] == "window" => return None,
         C::OpenUrl(_) | C::ShowPage { .. } | C::Navigate(_) if running => {
             format!("{agent} changed the page")
         }
@@ -1239,6 +1242,7 @@ mod tests {
             C::GetBackground,
             C::ListGpus,
             C::ListScreens,
+            C::ListWindows,
         ] {
             assert_eq!(balloon_for(a, &c, true), None, "{c:?}");
         }

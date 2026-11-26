@@ -311,6 +311,7 @@ mod tests {
             "set_background",
             "upload_background_image",
             "list_screens",
+            "list_windows",
             "list_layers",
             "add_layer",
             "update_layer",
@@ -329,7 +330,7 @@ mod tests {
             "load_scene",
             "delete_scene",
         ];
-        assert_eq!(want.len(), 47);
+        assert_eq!(want.len(), 48);
         let mut names = tool_names();
         names.sort();
         let mut w: Vec<String> = want.iter().map(|s| s.to_string()).collect();
@@ -342,7 +343,7 @@ mod tests {
             )
             .unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 47);
+        assert_eq!(tools.len(), 48);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert!(
@@ -468,6 +469,12 @@ mod tests {
                 C::SetBackground(json!({ "full": "screen", "full_screen": "DISPLAY2" })),
             ),
             ("list_screens", json!({}), C::ListScreens),
+            ("list_windows", json!({}), C::ListWindows),
+            (
+                "set_background",
+                json!({ "full": "window", "window": " Twitch " }),
+                C::SetBackground(json!({ "full": "window", "full_window": "Twitch" })),
+            ),
             (
                 "set_background",
                 json!({ "in_box": "colour", "box_colour": "#AABBCC", "refined_edges": true }),
@@ -672,6 +679,9 @@ mod tests {
             ("set_background", json!({ "screen": "x".repeat(65) })),
             ("set_background", json!({ "screen": 2 })),
             ("list_screens", json!({ "id": "DISPLAY1" })),
+            ("set_background", json!({ "window": "x".repeat(201) })),
+            ("set_background", json!({ "window": 2 })),
+            ("list_windows", json!({ "id": "1" })),
             ("set_background", json!({})),
             (
                 "upload_background_image",

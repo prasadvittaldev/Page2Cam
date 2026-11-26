@@ -323,11 +323,24 @@ impl TrayBackend {
             }
             C::GetBackground => self.get("/api/background").map(BackendReply::Json),
             C::ListScreens => self.get("/api/screens").map(BackendReply::Json),
+            C::ListWindows => self.get("/api/windows").map(BackendReply::Json),
             C::SetBackground(partial) => {
                 let cur = self.get("/api/background")?;
                 let new = Self::merged(&cur, partial);
-                self.json("POST", "/api/background", Some(&new), SLOW_TIMEOUT)
-                    .map(BackendReply::Json)
+                let mut out = self.json("POST", "/api/background", Some(&new), SLOW_TIMEOUT)?;
+                // The engine's note (a browser window's shared sound, a
+                // minimized window...) reaches the agent too.
+                if let Some(note) = self.state().ok().and_then(|s| {
+                    s["status"]["background_note"]
+                        .as_str()
+                        .filter(|n| !n.is_empty())
+                        .map(String::from)
+                }) {
+                    if let Some(m) = out.as_object_mut() {
+                        m.insert("note".into(), note.into());
+                    }
+                }
+                Ok(BackendReply::Json(out))
             }
             C::UploadBackgroundImage { row, bytes } => {
                 let (code, out) = self.http(
@@ -500,6 +513,22 @@ fn overlay_out(pip: &Value) -> Value {
     v
 }
 
+/// The title part of the engine's window label "<title> (<exe>)": the
+/// trailing " (xxx.exe)" is dropped, the rest (or the whole text when it has
+/// no such suffix) is kept, one line and short.
+fn window_title(label: &str) -> String {
+    let t = match label.rfind(" (") {
+        Some(i) if label.ends_with(')') && label[i..].to_lowercase().ends_with(".exe)") => {
+            &label[..i]
+        }
+        _ => label,
+    };
+    t.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(80)
+        .collect()
+}
+
 /// The engine's error body (`{"error": …}` or text) as a message.
 fn error_text(code: u16, body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
@@ -548,6 +577,34 @@ impl Backend for TrayBackend {
                     text.push_str(" (stream ended)");
                 }
                 self.ctl.balloon(text);
+            }
+            // A shared window: said always, with the title the engine resolved.
+            let short: String = agent.chars().take(40).collect();
+            match (&req, &r) {
+                (BackendCall::SetBackground(p), Ok(BackendReply::Json(v)))
+                    if p["full"] == "window" =>
+                {
+                    let label = v["full_window"].as_str().or(p["full_window"].as_str());
+                    self.ctl.balloon(format!(
+                        "Agent \u{201c}{short}\u{201d} is sharing a window: {}",
+                        window_title(label.unwrap_or(""))
+                    ));
+                }
+                (BackendCall::LoadScene { .. }, Ok(BackendReply::Json(v)))
+                    if v["background_full"] == "window" =>
+                {
+                    // The scene answer has no title: ask for the current background.
+                    let label = self
+                        .get("/api/background")
+                        .ok()
+                        .and_then(|b| b["full_window"].as_str().map(String::from))
+                        .unwrap_or_default();
+                    self.ctl.balloon(format!(
+                        "Agent \u{201c}{short}\u{201d} is sharing a window: {}",
+                        window_title(&label)
+                    ));
+                }
+                _ => {}
             }
             // A scene may bring back a screen-sharing background: said always.
             if let (BackendCall::LoadScene { .. }, Ok(BackendReply::Json(v))) = (&req, &r) {
@@ -879,6 +936,81 @@ pub(crate) mod tests {
             tray.balloons.lock().as_slice(),
             ["Agent “Claude” is sharing your screen"]
         );
+    }
+
+    #[test]
+    fn window_sharing_is_announced() {
+        let (port, log) = fake_engine(|m, p, body| match (m, p) {
+            ("GET", "/api/state") => (
+                200,
+                br#"{"status":{"background_note":"Sound: everything playing in Google Chrome"}}"#
+                    .to_vec(),
+            ),
+            ("GET", "/api/windows") => (
+                200,
+                br#"[{"id":"123","title":"Twitch","exe":"chrome.exe"}]"#.to_vec(),
+            ),
+            ("GET", "/api/background") => (
+                200,
+                br#"{"full":"page","full_window":"","in_box":"room"}"#.to_vec(),
+            ),
+            ("POST", "/api/background") => {
+                if String::from_utf8_lossy(body).contains("nomatch") {
+                    (
+                        400,
+                        br#"{"error":"no window matches \"nomatch\""}"#.to_vec(),
+                    )
+                } else {
+                    (
+                        200,
+                        br#"{"full":"window","full_window":"Twitch - Home (chrome.exe)"}"#.to_vec(),
+                    )
+                }
+            }
+            _ => (200, b"{}".to_vec()),
+        });
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "running".into();
+        *tray.engine.lock() = Some((port, "tok".into()));
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(tray.clone(), d.path());
+        let r = b.call("Claude", BackendCall::ListWindows).unwrap();
+        assert!(matches!(r, BackendReply::Json(ref v) if v[0]["title"] == "Twitch"));
+        assert!(tray.balloons.lock().is_empty(), "listing is quiet");
+        let r = b
+            .call(
+                "Claude",
+                BackendCall::SetBackground(json!({ "full": "window", "full_window": "Twitch" })),
+            )
+            .unwrap();
+        let BackendReply::Json(v) = r else { panic!() };
+        assert_eq!(v["full_window"], "Twitch - Home (chrome.exe)");
+        assert_eq!(v["note"], "Sound: everything playing in Google Chrome");
+        assert_eq!(
+            tray.balloons.lock().as_slice(),
+            ["Agent “Claude” is sharing a window: Twitch - Home"]
+        );
+        assert!(log
+            .lock()
+            .iter()
+            .any(|r| r.1 == "/api/background" && r.0 == "POST"));
+        // An engine error reaches the agent intact, with no balloon.
+        let e = b
+            .call(
+                "Claude",
+                BackendCall::SetBackground(json!({ "full": "window", "full_window": "nomatch" })),
+            )
+            .unwrap_err();
+        assert!(e.contains("no window matches"), "{e}");
+        assert_eq!(tray.balloons.lock().len(), 1);
+    }
+
+    #[test]
+    fn window_title_drops_the_exe_suffix() {
+        assert_eq!(window_title("Twitch - Home (chrome.exe)"), "Twitch - Home");
+        assert_eq!(window_title("Notes (draft) (Notepad.EXE)"), "Notes (draft)");
+        assert_eq!(window_title("Report (final)"), "Report (final)");
+        assert_eq!(window_title("a\nb"), "a b");
     }
 
     #[test]
