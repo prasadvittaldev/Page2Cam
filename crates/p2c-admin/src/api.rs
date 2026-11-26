@@ -311,6 +311,9 @@ pub struct Status {
     /// Why the chosen background isn't (fully) showing, or what was changed
     /// with it (e.g. "cut-out not ready"); "" when all is as chosen.
     pub background_note: String,
+    /// The window background's own note (not found, minimized, its sound),
+    /// also while `background_note` shows a more recent one; "" otherwise.
+    pub window_note: String,
     /// Agents may control Page2Cam (read from the tray). `None` without a tray.
     #[serde(default)]
     pub agents_allowed: Option<bool>,

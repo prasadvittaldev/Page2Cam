@@ -328,13 +328,20 @@ impl TrayBackend {
                 let cur = self.get("/api/background")?;
                 let new = Self::merged(&cur, partial);
                 let mut out = self.json("POST", "/api/background", Some(&new), SLOW_TIMEOUT)?;
-                // The engine's note (a browser window's shared sound, a
-                // minimized window...) reaches the agent too.
+                // The engine's notes (a style switched with it, a browser
+                // window's shared sound, a minimized window...) reach the
+                // agent too: the window note separately, since the style
+                // note hides it in `background_note`.
                 if let Some(note) = self.state().ok().and_then(|s| {
-                    s["status"]["background_note"]
-                        .as_str()
-                        .filter(|n| !n.is_empty())
-                        .map(String::from)
+                    let mut notes: Vec<&str> = Vec::new();
+                    for k in ["background_note", "window_note"] {
+                        if let Some(n) = s["status"][k].as_str().filter(|n| !n.is_empty()) {
+                            if !notes.contains(&n) {
+                                notes.push(n);
+                            }
+                        }
+                    }
+                    (!notes.is_empty()).then(|| notes.join("; "))
                 }) {
                     if let Some(m) = out.as_object_mut() {
                         m.insert("note".into(), note.into());
@@ -955,10 +962,11 @@ pub(crate) mod tests {
 
     #[test]
     fn window_sharing_is_announced() {
-        let (port, log) = fake_engine(|m, p, body| match (m, p) {
+        let (port, log) = fake_engine(|m, p, body| {
+            match (m, p) {
             ("GET", "/api/state") => (
                 200,
-                br#"{"status":{"background_note":"Sound: everything playing in Google Chrome"}}"#
+                br#"{"status":{"background_note":"Style set to full-height cut-out: a full-frame background needs the person cut out","window_note":"Sound: everything playing in Google Chrome"}}"#
                     .to_vec(),
             ),
             ("GET", "/api/windows") => (
@@ -983,6 +991,7 @@ pub(crate) mod tests {
                 }
             }
             _ => (200, b"{}".to_vec()),
+        }
         });
         let tray = Arc::new(FakeTray::default());
         *tray.state.lock() = "running".into();
@@ -1000,7 +1009,11 @@ pub(crate) mod tests {
             .unwrap();
         let BackendReply::Json(v) = r else { panic!() };
         assert_eq!(v["full_window"], "Twitch - Home (chrome.exe)");
-        assert_eq!(v["note"], "Sound: everything playing in Google Chrome");
+        // The style note and the window note both reach the agent.
+        assert_eq!(
+            v["note"],
+            "Style set to full-height cut-out: a full-frame background needs the person cut out; Sound: everything playing in Google Chrome"
+        );
         assert_eq!(
             tray.balloons.lock().as_slice(),
             ["Agent “Claude” is sharing a window: Twitch - Home"]

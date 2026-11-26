@@ -1570,6 +1570,7 @@ impl Controls for App {
             box_background,
             refined_edges,
             background_note,
+            window_note: self.window.note().unwrap_or_default(),
         }
     }
 
@@ -2489,6 +2490,14 @@ mod tests {
             app.window.note().as_deref(),
             Some("Sound: everything playing in Google Chrome")
         );
+        // ... but in the status's window note already (agents read it).
+        let s = app.status();
+        assert!(
+            s.background_note.starts_with("Style set"),
+            "{}",
+            s.background_note
+        );
+        assert_eq!(s.window_note, "Sound: everything playing in Google Chrome");
         app.bg.lock().note = None;
         assert_eq!(
             app.status().background_note,
