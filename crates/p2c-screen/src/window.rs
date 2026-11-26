@@ -207,10 +207,7 @@ mod tests {
     /// whole title is exactly that text.
     #[test]
     fn a_gone_id_is_not_a_title() {
-        let l = [
-            w(1, "excel.exe", "Invoice 1007"),
-            w(2, "game.exe", "2048"),
-        ];
+        let l = [w(1, "excel.exe", "Invoice 1007"), w(2, "game.exe", "2048")];
         assert_eq!(
             resolve_text(&l, "7").unwrap_err(),
             "that window is gone: choose it again"
