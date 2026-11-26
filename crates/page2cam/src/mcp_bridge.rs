@@ -725,7 +725,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Allow agents"));
-        assert_eq!(out[1]["result"]["tools"].as_array().unwrap().len(), 46);
+        assert_eq!(out[1]["result"]["tools"].as_array().unwrap().len(), 47);
         assert_eq!(out[2]["result"]["isError"], true);
         assert_eq!(out[2]["result"]["content"][0]["text"], p2c_mcp::AGENTS_OFF);
         // The guide works without the tray.
