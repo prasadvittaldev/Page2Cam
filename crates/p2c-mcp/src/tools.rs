@@ -56,9 +56,21 @@ pub enum BackendCall {
     /// `{x, y, w, h}` in 0..1 of the camera picture.
     SetCrop(Value),
     ResetCrop,
-    /// To the saved destination with the saved key.
-    StartStream,
-    StopStream,
+    /// `sites` ("youtube" | "twitch"): exactly these on; `None` = the sites
+    /// ticked in the control page. Keys are the saved ones, never passed.
+    StartStream {
+        sites: Option<Vec<String>>,
+    },
+    /// `sites`: stop only these (the stream ends when none is left); `None`
+    /// = stop everything.
+    StopStream {
+        sites: Option<Vec<String>>,
+    },
+    /// Tick/untick sites (live while streaming, saved while stopped).
+    SetStreamSites {
+        youtube: Option<bool>,
+        twitch: Option<bool>,
+    },
     /// Partial `AudioSettings`.
     SetAudio(Value),
     ListGpus,
@@ -137,6 +149,24 @@ impl BackendCall {
     pub fn summary(&self) -> String {
         match self {
             BackendCall::OpenUrl(u) => format!("open {}", crate::redact(u)),
+            BackendCall::StartStream { sites } => match sites {
+                Some(s) => format!("start stream to {}", s.join(" and ")),
+                None => "start stream".into(),
+            },
+            BackendCall::StopStream { sites } => match sites {
+                Some(s) => format!("stop stream to {}", s.join(" and ")),
+                None => "stop stream".into(),
+            },
+            BackendCall::SetStreamSites { youtube, twitch } => {
+                let on = |n: &str, v: &Option<bool>| {
+                    v.map(|b| format!("{n} {}", if b { "on" } else { "off" }))
+                };
+                let parts: Vec<String> = [on("YouTube", youtube), on("Twitch", twitch)]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                format!("stream sites: {}", parts.join(", "))
+            }
             BackendCall::Navigate(n) => format!("navigate {}", n.as_str()),
             BackendCall::ShowPage { name, html } => {
                 format!("show page {name:?} ({} KB)", html.len().div_ceil(1024))
@@ -265,8 +295,17 @@ Choosing box while a full-frame background other than page is on returns the bac
             &json!({ "type": "object", "required": ["x", "y", "w", "h"], "additionalProperties": false,
                 "properties": { "x": unit, "y": unit, "w": unit, "h": unit } })),
         t("reset_crop", "Use the whole webcam picture again.".into(), &none),
-        t("start_stream", "Start streaming (e.g. YouTube Live) to the destination and key saved in the control page. You cannot pass or read the key.".into(), &none),
-        t("stop_stream", "Stop the stream.".into(), &none),
+        t("start_stream", "Start streaming to YouTube and/or Twitch with the destinations and keys saved in the control page. Give 'sites' to choose (those on, the others off); without it the sites ticked in the control page are used. Keys are never passed to you and cannot be read; if a site has no key the error says so and the user must enter it in the control page.".into(),
+            &json!({ "type": "object", "additionalProperties": false,
+                "properties": { "sites": { "type": "array", "minItems": 1, "uniqueItems": true,
+                    "items": { "enum": ["youtube", "twitch"] } } } })),
+        t("stop_stream", "Stop the stream (all sites), or only the sites in 'sites' (the stream ends when none is left).".into(),
+            &json!({ "type": "object", "additionalProperties": false,
+                "properties": { "sites": { "type": "array", "minItems": 1, "uniqueItems": true,
+                    "items": { "enum": ["youtube", "twitch"] } } } })),
+        t("set_stream_sites", "Tick or untick YouTube and Twitch as stream destinations. While streaming it adds or drops that site live; while stopped it is saved for the next start. Give only what changes. Keys are never passed to you; a missing key must be entered by the user in the control page.".into(),
+            &json!({ "type": "object", "additionalProperties": false, "minProperties": 1,
+                "properties": { "youtube": { "type": "boolean" }, "twitch": { "type": "boolean" } } })),
         t("set_audio", "Stream audio: microphone and page sound on/off and gain (0-4, 1 = unchanged). Give only what changes. Audio goes to the stream only.".into(),
             &json!({ "type": "object", "additionalProperties": false, "minProperties": 1,
                 "properties": { "mic_on": { "type": "boolean" }, "mic_gain": { "type": "number", "minimum": 0, "maximum": 4 },
@@ -757,6 +796,32 @@ fn bool_arg(args: &Args, k: &str) -> Result<Option<bool>, String> {
     }
 }
 
+/// `sites`: a non-empty list of "youtube" / "twitch" (duplicates dropped).
+fn sites_arg(args: &Args) -> Result<Option<Vec<String>>, String> {
+    const MSG: &str = "sites must be a list of youtube and/or twitch";
+    match args.get("sites") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(a)) if !a.is_empty() && a.len() <= 8 => {
+            let mut out: Vec<String> = Vec::new();
+            for v in a {
+                let s = v.as_str().ok_or(MSG)?;
+                let s = one_of(
+                    "sites",
+                    s.trim().to_ascii_lowercase().as_str(),
+                    &["youtube", "twitch"],
+                )
+                .map_err(|_| MSG.to_string())?
+                .to_string();
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err(MSG.into()),
+    }
+}
+
 fn one_of<'a>(k: &str, v: &'a str, allowed: &[&str]) -> Result<&'a str, String> {
     if allowed.contains(&v) {
         Ok(v)
@@ -804,8 +869,26 @@ pub(crate) fn parse_call(name: &str, args: &Args) -> Result<BackendCall, Option<
         "get_overlay" => return simple(C::GetOverlay),
         "get_crop" => return simple(C::GetCrop),
         "reset_crop" => return simple(C::ResetCrop),
-        "start_stream" => return simple(C::StartStream),
-        "stop_stream" => return simple(C::StopStream),
+        "start_stream" => (|| {
+            only(args, &["sites"])?;
+            Ok(C::StartStream {
+                sites: sites_arg(args)?,
+            })
+        })(),
+        "stop_stream" => (|| {
+            only(args, &["sites"])?;
+            Ok(C::StopStream {
+                sites: sites_arg(args)?,
+            })
+        })(),
+        "set_stream_sites" => (|| {
+            only(args, &["youtube", "twitch"])?;
+            let (youtube, twitch) = (bool_arg(args, "youtube")?, bool_arg(args, "twitch")?);
+            if youtube.is_none() && twitch.is_none() {
+                return Err("give youtube and/or twitch (true or false)".into());
+            }
+            Ok(C::SetStreamSites { youtube, twitch })
+        })(),
         "list_gpus" => return simple(C::ListGpus),
         "install_update" => return simple(C::InstallUpdate),
         "get_background" => return simple(C::GetBackground),

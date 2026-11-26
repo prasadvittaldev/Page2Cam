@@ -255,24 +255,43 @@ impl TrayBackend {
                     &json!({ "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "save": true }),
                 )
                 .map(BackendReply::Json),
-            C::StartStream => {
-                let st = self.state()?;
-                let url = st["status"]["stream_url"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                if url.is_empty() || st["status"]["has_saved_key"] != json!(true) {
-                    return Err("No saved stream destination and key: save them once in the Page2Cam control page".into());
-                }
-                self.post(
-                    "/api/stream/start",
-                    &json!({ "url": url, "key": "", "remember": false }),
-                )?;
+            C::StartStream { sites } => {
+                // No keys, no urls: the engine uses the saved ones and answers
+                // with its own message (e.g. "Twitch has no stream key").
+                let body = match sites {
+                    Some(list) => {
+                        let on = |s: &str| list.iter().any(|x| x == s);
+                        json!({ "sites": {
+                            "youtube": { "on": on("youtube") },
+                            "twitch": { "on": on("twitch") },
+                        } })
+                    }
+                    None => json!({ "sites": {} }),
+                };
+                self.post("/api/stream/start", &body)?;
                 Ok(BackendReply::Done("stream starting".into()))
             }
-            C::StopStream => {
+            C::StopStream { sites: Some(list) } => {
+                let mut m = serde_json::Map::new();
+                for s in list {
+                    m.insert(s.clone(), json!({ "on": false }));
+                }
+                self.post("/api/stream/sites", &Value::Object(m))?;
+                Ok(BackendReply::Done("stream sites stopped".into()))
+            }
+            C::StopStream { sites: None } => {
                 self.post("/api/stream/stop", &json!({}))?;
                 Ok(BackendReply::Done("stream stopped".into()))
+            }
+            C::SetStreamSites { youtube, twitch } => {
+                let mut m = serde_json::Map::new();
+                for (name, v) in [("youtube", youtube), ("twitch", twitch)] {
+                    if let Some(on) = v {
+                        m.insert(name.into(), json!({ "on": on }));
+                    }
+                }
+                self.post("/api/stream/sites", &Value::Object(m))?;
+                Ok(BackendReply::Done("stream sites updated".into()))
             }
             C::SetAudio(partial) => {
                 let cur = self.state()?["audio"].clone();
@@ -863,7 +882,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stream_uses_the_saved_destination_and_never_a_key() {
+    fn start_stream_posts_sites() {
         let (port, log) = fake_engine(|m, p, _| match (m, p) {
             ("GET", "/api/state") => (200, state_json()),
             _ => (200, Vec::new()),
@@ -873,17 +892,96 @@ pub(crate) mod tests {
         *tray.engine.lock() = Some((port, "tok".into()));
         let d = tempfile::tempdir().unwrap();
         let b = backend(tray.clone(), d.path());
-        b.call("Claude", BackendCall::StartStream).unwrap();
+        b.call(
+            "Claude",
+            BackendCall::StartStream {
+                sites: Some(vec!["twitch".into()]),
+            },
+        )
+        .unwrap();
+        b.call("Claude", BackendCall::StartStream { sites: None })
+            .unwrap();
         let log = log.lock();
-        let r = log.iter().find(|r| r.1 == "/api/stream/start").unwrap();
-        let body: Value = serde_json::from_slice(&r.2).unwrap();
+        let bodies: Vec<Value> = log
+            .iter()
+            .filter(|r| r.1 == "/api/stream/start")
+            .map(|r| serde_json::from_slice(&r.2).unwrap())
+            .collect();
         assert_eq!(
-            body,
-            json!({ "url": "rtmp://a.rtmp.youtube.com/live2", "key": "", "remember": false })
+            bodies,
+            vec![
+                json!({ "sites": { "youtube": { "on": false }, "twitch": { "on": true } } }),
+                json!({ "sites": {} }),
+            ]
         );
         assert_eq!(
             tray.balloons.lock().as_slice(),
-            ["Agent “Claude” started your stream"]
+            [
+                "Agent “Claude” started your stream",
+                "Agent “Claude” started your stream"
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_key_message_reaches_the_agent() {
+        let (port, _log) = fake_engine(|m, p, _| match (m, p) {
+            ("POST", "/api/stream/start") => (500, b"Twitch has no stream key".to_vec()),
+            _ => (200, state_json()),
+        });
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "running".into();
+        *tray.engine.lock() = Some((port, "tok".into()));
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(tray, d.path());
+        let e = b
+            .call("Claude", BackendCall::StartStream { sites: None })
+            .unwrap_err();
+        assert!(e.contains("Twitch has no stream key"), "{e}");
+    }
+
+    #[test]
+    fn stop_stream_sites_and_set_sites_post_to_sites() {
+        let (port, log) = fake_engine(|_, _, _| (200, b"{}".to_vec()));
+        let tray = Arc::new(FakeTray::default());
+        *tray.state.lock() = "running".into();
+        *tray.engine.lock() = Some((port, "tok".into()));
+        let d = tempfile::tempdir().unwrap();
+        let b = backend(tray, d.path());
+        b.call(
+            "A",
+            BackendCall::StopStream {
+                sites: Some(vec!["twitch".into()]),
+            },
+        )
+        .unwrap();
+        b.call(
+            "A",
+            BackendCall::SetStreamSites {
+                youtube: Some(true),
+                twitch: None,
+            },
+        )
+        .unwrap();
+        b.call("A", BackendCall::StopStream { sites: None })
+            .unwrap();
+        let log = log.lock();
+        let posts: Vec<(&str, Value)> = log
+            .iter()
+            .map(|r| {
+                (
+                    r.1.as_str(),
+                    serde_json::from_slice(&r.2).unwrap_or(Value::Null),
+                )
+            })
+            .collect();
+        assert_eq!(
+            posts,
+            vec![
+                ("/api/stream/sites", json!({ "twitch": { "on": false } })),
+                ("/api/stream/sites", json!({ "youtube": { "on": true } })),
+                ("/api/stream/stop", json!({})),
+            ]
         );
     }
 

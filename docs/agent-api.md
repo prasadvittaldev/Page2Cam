@@ -48,7 +48,8 @@ Coordinates are 0..1 of the 1920×1080 output.
 | `get_overlay`, `set_overlay(visible, x, y, width, style: box\|cutout_small\|cutout_full)` | webcam overlay (give only what changes) |
 | `set_cutout_quality(quality\|fast)` | cut-out model |
 | `get_crop`, `set_crop(x, y, w, h)`, `reset_crop` | webcam crop |
-| `start_stream`, `stop_stream` | stream to the destination and key saved in the control page (agents can't pass or read a key) |
+| `start_stream`, `stop_stream` | stream to YouTube and/or Twitch with the destinations and keys saved in the control page; optional `sites` (`["youtube","twitch"]`) picks them (agents can't pass or read a key) |
+| `set_stream_sites` | tick/untick `youtube` and/or `twitch` (live while streaming, saved while stopped) |
 | `set_audio(mic_on, mic_gain, page_on, page_gain)` | stream sound (give only what changes) |
 | `list_gpus`, `set_gpu(choice)` | video processing; restarts Page2Cam when needed |
 | `install_update` | installs the update on offer |
