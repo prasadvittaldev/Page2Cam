@@ -25,8 +25,8 @@ pub use crate::screen::FrameOut;
 /// Lists windows and starts captures (the real one, or a fake in tests).
 pub trait WindowBackend: Send + Sync {
     fn list(&self) -> anyhow::Result<Vec<WindowInfo>>;
-    /// Capture `w` (picture and sound); dropping the run stops both.
-    fn start(&self, w: &WindowInfo) -> anyhow::Result<Box<dyn WindowRun>>;
+    /// Capture `w`, and its sound when `sound`; dropping the run stops both.
+    fn start(&self, w: &WindowInfo, sound: bool) -> anyhow::Result<Box<dyn WindowRun>>;
     /// Show black once (the captured window closed). Default: nothing.
     fn black(&self) {}
 }
@@ -78,22 +78,24 @@ impl WindowBackend for RealWindows {
         p2c_screen::list_windows()
     }
 
-    fn start(&self, w: &WindowInfo) -> anyhow::Result<Box<dyn WindowRun>> {
+    fn start(&self, w: &WindowInfo, sound: bool) -> anyhow::Result<Box<dyn WindowRun>> {
         let out = self.out.clone();
         let cap = p2c_screen::Capture::start_window(
             w.id,
             self.max_fps,
             Box::new(move |f| out(Arc::new(f))),
         )?;
-        // A sound failure keeps the picture.
-        let (sound, sound_failed) = match p2c_audio::ProcessLoopback::start(
-            w.pid,
-            self.ring.clone(),
-        ) {
-            Ok(s) => (Some(s), None),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), exe = %w.exe, "window sound unavailable");
-                (None, Some(format!("{e:#}")))
+        // A sound failure keeps the picture. Without `sound` the caller
+        // explains why (see `no_sound_reason`).
+        let (sound, sound_failed) = if !sound {
+            (None, None)
+        } else {
+            match p2c_audio::ProcessLoopback::start(w.pid, self.ring.clone()) {
+                Ok(s) => (Some(s), None),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), exe = %w.exe, "window sound unavailable");
+                    (None, Some(format!("{e:#}")))
+                }
             }
         };
         Ok(Box::new(RealRun {
@@ -125,6 +127,21 @@ const NONE_CHOSEN: &str = "no window chosen for the window background: choose a 
 /// app hasn't caught up with yet is no restart).
 const TITLES_KEPT: usize = 32;
 
+/// Why a window's sound is never captured, by its exe (case-insensitive):
+/// File Explorer is the parent of most apps started from Start or the
+/// taskbar, so its process tree's sound would be nearly every app's; Store
+/// apps' windows belong to their frame host, not the app. Their picture
+/// still shows.
+fn no_sound_reason(exe: &str) -> Option<&'static str> {
+    if exe.eq_ignore_ascii_case("explorer.exe") {
+        Some("File Explorer's sound would include every app")
+    } else if exe.eq_ignore_ascii_case("ApplicationFrameHost.exe") {
+        Some("sound of Store apps can't be captured")
+    } else {
+        None
+    }
+}
+
 /// A title change of the running window (`tick`): the match before and
 /// after. The app applies it only while it still shows `old`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,6 +155,8 @@ struct Running {
     id: u64,
     exe: String,
     app: String,
+    /// Why its sound isn't captured on purpose ([`no_sound_reason`]).
+    no_sound: Option<&'static str>,
     /// Every title this run had, oldest first.
     titles: Vec<String>,
 }
@@ -314,7 +333,8 @@ impl WindowShare {
         if st.failed_id == Some(w.id) {
             return self.blank(st); // its failure note stays; not retried
         }
-        match self.backend.start(w) {
+        let no_sound = no_sound_reason(&w.exe);
+        match self.backend.start(w, no_sound.is_none()) {
             Ok(run) => {
                 tracing::info!(exe = %w.exe, window = w.id, "window background on");
                 st.failed_id = None;
@@ -324,6 +344,7 @@ impl WindowShare {
                     id: w.id,
                     exe: w.exe.clone(),
                     app: w.app.clone(),
+                    no_sound,
                     titles: vec![w.title.clone()],
                 });
                 // An explicit pick by id may carry an older title.
@@ -342,13 +363,13 @@ impl WindowShare {
         }
     }
 
-    /// The note while running: minimized, else a sound failure, else the
-    /// browser warning.
+    /// The note while running: minimized, else why there is no sound, else
+    /// the browser warning.
     fn update_note(&self, st: &State) {
         let Some(r) = &st.running else { return };
         let n = if r.run.status() == WindowStatus::Minimized {
             Some(MINIMIZED.to_string())
-        } else if let Some(e) = r.run.sound_error() {
+        } else if let Some(e) = r.no_sound.map(String::from).or_else(|| r.run.sound_error()) {
             Some(format!("window sound unavailable: {e}"))
         } else if p2c_screen::is_browser(&r.exe) {
             Some(format!("Sound: everything playing in {}", r.app))
@@ -426,6 +447,8 @@ pub mod tests {
     pub struct FakeWindows {
         pub list: Arc<Mutex<Vec<WindowInfo>>>,
         pub starts: Arc<Mutex<Vec<u64>>>,
+        /// Whether each start asked for the sound too.
+        pub sound: Arc<Mutex<Vec<bool>>>,
         pub live: Arc<AtomicUsize>,
         pub blacks: Arc<AtomicUsize>,
         pub fail: Arc<Mutex<Option<String>>>,
@@ -459,11 +482,12 @@ pub mod tests {
             anyhow::ensure!(!self.unsupported, p2c_screen::WINDOW_UNSUPPORTED);
             Ok(self.list.lock().clone())
         }
-        fn start(&self, w: &WindowInfo) -> anyhow::Result<Box<dyn WindowRun>> {
+        fn start(&self, w: &WindowInfo, sound: bool) -> anyhow::Result<Box<dyn WindowRun>> {
             if let Some(e) = self.fail.lock().clone() {
                 anyhow::bail!(e);
             }
             self.starts.lock().push(w.id);
+            self.sound.lock().push(sound);
             self.live.fetch_add(1, Ordering::SeqCst);
             *self.run.lock() = RunState {
                 title: Some(w.title.clone()),
@@ -635,6 +659,43 @@ pub mod tests {
         assert_eq!(
             s.note().as_deref(),
             Some("window sound unavailable: denied")
+        );
+    }
+
+    /// File Explorer is the parent of most apps (its process tree's sound is
+    /// nearly everything) and Store apps' frame host isn't the app: their
+    /// picture shows, their sound is never captured.
+    #[test]
+    fn explorer_and_store_apps_get_no_sound() {
+        let (f, s) = share();
+        *f.list.lock() = vec![
+            win(1, "Explorer.EXE", "Downloads"),
+            win(2, "ApplicationFrameHost.exe", "Calculator"),
+            win(3, "game.exe", "Game"),
+        ];
+        s.sync(Some(&m("Explorer.EXE", "Downloads")), Some(1));
+        assert_eq!(s.running(), Some(1), "the picture still shows");
+        assert_eq!(
+            s.note().as_deref(),
+            Some("window sound unavailable: File Explorer's sound would include every app")
+        );
+        s.tick();
+        assert_eq!(
+            s.note().as_deref(),
+            Some("window sound unavailable: File Explorer's sound would include every app")
+        );
+        s.sync(Some(&m("ApplicationFrameHost.exe", "Calculator")), Some(2));
+        assert_eq!(s.running(), Some(2));
+        assert_eq!(
+            s.note().as_deref(),
+            Some("window sound unavailable: sound of Store apps can't be captured")
+        );
+        s.sync(Some(&m("game.exe", "Game")), Some(3));
+        assert_eq!(s.note(), None);
+        assert_eq!(
+            *f.sound.lock(),
+            vec![false, false, true],
+            "loopback per start"
         );
     }
 
