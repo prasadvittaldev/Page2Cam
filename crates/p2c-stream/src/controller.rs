@@ -538,11 +538,13 @@ impl Inner {
         };
         *self.state.lock() = StreamState::Error(why.clone());
         self.halt(r);
-        drop(running);
-        tracing::warn!("stream stopped: {why}");
+        // Pruned before the run lock goes: a start right after must not
+        // have its fresh sites pruned (lock order: running, site_states).
         self.site_states
             .lock()
             .retain(|(_, s)| matches!(*s.lock(), SiteState::Error(_)));
+        drop(running);
+        tracing::warn!("stream stopped: {why}");
     }
 
     /// A site went to error: when every site has, stop the stream.
