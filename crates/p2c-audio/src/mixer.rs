@@ -30,6 +30,8 @@ pub struct Mixer {
     page: AudioRing,
     /// Overlay-layer sound (videos, YouTube): mixed as page sound.
     overlay: Option<AudioRing>,
+    /// Window-background sound (process loopback): mixed as page sound.
+    window: Option<AudioRing>,
     mic: AudioRing,
     settings: Arc<RwLock<MixSettings>>,
     delay: Arc<parking_lot::Mutex<MicDelay>>,
@@ -55,6 +57,7 @@ impl Mixer {
         Mixer {
             page,
             overlay: None,
+            window: None,
             mic,
             settings: Arc::new(RwLock::new(settings)),
             delay: Arc::default(),
@@ -65,6 +68,13 @@ impl Mixer {
     /// same on/off and gain.
     pub fn with_overlay(mut self, ring: AudioRing) -> Self {
         self.overlay = Some(ring);
+        self
+    }
+
+    /// Also mix `ring` (the window background's process sound) as part of
+    /// page sound: same on/off and gain.
+    pub fn with_window(mut self, ring: AudioRing) -> Self {
+        self.window = Some(ring);
         self
     }
 
@@ -91,8 +101,8 @@ impl Mixer {
     /// Drop anything buffered (e.g. when a stream starts).
     pub fn reset(&self) {
         self.page.clear();
-        if let Some(o) = &self.overlay {
-            o.clear();
+        for r in [&self.overlay, &self.window].into_iter().flatten() {
+            r.clear();
         }
         self.mic.clear();
         let mut d = self.delay.lock();
@@ -129,6 +139,9 @@ impl Mixer {
             self.overlay
                 .as_ref()
                 .map(|o| (o, s.page_on, s.page_gain, false)),
+            self.window
+                .as_ref()
+                .map(|w| (w, s.page_on, s.page_gain, false)),
             Some((&self.mic, s.mic_on, s.mic_gain, hold_mic)),
         ];
         for (ring, on, gain, hold) in sources.into_iter().flatten() {
@@ -282,5 +295,36 @@ mod tests {
         // Drained while off: nothing replays when page sound comes back.
         m.set(MixSettings::default());
         assert_eq!(&m.pull(1)[..], &[0.0, 0.0]);
+    }
+
+    #[test]
+    fn window_sound_follows_page_switches() {
+        let (page, mic, win) = (
+            AudioRing::new(1000),
+            AudioRing::new(1000),
+            AudioRing::new(1000),
+        );
+        let m = Mixer::new(page, mic, MixSettings::default()).with_window(win.clone());
+        win.push(&[0.5, 0.5]);
+        assert_eq!(&m.pull(1)[..], &[0.5, 0.5]);
+        m.set(MixSettings {
+            page_on: false,
+            ..MixSettings::default()
+        });
+        win.push(&[0.5, 0.5]);
+        assert_eq!(&m.pull(1)[..], &[0.0, 0.0]);
+        m.set(MixSettings {
+            page_gain: 2.0,
+            ..MixSettings::default()
+        });
+        win.push(&[0.5, 0.5]);
+        assert_eq!(&m.pull(1)[..], &[1.0, 1.0]);
+        // Past full scale it is clamped like the other sources.
+        m.set(MixSettings {
+            page_gain: 4.0,
+            ..MixSettings::default()
+        });
+        win.push(&[0.5, -0.5]);
+        assert_eq!(&m.pull(1)[..], &[1.0, -1.0]);
     }
 }
