@@ -225,8 +225,10 @@ impl WindowShare {
     fn set_want(&self, st: &mut State, want: Option<&WindowMatch>, id: Option<u64>) -> bool {
         match want {
             None => {
-                // The page comes back (repainted by the app): no black.
+                // The page comes back (repainted by the app): no black now,
+                // but the next window wish must black out the page's frame.
                 st.running = None;
+                st.blank = false;
                 st.want = None;
                 st.failed_id = None;
                 *self.note.lock() = None;
@@ -752,6 +754,10 @@ pub mod tests {
         // Stopping (back to the page) needs no black: the page repaints.
         s.sync(None, None);
         assert_eq!(blacks(), 3);
+        // A missing window after a detour through the page (or a screen)
+        // blacks out again: never the page's or monitor's last frame.
+        s.sync(Some(&m("app.exe", "Missing")), None);
+        assert_eq!(blacks(), 4, "not found after the page");
     }
 
     /// Fix 4: picking a window again after its start failed retries it.
