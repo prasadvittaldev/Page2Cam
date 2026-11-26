@@ -40,5 +40,5 @@ Use the streamer's own name; add social handles only if they gave them. Starting
 - Only rebroadcast content the user has the right to use; many platforms mute or remove streams of other people's videos, music or matches.
 - Games in borderless or windowed mode.
 - Say which window you are about to share before you choose it, and never pick between look-alike windows yourself.
-- Twitch accepts up to 6000 kbps: lower the video bitrate if the answer warns about it.
+- Twitch accepts up to 6000 kbps: if `status.stream_note` warns about it, the user lowers the video bitrate (`video_kbps` in the settings file).
 - Never show chat usernames' personal details or private messages.
