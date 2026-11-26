@@ -61,7 +61,7 @@ mod imp {
     use anyhow::Context;
     use p2c_core::SAMPLE_RATE;
     use windows::core::{implement, Interface, Ref, HRESULT};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
     use windows::Win32::Media::Audio::{
         ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
         IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
@@ -156,7 +156,9 @@ mod imp {
     }
 
     fn activate(pid: u32) -> anyhow::Result<IAudioClient> {
-        let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+        // Boxed: after a timeout the activation may still read the PROPVARIANT
+        // and the blob it points at, so they are leaked then (see below).
+        let mut params = Box::new(AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
             Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
                 ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
@@ -164,18 +166,18 @@ mod imp {
                     ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
                 },
             },
-        };
+        });
         // ManuallyDrop: PROPVARIANT's Drop runs PropVariantClear, which would
-        // CoTaskMemFree the blob, but the blob is `params` on our stack.
-        let mut pv = std::mem::ManuallyDrop::new(PROPVARIANT::default());
-        // SAFETY: plain union writes; the blob points at `params`, which
-        // outlives the activation (we wait for it to complete below).
+        // CoTaskMemFree the blob, but the blob is our own Box.
+        let mut pv = Box::new(std::mem::ManuallyDrop::new(PROPVARIANT::default()));
+        // SAFETY: plain union writes; the blob points at `*params`, which
+        // lives until the activation completed, or for good after a timeout.
         unsafe {
             let inner = &mut *pv.Anonymous.Anonymous;
             inner.vt = VT_BLOB;
             inner.Anonymous.blob = BLOB {
                 cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-                pBlobData: &mut params as *mut _ as *mut u8,
+                pBlobData: &mut *params as *mut AUDIOCLIENT_ACTIVATION_PARAMS as *mut u8,
             };
         }
         let (tx, rx) = mpsc::channel();
@@ -184,13 +186,21 @@ mod imp {
             ActivateAudioInterfaceAsync(
                 VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
                 &IAudioClient::IID,
-                Some(&*pv),
+                Some(&**pv),
                 &handler,
             )
         }
         .context("ActivateAudioInterfaceAsync")?;
-        rx.recv_timeout(Duration::from_secs(5))
-            .context("audio activation did not complete")?;
+        if rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            // The activation may still be running: it can read `pv`/`params`
+            // or call `handler` later. Keep them all alive for good (a few
+            // bytes per rare failure) rather than free memory it may touch.
+            Box::leak(params);
+            Box::leak(pv);
+            std::mem::forget(handler);
+            std::mem::forget(op);
+            anyhow::bail!("audio activation did not complete");
+        }
         let mut hr = HRESULT(0);
         let mut unknown = None;
         unsafe { op.GetActivateResult(&mut hr, &mut unknown) }.context("GetActivateResult")?;
@@ -319,6 +329,12 @@ mod imp {
                 let mut rs = Resampler::new(opened.rate, SAMPLE_RATE);
                 while !stop2.load(Ordering::Relaxed) {
                     let w = unsafe { WaitForSingleObject(session.event, 100) };
+                    if w == WAIT_FAILED {
+                        let e = windows::core::Error::from_thread();
+                        tracing::warn!(pid, error = %e, "window sound capture stopped");
+                        *error2.lock() = Some(format!("waiting for sound failed: {e}"));
+                        break;
+                    }
                     if w != WAIT_OBJECT_0 {
                         continue;
                     }
