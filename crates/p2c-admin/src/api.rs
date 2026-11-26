@@ -98,7 +98,7 @@ pub struct SitesRequest {
 /// `POST /api/stream/start`: `{sites: {youtube?, twitch?}}` (an empty
 /// `sites` starts the saved ticks), or the older `{url, key, remember}`,
 /// which means YouTube ticked with that server and key.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum StreamRequest {
     Sites {
@@ -111,6 +111,23 @@ pub enum StreamRequest {
         #[serde(default)]
         remember: bool,
     },
+}
+
+/// Never prints the key (`****` when there is one).
+impl std::fmt::Debug for StreamRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamRequest::Sites { sites } => {
+                f.debug_struct("Sites").field("sites", sites).finish()
+            }
+            StreamRequest::Legacy { url, key, remember } => f
+                .debug_struct("Legacy")
+                .field("url", url)
+                .field("key", &if key.is_empty() { "" } else { "****" })
+                .field("remember", remember)
+                .finish(),
+        }
+    }
 }
 
 impl StreamRequest {
@@ -662,5 +679,22 @@ mod tests {
             ..Default::default()
         };
         assert!(!format!("{r:?}").contains("secret-key"));
+    }
+
+    #[test]
+    fn stream_request_debug_hides_the_key() {
+        let r: StreamRequest = serde_json::from_str(
+            r#"{"url":"rtmp://a.rtmp.youtube.com/live2","key":"legacy-secret"}"#,
+        )
+        .unwrap();
+        let d = format!("{r:?}");
+        assert!(!d.contains("legacy-secret"), "{d}");
+        assert!(
+            d.contains("****") && d.contains("rtmp://a.rtmp.youtube.com/live2"),
+            "{d}"
+        );
+        let r: StreamRequest =
+            serde_json::from_str(r#"{"sites":{"twitch":{"key":"site-secret"}}}"#).unwrap();
+        assert!(!format!("{r:?}").contains("site-secret"));
     }
 }

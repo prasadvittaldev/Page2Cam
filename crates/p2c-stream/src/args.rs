@@ -45,13 +45,24 @@ impl Site {
 }
 
 /// One RTMP destination.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Destination {
     pub site: Site,
     /// RTMP server URL (e.g. rtmp://a.rtmp.youtube.com/live2).
     pub url: String,
     /// Stream key, appended as the last path segment. Empty: `url` is complete.
     pub key: String,
+}
+
+/// Never prints the key (`****` when there is one).
+impl std::fmt::Debug for Destination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Destination")
+            .field("site", &self.site)
+            .field("url", &redact(&self.url, &self.key))
+            .field("key", &if self.key.is_empty() { "" } else { "****" })
+            .finish()
+    }
 }
 
 impl Destination {
@@ -396,6 +407,29 @@ mod tests {
             pix_fmt: "bgra",
             encoder: Encoder::X264,
         }
+    }
+
+    #[test]
+    fn debug_hides_the_keys() {
+        let c = cfg_with(vec![
+            Destination {
+                site: Site::YouTube,
+                url: "rtmp://a.rtmp.youtube.com/live2".into(),
+                key: "yt-secret-key".into(),
+            },
+            Destination {
+                site: Site::Twitch,
+                url: "rtmp://live.twitch.tv/app".into(),
+                key: String::new(),
+            },
+        ]);
+        let d = format!("{c:?}");
+        assert!(!d.contains("yt-secret-key"), "{d}");
+        assert!(
+            d.contains("****") && d.contains("rtmp://live.twitch.tv/app"),
+            "{d}"
+        );
+        assert!(!format!("{:?}", c.destinations[0]).contains("yt-secret-key"));
     }
 
     fn with(e: Encoder) -> String {
