@@ -5,18 +5,259 @@ use anyhow::Context;
 
 use p2c_admin::{
     AudioSettings, BackgroundDto, Controls, GpuInfo, ImageRow, InputEvent, KeyAction, MouseBtn,
-    NavAction, Status, StreamRequest,
+    NavAction, SiteRequest, SiteStatusDto, SitesRequest, Status,
 };
 use p2c_audio::{MicCapture, MixSettings, Mixer};
 use p2c_browser::{BrowserHandle, KeyInput, KeyKind, MouseButton};
 use p2c_compositor::{Backdrop, OverlayStyle, PipLayout};
 use p2c_core::{AudioRing, FrameSlot};
 use p2c_segment::{EngineChoice, Segmenter};
-use p2c_stream::{StreamConfig, StreamController, StreamState};
+use p2c_stream::{
+    redact_all, Destination, Encoder, Site, SiteState, StreamConfig, StreamController, StreamState,
+};
 use parking_lot::{Mutex, RwLock};
 
 const KEYRING_SERVICE: &str = "page2cam";
+/// YouTube's key (the entry predates Twitch).
 const KEYRING_USER: &str = "stream-key";
+const KEYRING_TWITCH_USER: &str = "twitch-stream-key";
+
+/// The stream sites, in the order they are shown and checked.
+const SITES: [Site; 2] = [Site::YouTube, Site::Twitch];
+const NO_SITE: &str = "Choose YouTube and/or Twitch.";
+/// Twitch's highest accepted video bitrate (kbps).
+const TWITCH_MAX_KBPS: u32 = 6000;
+const TWITCH_KBPS_NOTE: &str =
+    "Twitch accepts up to 6000 kbps; lower 'video bitrate' or Twitch may refuse the stream.";
+
+/// The stream as the app drives it: the real [`StreamController`], a fake
+/// in tests.
+pub trait Streamer: Send + Sync {
+    /// Start (or restart) with `cfg.destinations`.
+    fn start(&self, cfg: StreamConfig) -> anyhow::Result<()>;
+    /// Change the sites while running (empty stops).
+    fn set_destinations(&self, d: Vec<Destination>) -> anyhow::Result<()>;
+    /// Every site with its state.
+    fn sites(&self) -> Vec<(Site, SiteState)>;
+    fn state(&self) -> StreamState;
+    fn stop(&self);
+    fn set_encoder(&self, _e: Encoder) {}
+    fn encoder_fallback(&self) -> Option<String> {
+        None
+    }
+}
+
+impl Streamer for StreamController {
+    fn start(&self, cfg: StreamConfig) -> anyhow::Result<()> {
+        let ffmpeg = p2c_stream::find_ffmpeg().ok_or_else(|| {
+            anyhow::anyhow!(
+                "ffmpeg was not found. Put ffmpeg{} next to page2cam or on PATH",
+                std::env::consts::EXE_SUFFIX
+            )
+        })?;
+        StreamController::start(self, cfg, &ffmpeg)
+    }
+    fn set_destinations(&self, d: Vec<Destination>) -> anyhow::Result<()> {
+        StreamController::set_destinations(self, d)
+    }
+    fn sites(&self) -> Vec<(Site, SiteState)> {
+        StreamController::sites(self)
+    }
+    fn state(&self) -> StreamState {
+        StreamController::state(self)
+    }
+    fn stop(&self) {
+        StreamController::stop(self)
+    }
+    fn set_encoder(&self, e: Encoder) {
+        StreamController::set_encoder(self, e)
+    }
+    fn encoder_fallback(&self) -> Option<String> {
+        StreamController::encoder_fallback(self)
+    }
+}
+
+/// Where remembered stream keys live: the OS keyring, a fake in tests.
+pub trait KeyStore: Send + Sync {
+    fn get(&self, site: Site) -> Option<String>;
+    fn set(&self, site: Site, key: &str) -> anyhow::Result<()>;
+}
+
+/// The OS keyring (`keyring` crate): one entry per site.
+pub struct Keyring;
+
+impl Keyring {
+    fn entry(site: Site) -> keyring::Result<keyring::Entry> {
+        let user = match site {
+            Site::YouTube => KEYRING_USER,
+            Site::Twitch => KEYRING_TWITCH_USER,
+        };
+        keyring::Entry::new(KEYRING_SERVICE, user)
+    }
+}
+
+impl KeyStore for Keyring {
+    fn get(&self, site: Site) -> Option<String> {
+        Self::entry(site).ok()?.get_password().ok()
+    }
+    fn set(&self, site: Site, key: &str) -> anyhow::Result<()> {
+        Self::entry(site)
+            .and_then(|e| e.set_password(key))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+/// One site's stream choices.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SiteChoice {
+    /// Ticked (saved as `stream_youtube` / `stream_twitch`).
+    pub on: bool,
+    /// RTMP server (saved as `rtmp_url` / `twitch_url`).
+    pub url: String,
+    /// The key typed in this run (memory only; never log it). Wins over the
+    /// keyring, so a live site keeps the key it was started with.
+    pub typed_key: String,
+}
+
+/// The stream choices for every site.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StreamSites {
+    pub youtube: SiteChoice,
+    pub twitch: SiteChoice,
+}
+
+impl StreamSites {
+    pub fn from_config(c: &crate::config::Config) -> Self {
+        let choice = |on: bool, url: &str| SiteChoice {
+            on,
+            url: url.trim().to_string(),
+            typed_key: String::new(),
+        };
+        StreamSites {
+            youtube: choice(c.stream_youtube, &c.rtmp_url),
+            twitch: choice(c.stream_twitch, &c.twitch_url),
+        }
+    }
+
+    pub fn get(&self, s: Site) -> &SiteChoice {
+        match s {
+            Site::YouTube => &self.youtube,
+            Site::Twitch => &self.twitch,
+        }
+    }
+
+    fn get_mut(&mut self, s: Site) -> &mut SiteChoice {
+        match s {
+            Site::YouTube => &mut self.youtube,
+            Site::Twitch => &mut self.twitch,
+        }
+    }
+
+    /// The typed keys (for redaction).
+    fn typed_keys(&self) -> impl Iterator<Item = String> + '_ {
+        SITES
+            .iter()
+            .map(|&s| self.get(s).typed_key.clone())
+            .filter(|k| !k.is_empty())
+    }
+}
+
+/// A stream request merged into the current choices (nothing applied yet).
+struct SitesPlan {
+    sites: StreamSites,
+    /// Keys to save in the keyring (`remember`).
+    remember: Vec<(Site, String)>,
+    /// Each site's key: typed in this run, else the saved one.
+    keys: Vec<(Site, Option<String>)>,
+}
+
+fn site_request(req: &SitesRequest, s: Site) -> Option<&SiteRequest> {
+    match s {
+        Site::YouTube => req.youtube.as_ref(),
+        Site::Twitch => req.twitch.as_ref(),
+    }
+}
+
+/// `req` over `current`: a tick, server or key the request leaves out keeps
+/// its current value; an empty server is ignored.
+fn merge_sites(
+    current: &StreamSites,
+    req: &SitesRequest,
+    saved_key: impl Fn(Site) -> Option<String>,
+) -> SitesPlan {
+    let mut sites = current.clone();
+    let mut remember = Vec::new();
+    let mut keys = Vec::new();
+    for s in SITES {
+        let c = sites.get_mut(s);
+        if let Some(r) = site_request(req, s) {
+            if let Some(on) = r.on {
+                c.on = on;
+            }
+            if let Some(url) = r.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                c.url = url.to_string();
+            }
+            let key = r.key.trim();
+            if !key.is_empty() {
+                c.typed_key = key.to_string();
+                if r.remember {
+                    remember.push((s, key.to_string()));
+                }
+            }
+        }
+        let key = if c.typed_key.is_empty() {
+            saved_key(s)
+        } else {
+            Some(c.typed_key.clone())
+        };
+        keys.push((s, key));
+    }
+    SitesPlan {
+        sites,
+        remember,
+        keys,
+    }
+}
+
+impl SitesPlan {
+    /// The ticked sites as destinations; a ticked site without a key or
+    /// server is an error. Empty when nothing is ticked.
+    fn destinations(&self) -> anyhow::Result<Vec<Destination>> {
+        let mut out = Vec::new();
+        for (s, key) in &self.keys {
+            let c = self.sites.get(*s);
+            if !c.on {
+                continue;
+            }
+            let key = key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("{} has no stream key", s.label()))?;
+            anyhow::ensure!(!c.url.is_empty(), "enter the {} server URL", s.label());
+            out.push(Destination {
+                site: *s,
+                url: c.url.clone(),
+                key,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every key involved (for redaction).
+    fn all_keys(&self) -> Vec<String> {
+        self.keys
+            .iter()
+            .filter_map(|(_, k)| k.clone())
+            .chain(self.remember.iter().map(|(_, k)| k.clone()))
+            .chain(self.sites.typed_keys())
+            .collect()
+    }
+}
+
+/// `e` as one line with every key in `keys` replaced by `****`.
+fn redacted(e: anyhow::Error, keys: &[String]) -> anyhow::Error {
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    anyhow::anyhow!(redact_all(&format!("{e:#}"), &refs))
+}
 
 pub struct App {
     pub browser: OnceLock<BrowserHandle>,
@@ -38,7 +279,13 @@ pub struct App {
     pub thumbs: crate::background::ThumbCache,
     /// Webcam crop, read by the capture thread for every frame.
     pub crop: p2c_core::SharedCrop,
-    pub stream: StreamController,
+    pub stream: Box<dyn Streamer>,
+    /// Remembered stream keys (the OS keyring).
+    pub keys: Box<dyn KeyStore>,
+    /// Ticks, servers and this run's typed keys per site.
+    pub stream_sites: Mutex<StreamSites>,
+    /// Serializes stream starts and site changes (never held by `status()`).
+    pub stream_ops: Mutex<()>,
     pub mixer: Mixer,
     pub mic_ring: AudioRing,
     pub mic: Mutex<Option<MicCapture>>,
@@ -51,7 +298,6 @@ pub struct App {
     pub vcam_live: p2c_vcam::CameraStatus,
     /// ffmpeg raw input format matching the ticker's output (`"nv12"` or `"bgra"`).
     pub stream_pix_fmt: &'static str,
-    pub stream_url: Mutex<String>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -190,18 +436,109 @@ impl App {
         }
     }
 
-    fn saved_key() -> Option<String> {
-        keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
-            .ok()?
-            .get_password()
-            .ok()
+    /// `site`'s key saved in the keyring, if any.
+    fn saved_key(&self, site: Site) -> Option<String> {
+        self.keys.get(site).filter(|k| !k.is_empty())
     }
 
-    fn save_key(key: &str) {
-        match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).and_then(|e| e.set_password(key)) {
-            Ok(()) => tracing::info!("stream key saved in the system keyring"),
-            Err(e) => tracing::warn!(error = %e, "could not save the stream key"),
+    fn save_key(&self, site: Site, key: &str) {
+        match self.keys.set(site, key) {
+            Ok(()) => tracing::info!("{} stream key saved in the system keyring", site.label()),
+            Err(e) => {
+                let e = redact_all(&e.to_string(), &[key]);
+                tracing::warn!(error = %e, "could not save the {} stream key", site.label())
+            }
         }
+    }
+
+    /// Every key the app knows (typed in this run, saved, and `plan`'s),
+    /// for redaction.
+    fn known_keys(&self, plan: Option<&SitesPlan>) -> Vec<String> {
+        let mut keys: Vec<String> = SITES.iter().filter_map(|&s| self.saved_key(s)).collect();
+        keys.extend(lock(&self.stream_sites, "stream_sites").typed_keys());
+        if let Some(p) = plan {
+            keys.extend(p.all_keys());
+        }
+        keys
+    }
+
+    /// The encoder or a sender is running (a stream stopped by itself is not).
+    fn stream_running(&self) -> bool {
+        matches!(
+            self.stream.state(),
+            StreamState::Connecting | StreamState::Live
+        )
+    }
+
+    /// Apply a checked plan: the choices, remembered keys and the settings file.
+    fn commit_sites(&self, plan: SitesPlan) {
+        let old = std::mem::replace(
+            &mut *lock(&self.stream_sites, "stream_sites"),
+            plan.sites.clone(),
+        );
+        for (s, k) in &plan.remember {
+            self.save_key(*s, k);
+        }
+        let new = &plan.sites;
+        let changed = SITES
+            .iter()
+            .any(|&s| (old.get(s).on, &old.get(s).url) != (new.get(s).on, &new.get(s).url));
+        if changed {
+            tracing::info!(
+                youtube = new.youtube.on,
+                twitch = new.twitch.on,
+                "stream sites changed"
+            );
+            self.save_values(&[
+                ("stream_youtube", new.youtube.on.into()),
+                ("stream_twitch", new.twitch.on.into()),
+                ("rtmp_url", new.youtube.url.as_str().into()),
+                ("twitch_url", new.twitch.url.as_str().into()),
+            ]);
+        }
+    }
+
+    /// The stream part of the status: overall state, every site (YouTube
+    /// then Twitch), the bitrate note, and YouTube's server and saved-key
+    /// flag (for older clients). Keys are redacted from every state text.
+    fn stream_status(&self) -> (String, Vec<SiteStatusDto>, Option<String>, String, bool) {
+        let saved: Vec<Option<String>> = SITES.iter().map(|&s| self.saved_key(s)).collect();
+        let choices = lock(&self.stream_sites, "stream_sites").clone();
+        let keys: Vec<String> = saved
+            .iter()
+            .flatten()
+            .cloned()
+            .chain(choices.typed_keys())
+            .collect();
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let stream = redact_all(&self.stream.state().to_string(), &refs);
+        let states = self.stream.sites();
+        let streams = SITES
+            .iter()
+            .zip(&saved)
+            .map(|(&s, saved)| {
+                let state = states
+                    .iter()
+                    .find(|(x, _)| *x == s)
+                    .map_or(SiteState::Idle, |(_, st)| st.clone());
+                SiteStatusDto {
+                    site: s.as_str().into(),
+                    state: redact_all(&state.to_string(), &refs),
+                    ticked: choices.get(s).on,
+                    has_saved_key: saved.is_some(),
+                    url: choices.get(s).url.clone(),
+                }
+            })
+            .collect();
+        let note = (choices.twitch.on && self.video_kbps > TWITCH_MAX_KBPS)
+            .then(|| TWITCH_KBPS_NOTE.to_string());
+        (
+            stream,
+            streams,
+            note,
+            choices.youtube.url.clone(),
+            saved[0].is_some(),
+        )
     }
 
     fn update_mic(&self, want: bool) {
@@ -520,8 +857,8 @@ impl App {
             return;
         }
         match crate::config::save_values(p, values) {
-            Ok(()) => tracing::info!(file = %p.display(), "background settings saved"),
-            Err(e) => tracing::warn!("could not save the background settings: {e:#}"),
+            Ok(()) => tracing::info!(file = %p.display(), "settings saved"),
+            Err(e) => tracing::warn!("could not save the settings: {e:#}"),
         }
     }
 
@@ -969,36 +1306,48 @@ impl Controls for App {
         self.update_segmenter();
     }
 
-    fn start_stream(&self, req: StreamRequest) -> anyhow::Result<()> {
-        let key = if req.key.trim().is_empty() {
-            Self::saved_key().ok_or_else(|| anyhow::anyhow!("enter your stream key"))?
-        } else {
-            req.key.trim().to_string()
-        };
-        if req.remember && !req.key.trim().is_empty() {
-            Self::save_key(&key);
-        }
-        let ffmpeg = p2c_stream::find_ffmpeg().ok_or_else(|| {
-            anyhow::anyhow!(
-                "ffmpeg was not found. Put ffmpeg{} next to page2cam or on PATH",
-                std::env::consts::EXE_SUFFIX
-            )
-        })?;
-        *self.stream_url.lock() = req.url.trim().to_string();
+    fn start_stream(&self, req: SitesRequest) -> anyhow::Result<()> {
+        let _op = self.stream_ops.lock();
+        let current = lock(&self.stream_sites, "stream_sites").clone();
+        let plan = merge_sites(&current, &req, |s| self.saved_key(s));
+        let keys = self.known_keys(Some(&plan));
+        let destinations = plan
+            .destinations()
+            .and_then(|d| {
+                anyhow::ensure!(!d.is_empty(), NO_SITE);
+                Ok(d)
+            })
+            .map_err(|e| redacted(e, &keys))?;
+        self.commit_sites(plan);
+        let names: Vec<&str> = destinations.iter().map(|d| d.site.label()).collect();
+        tracing::info!(sites = %names.join(", "), "stream starting");
         let cfg = StreamConfig {
-            destinations: vec![p2c_stream::Destination {
-                site: p2c_stream::Site::YouTube,
-                url: req.url.trim().to_string(),
-                key,
-            }],
+            destinations,
             width: self.width,
             height: self.height,
             fps: self.fps,
             video_kbps: self.video_kbps,
             pix_fmt: self.stream_pix_fmt,
-            encoder: p2c_stream::Encoder::X264, // replaced by the controller (set_encoder)
+            encoder: Encoder::X264, // replaced by the controller (set_encoder)
         };
-        self.stream.start(cfg, &ffmpeg)
+        self.stream.start(cfg).map_err(|e| redacted(e, &keys))
+    }
+
+    fn set_stream_sites(&self, req: SitesRequest) -> anyhow::Result<()> {
+        let _op = self.stream_ops.lock();
+        let current = lock(&self.stream_sites, "stream_sites").clone();
+        let plan = merge_sites(&current, &req, |s| self.saved_key(s));
+        let keys = self.known_keys(Some(&plan));
+        // While live the change applies at once (a ticked site needs its
+        // key); otherwise it is only saved for the next start.
+        if self.stream_running() {
+            let d = plan.destinations().map_err(|e| redacted(e, &keys))?;
+            self.stream
+                .set_destinations(d)
+                .map_err(|e| redacted(e, &keys))?;
+        }
+        self.commit_sites(plan);
+        Ok(())
     }
 
     fn stop_stream(&self) {
@@ -1034,16 +1383,12 @@ impl Controls for App {
             .and_then(|s| s.latest())
             .map(|f| f.height as f32 / f.width.max(1) as f32)
             .unwrap_or(9.0 / 16.0);
-        let stream = match self.stream.state() {
-            StreamState::Idle => "idle".to_string(),
-            s => s.to_string(),
-        };
+        let (stream, streams, stream_note, stream_url, has_saved_key) = self.stream_status();
         // Every locked value is read into its own local (each guard dropped
         // at the end of its `let`): a guard alive inside the literal below
         // would last the whole statement and deadlock any call in it that
         // takes the same lock again (it happened with `video`/`health`).
         let gpu_saved = lock(&self.gpu_saved, "gpu_saved").clone();
-        let stream_url = lock(&self.stream_url, "stream_url").clone();
         let mic = lock(&self.mic_status, "mic_status").clone();
         let video = display_video(&lock(&self.video, "video").clone());
         let probed = lock(&self.encoder, "encoder").clone();
@@ -1054,7 +1399,6 @@ impl Controls for App {
         let cutout_engine = self.cutout_engine();
         let cutout_gpu = self.cutout_device();
         let update = self.updater.info();
-        let has_saved_key = Self::saved_key().is_some();
         let health = self.health();
         // While a generated background shows, the admin page keeps the
         // user's page URL (never a /bg/ URL).
@@ -1086,6 +1430,8 @@ impl Controls for App {
             stream,
             stream_url,
             has_saved_key,
+            streams,
+            stream_note,
             mic,
             log_file: self.log_file.clone(),
             cutout,
@@ -1653,7 +1999,7 @@ mod tests {
     }
 
     /// An `App` without browser, webcam or segmenter.
-    fn bare_app() -> App {
+    pub(super) fn bare_app() -> App {
         let (page, mic) = (AudioRing::new(50), AudioRing::new(50));
         let mixer = Mixer::new(page, mic.clone(), MixSettings::default());
         App {
@@ -1674,7 +2020,10 @@ mod tests {
                 anyhow::bail!("no network in tests")
             })),
             crop: Arc::new(RwLock::new(p2c_core::Crop::FULL)),
-            stream: StreamController::new(mixer.clone()),
+            stream: Box::new(super::stream_tests::FakeStreamer::default()),
+            keys: Box::new(super::stream_tests::FakeKeys::default()),
+            stream_sites: Mutex::new(StreamSites::from_config(&crate::config::Config::default())),
+            stream_ops: Mutex::new(()),
             mixer,
             mic_ring: mic,
             mic: Mutex::new(None),
@@ -1684,7 +2033,6 @@ mod tests {
             vcam_status: "ok: test".into(),
             vcam_live: p2c_vcam::CameraStatus::default(),
             stream_pix_fmt: "bgra",
-            stream_url: Mutex::new(String::new()),
             width: 1280,
             height: 720,
             fps: 30,
@@ -2437,5 +2785,390 @@ mod tests {
         assert_eq!(MAX_MIC_DELAY_MS, 250);
         assert_eq!(mic_delay(&[200; 5], 100), 250);
         assert_eq!(mic_delay(&[], 400), 250);
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use p2c_admin::{SiteRequest, SitesRequest};
+    use p2c_stream::{Destination, Site, SiteState};
+
+    /// The controller seam: records starts and destination changes.
+    #[derive(Clone, Default)]
+    pub(super) struct FakeStreamer(Arc<Mutex<FakeStream>>);
+
+    #[derive(Default)]
+    pub(super) struct FakeStream {
+        /// Sites streaming now (empty: stopped).
+        running: Vec<Destination>,
+        /// Set after an automatic stop (every site failed).
+        failed: Option<String>,
+        starts: Vec<Vec<Destination>>,
+        /// The next `start` fails with this.
+        start_error: Option<String>,
+    }
+
+    impl FakeStreamer {
+        /// As the controller after an automatic stop: not running, the
+        /// error kept (its `stop` does nothing).
+        fn fail_all(&self, why: &str) {
+            let mut s = self.0.lock();
+            s.running.clear();
+            s.failed = Some(why.into());
+        }
+        fn starts(&self) -> usize {
+            self.0.lock().starts.len()
+        }
+        fn running(&self) -> Vec<(Site, String, String)> {
+            let s = self.0.lock();
+            s.running
+                .iter()
+                .map(|d| (d.site, d.url.clone(), d.key.clone()))
+                .collect()
+        }
+    }
+
+    impl Streamer for FakeStreamer {
+        fn start(&self, cfg: StreamConfig) -> anyhow::Result<()> {
+            let mut s = self.0.lock();
+            if let Some(e) = s.start_error.take() {
+                anyhow::bail!(e);
+            }
+            s.failed = None;
+            s.starts.push(cfg.destinations.clone());
+            s.running = cfg.destinations;
+            Ok(())
+        }
+        fn set_destinations(&self, d: Vec<Destination>) -> anyhow::Result<()> {
+            self.0.lock().running = d;
+            Ok(())
+        }
+        fn sites(&self) -> Vec<(Site, SiteState)> {
+            let s = self.0.lock();
+            [Site::YouTube, Site::Twitch]
+                .into_iter()
+                .map(|site| {
+                    let st = if s.running.iter().any(|d| d.site == site) {
+                        SiteState::Live
+                    } else if let Some(e) = &s.failed {
+                        SiteState::Error(e.clone())
+                    } else {
+                        SiteState::Idle
+                    };
+                    (site, st)
+                })
+                .collect()
+        }
+        fn state(&self) -> StreamState {
+            let s = self.0.lock();
+            match (&s.failed, s.running.is_empty()) {
+                (_, false) => StreamState::Live,
+                (Some(e), true) => StreamState::Error(e.clone()),
+                (None, true) => StreamState::Idle,
+            }
+        }
+        fn stop(&self) {
+            let mut s = self.0.lock();
+            if s.failed.is_none() {
+                s.running.clear();
+            }
+        }
+    }
+
+    /// The keyring seam.
+    #[derive(Clone, Default)]
+    pub(super) struct FakeKeys(Arc<Mutex<Vec<(Site, String)>>>);
+
+    impl KeyStore for FakeKeys {
+        fn get(&self, site: Site) -> Option<String> {
+            let k = self.0.lock();
+            k.iter().find(|(s, _)| *s == site).map(|(_, k)| k.clone())
+        }
+        fn set(&self, site: Site, key: &str) -> anyhow::Result<()> {
+            let mut k = self.0.lock();
+            k.retain(|(s, _)| *s != site);
+            k.push((site, key.into()));
+            Ok(())
+        }
+    }
+
+    struct TestApp {
+        app: App,
+        stream: FakeStreamer,
+        keys: FakeKeys,
+    }
+
+    impl std::ops::Deref for TestApp {
+        type Target = App;
+        fn deref(&self) -> &App {
+            &self.app
+        }
+    }
+
+    fn test_app() -> TestApp {
+        test_app_with_kbps(4000)
+    }
+
+    fn test_app_with_kbps(kbps: u32) -> TestApp {
+        let mut app = super::tests::bare_app();
+        let (stream, keys) = (FakeStreamer::default(), FakeKeys::default());
+        app.stream = Box::new(stream.clone());
+        app.keys = Box::new(keys.clone());
+        app.video_kbps = kbps;
+        TestApp { app, stream, keys }
+    }
+
+    fn site(on: Option<bool>, key: &str, remember: bool) -> Option<SiteRequest> {
+        Some(SiteRequest {
+            on,
+            key: key.into(),
+            remember,
+            url: None,
+        })
+    }
+
+    fn sites(youtube: bool, twitch: bool) -> SitesRequest {
+        SitesRequest {
+            youtube: site(Some(youtube), "", false),
+            twitch: site(Some(twitch), "", false),
+        }
+    }
+
+    fn sites_tw_only_no_key() -> SitesRequest {
+        sites(false, true)
+    }
+
+    fn tick_twitch() -> SitesRequest {
+        SitesRequest {
+            youtube: None,
+            twitch: site(Some(true), "", false),
+        }
+    }
+
+    fn tick_twitch_with_key() -> SitesRequest {
+        SitesRequest {
+            youtube: None,
+            twitch: site(Some(true), "tw-key-1", false),
+        }
+    }
+
+    /// Live on YouTube with a key typed in (not remembered).
+    fn live_app_with_youtube() -> TestApp {
+        let app = test_app();
+        let req = SitesRequest {
+            youtube: site(Some(true), "yt-key-1", false),
+            twitch: None,
+        };
+        app.start_stream(req).unwrap();
+        assert_eq!(app.status().streams[0].state, "live");
+        app
+    }
+
+    #[test]
+    fn start_rules() {
+        let app = test_app();
+        assert_eq!(
+            app.start_stream(sites(false, false))
+                .unwrap_err()
+                .to_string(),
+            "Choose YouTube and/or Twitch."
+        );
+        assert_eq!(
+            app.start_stream(sites_tw_only_no_key())
+                .unwrap_err()
+                .to_string(),
+            "Twitch has no stream key"
+        );
+        // YouTube is ticked by default and has no key either.
+        assert_eq!(
+            app.start_stream(SitesRequest::default())
+                .unwrap_err()
+                .to_string(),
+            "YouTube has no stream key"
+        );
+        assert_eq!(app.stream.starts(), 0);
+        // Nothing was saved by the refused starts.
+        let s = app.status();
+        assert!(
+            s.streams[0].ticked && !s.streams[1].ticked,
+            "{:?}",
+            s.streams
+        );
+    }
+
+    #[test]
+    fn start_uses_saved_and_typed_keys_and_saves_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# mine\nfps = 30\n").unwrap();
+        app.app.settings_path = Some(path.clone());
+        app.keys.set(Site::YouTube, "yt-saved").unwrap();
+        let req = SitesRequest {
+            youtube: None,
+            twitch: Some(SiteRequest {
+                on: Some(true),
+                key: " tw-typed ".into(),
+                remember: true,
+                url: Some("rtmp://ingest.example/app ".into()),
+            }),
+        };
+        app.start_stream(req).unwrap();
+        assert_eq!(
+            app.stream.running(),
+            vec![
+                (
+                    Site::YouTube,
+                    "rtmp://a.rtmp.youtube.com/live2".into(),
+                    "yt-saved".into()
+                ),
+                (
+                    Site::Twitch,
+                    "rtmp://ingest.example/app".into(),
+                    "tw-typed".into()
+                ),
+            ]
+        );
+        assert_eq!(app.keys.get(Site::Twitch).as_deref(), Some("tw-typed"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# mine"), "{text}");
+        let c: crate::config::Config = toml::from_str(&text).unwrap();
+        assert!(c.stream_youtube && c.stream_twitch);
+        assert_eq!(c.twitch_url, "rtmp://ingest.example/app");
+        assert!(!text.contains("tw-typed"), "{text}");
+        let s = app.status();
+        assert_eq!(s.streams.len(), 2);
+        assert_eq!(
+            (
+                s.streams[1].site.as_str(),
+                s.streams[1].ticked,
+                s.streams[1].has_saved_key
+            ),
+            ("twitch", true, true)
+        );
+        assert_eq!(s.streams[1].url, "rtmp://ingest.example/app");
+        assert!(s.has_saved_key);
+        assert_eq!(s.stream_url, "rtmp://a.rtmp.youtube.com/live2");
+    }
+
+    #[test]
+    fn typed_key_not_remembered_is_kept_for_this_run_only() {
+        let app = test_app();
+        let req = SitesRequest {
+            youtube: site(Some(true), "yt-typed", false),
+            twitch: None,
+        };
+        app.start_stream(req).unwrap();
+        assert_eq!(app.keys.get(Site::YouTube), None);
+        assert!(!app.status().streams[0].has_saved_key);
+        app.stop_stream();
+        // Started again without typing it: the key from this run.
+        app.start_stream(SitesRequest::default()).unwrap();
+        assert_eq!(app.stream.running()[0].2, "yt-typed");
+    }
+
+    #[test]
+    fn legacy_request_starts_youtube() {
+        let app = test_app();
+        let req: p2c_admin::StreamRequest =
+            serde_json::from_str(r#"{"url":"rtmp://my.server/live","key":"k-1","remember":false}"#)
+                .unwrap();
+        app.start_stream(req.normalized()).unwrap();
+        assert_eq!(
+            app.stream.running(),
+            vec![(Site::YouTube, "rtmp://my.server/live".into(), "k-1".into())]
+        );
+        assert_eq!(app.status().stream_url, "rtmp://my.server/live");
+    }
+
+    #[test]
+    fn ticking_twitch_without_key_while_live_leaves_youtube() {
+        let app = live_app_with_youtube();
+        let e = app.set_stream_sites(tick_twitch()).unwrap_err().to_string();
+        assert_eq!(e, "Twitch has no stream key");
+        assert_eq!(app.status().streams[0].state, "live");
+        assert!(!app.status().streams[1].ticked);
+        assert_eq!(app.stream.running().len(), 1);
+    }
+
+    #[test]
+    fn ticks_change_live_sites_and_the_last_untick_stops() {
+        let app = live_app_with_youtube();
+        app.set_stream_sites(tick_twitch_with_key()).unwrap();
+        let running = app.stream.running();
+        assert_eq!(running.len(), 2);
+        // YouTube keeps the key it was started with (typed, not saved).
+        assert_eq!(running[0].2, "yt-key-1");
+        assert_eq!(running[1].2, "tw-key-1");
+        let s = app.status();
+        assert_eq!(
+            (s.streams[1].state.as_str(), s.streams[1].ticked),
+            ("live", true)
+        );
+        app.set_stream_sites(sites(false, false)).unwrap();
+        assert!(app.stream.running().is_empty());
+        assert_eq!(app.status().stream, "idle");
+        assert!(!app.status().streams[0].ticked);
+    }
+
+    #[test]
+    fn ticking_while_idle_only_saves() {
+        let app = test_app();
+        // No key needed until the stream starts.
+        app.set_stream_sites(tick_twitch()).unwrap();
+        assert!(app.status().streams[1].ticked);
+        assert_eq!(app.stream.starts(), 0);
+        assert!(app.stream.running().is_empty());
+    }
+
+    #[test]
+    fn starts_again_after_an_automatic_stop() {
+        let app = live_app_with_youtube();
+        app.stream.fail_all("bad key");
+        assert!(app.status().stream.starts_with("error"));
+        // Ticks while stopped by itself only save (no set_destinations).
+        app.set_stream_sites(tick_twitch_with_key()).unwrap();
+        assert!(app.stream.running().is_empty());
+        app.stop_stream();
+        app.start_stream(SitesRequest::default()).unwrap();
+        assert_eq!(app.stream.starts(), 2);
+        assert_eq!(app.status().stream, "live");
+        assert_eq!(app.stream.running().len(), 2);
+    }
+
+    #[test]
+    fn twitch_bitrate_note() {
+        let app = test_app_with_kbps(8000);
+        assert_eq!(app.status().stream_note, None);
+        app.set_stream_sites(tick_twitch_with_key()).unwrap();
+        assert_eq!(
+            app.status().stream_note.as_deref(),
+            Some(
+                "Twitch accepts up to 6000 kbps; lower 'video bitrate' or Twitch may refuse the stream."
+            )
+        );
+        let app = test_app_with_kbps(6000);
+        app.set_stream_sites(tick_twitch_with_key()).unwrap();
+        assert_eq!(app.status().stream_note, None);
+    }
+
+    #[test]
+    fn errors_never_show_a_key() {
+        let app = test_app();
+        app.keys.set(Site::Twitch, "tw-secret-9").unwrap();
+        app.stream.0.lock().start_error =
+            Some("connect rtmp://x/app/tw-secret-9 and yt-secret-1 failed".into());
+        let req = SitesRequest {
+            youtube: site(Some(true), "yt-secret-1", false),
+            twitch: site(Some(true), "", false),
+        };
+        let e = format!("{:#}", app.start_stream(req).unwrap_err());
+        assert!(!e.contains("secret"), "{e}");
+        assert!(e.contains("****"), "{e}");
+        // The site states in the status are redacted too.
+        app.stream.fail_all("rtmp://x/app/tw-secret-9 refused");
+        let s = serde_json::to_string(&app.status()).unwrap();
+        assert!(!s.contains("secret"), "{s}");
     }
 }

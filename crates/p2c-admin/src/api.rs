@@ -58,16 +58,91 @@ pub enum InputEvent {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub struct StreamRequest {
-    /// RTMP server URL, e.g. rtmp://a.rtmp.youtube.com/live2
-    pub url: String,
-    /// Stream key. Empty: use the key saved in the OS keyring.
+/// One site's part of a stream request. Never log it (it may hold a key).
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SiteRequest {
+    /// Tick (`true`) or untick the site; `None` leaves the saved tick.
+    #[serde(default)]
+    pub on: Option<bool>,
+    /// Stream key. Empty: the key entered earlier in this run, else the one
+    /// saved in the OS keyring.
     #[serde(default)]
     pub key: String,
-    /// Save the key in the OS keyring.
+    /// Save `key` in the OS keyring.
     #[serde(default)]
     pub remember: bool,
+    /// The site's RTMP server; `None` (or empty) leaves the saved one.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+impl std::fmt::Debug for SiteRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiteRequest")
+            .field("on", &self.on)
+            .field("key", &if self.key.is_empty() { "" } else { "****" })
+            .field("remember", &self.remember)
+            .field("url", &self.url)
+            .finish()
+    }
+}
+
+/// Changes to the stream sites; a missing site is left as saved.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SitesRequest {
+    pub youtube: Option<SiteRequest>,
+    pub twitch: Option<SiteRequest>,
+}
+
+/// `POST /api/stream/start`: `{sites: {youtube?, twitch?}}` (an empty
+/// `sites` starts the saved ticks), or the older `{url, key, remember}`,
+/// which means YouTube ticked with that server and key.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum StreamRequest {
+    Sites {
+        sites: SitesRequest,
+    },
+    Legacy {
+        url: String,
+        #[serde(default)]
+        key: String,
+        #[serde(default)]
+        remember: bool,
+    },
+}
+
+impl StreamRequest {
+    pub fn normalized(self) -> SitesRequest {
+        match self {
+            StreamRequest::Sites { sites } => sites,
+            StreamRequest::Legacy { url, key, remember } => SitesRequest {
+                youtube: Some(SiteRequest {
+                    on: Some(true),
+                    key,
+                    remember,
+                    url: Some(url),
+                }),
+                twitch: None,
+            },
+        }
+    }
+}
+
+/// One stream site in the status (keys never appear).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteStatusDto {
+    /// "youtube" | "twitch"
+    pub site: String,
+    /// "idle" | "connecting" | "live" | "reconnecting (n)" | "error: <why>"
+    pub state: String,
+    /// Ticked for the stream (saved).
+    pub ticked: bool,
+    /// A key for this site is saved in the OS keyring.
+    pub has_saved_key: bool,
+    /// The site's RTMP server.
+    pub url: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -192,8 +267,14 @@ pub struct Status {
     pub webcam_aspect: f32,
     /// "idle" | "connecting" | "live" | "error: <why>"
     pub stream: String,
+    /// YouTube's server (for older clients; see `streams`).
     pub stream_url: String,
+    /// A YouTube key is saved (for older clients; see `streams`).
     pub has_saved_key: bool,
+    /// Every stream site, YouTube then Twitch.
+    pub streams: Vec<SiteStatusDto>,
+    /// A warning about the stream settings (Twitch's bitrate limit).
+    pub stream_note: Option<String>,
     /// "ok" | "none" | "error: <why>"
     pub mic: String,
     pub log_file: String,
@@ -352,7 +433,13 @@ pub trait Controls: Overlays + Send + Sync + 'static {
     fn input(&self, ev: InputEvent);
     fn pip(&self) -> PipLayout;
     fn set_pip(&self, l: PipLayout);
-    fn start_stream(&self, req: StreamRequest) -> anyhow::Result<()>;
+    /// Start streaming to the ticked sites (the saved ticks merged with
+    /// `req`). Errors start nothing and never contain a key. May write the
+    /// settings and the keyring: call it off the async runtime.
+    fn start_stream(&self, req: SitesRequest) -> anyhow::Result<()>;
+    /// Change the saved ticks, servers or keys; while streaming, sites start
+    /// or stop at once. Errors change nothing. Call it off the async runtime.
+    fn set_stream_sites(&self, req: SitesRequest) -> anyhow::Result<()>;
     fn stop_stream(&self);
     fn audio(&self) -> AudioSettings;
     fn set_audio(&self, a: AudioSettings);
@@ -491,5 +578,59 @@ pub trait Overlays {
     /// Delete a scene.
     fn delete_scene(&self, _id: &str) -> anyhow::Result<()> {
         anyhow::bail!("scenes are not available")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> SitesRequest {
+        serde_json::from_str::<StreamRequest>(s)
+            .unwrap()
+            .normalized()
+    }
+
+    #[test]
+    fn legacy_stream_body_is_youtube_on() {
+        let r = parse(r#"{"url":"rtmp://x/live2","key":"k-1","remember":true}"#);
+        assert_eq!(
+            r,
+            SitesRequest {
+                youtube: Some(SiteRequest {
+                    on: Some(true),
+                    key: "k-1".into(),
+                    remember: true,
+                    url: Some("rtmp://x/live2".into()),
+                }),
+                twitch: None,
+            }
+        );
+        // The tray's body: no key, nothing remembered.
+        let r = parse(r#"{"url":"rtmp://x/live2","key":"","remember":false}"#);
+        assert_eq!(r.youtube.unwrap().on, Some(true));
+    }
+
+    #[test]
+    fn sites_stream_body() {
+        assert_eq!(parse(r#"{"sites":{}}"#), SitesRequest::default());
+        let r = parse(r#"{"sites":{"twitch":{"on":true,"key":"t"}}}"#);
+        assert_eq!(r.youtube, None);
+        let t = r.twitch.unwrap();
+        assert_eq!(
+            (t.on, t.key.as_str(), t.remember, t.url),
+            (Some(true), "t", false, None)
+        );
+        // A misspelt site is refused, not ignored.
+        assert!(serde_json::from_str::<StreamRequest>(r#"{"sites":{"kick":{}}}"#).is_err());
+    }
+
+    #[test]
+    fn site_request_debug_hides_the_key() {
+        let r = SiteRequest {
+            key: "secret-key".into(),
+            ..Default::default()
+        };
+        assert!(!format!("{r:?}").contains("secret-key"));
     }
 }

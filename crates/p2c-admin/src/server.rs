@@ -17,7 +17,7 @@ use tokio::sync::watch;
 
 use crate::api::{
     AudioSettings, BackgroundDto, Controls, CropDto, GpuInfo, ImageRow, InputEvent, KeyAction,
-    MouseBtn, NavAction, PipDto, ScreenDto, StreamRequest,
+    MouseBtn, NavAction, PipDto, ScreenDto, SitesRequest, StreamRequest,
 };
 use crate::input::{map_preview, normalize_url};
 use crate::preview::spawn_encoder;
@@ -131,6 +131,7 @@ pub(crate) fn router(st: State) -> Router {
         .route("/api/quit", post(quit))
         .route("/api/stream/start", post(stream_start))
         .route("/api/stream/stop", post(stream_stop))
+        .route("/api/stream/sites", post(stream_sites))
         .route("/api/audio", post(audio))
         .route("/api/crop", get(crop_get).post(crop_set))
         .route("/api/input", post(input))
@@ -433,10 +434,25 @@ async fn quit(AxState(st): AxState<State>) -> StatusCode {
     StatusCode::OK
 }
 
+/// Answers the error as plain text (what the control page and the tray read).
 async fn stream_start(AxState(st): AxState<State>, Json(b): Json<StreamRequest>) -> Response {
-    match st.controls.start_stream(b) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    // Reads the keyring, may write the settings and spawns ffmpeg.
+    let c = st.controls.clone();
+    match tokio::task::spawn_blocking(move || c.start_stream(b.normalized())).await {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/stream/sites` (`SitesRequest`): ticks, servers and keys;
+/// 400 `{error}` changes nothing.
+async fn stream_sites(AxState(st): AxState<State>, Json(b): Json<SitesRequest>) -> Response {
+    let c = st.controls.clone();
+    match tokio::task::spawn_blocking(move || c.set_stream_sites(b)).await {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(e)) => json_error(StatusCode::BAD_REQUEST, &format!("{e:#}")),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
@@ -1279,7 +1295,10 @@ mod tests {
         pub struct Fake {
             pub navigated: Mutex<Vec<String>>,
             pub pip: Mutex<PipLayout>,
-            pub streams: Mutex<Vec<StreamRequest>>,
+            pub streams: Mutex<Vec<SitesRequest>>,
+            pub stream_sites: Mutex<Vec<SitesRequest>>,
+            /// `set_stream_sites` fails with this.
+            pub sites_error: Mutex<Option<String>>,
             pub engine: Mutex<String>,
             pub updates: Mutex<u32>,
             pub gpu: Mutex<String>,
@@ -1448,8 +1467,15 @@ mod tests {
             fn set_pip(&self, l: PipLayout) {
                 *self.pip.lock().unwrap() = l;
             }
-            fn start_stream(&self, req: StreamRequest) -> anyhow::Result<()> {
+            fn start_stream(&self, req: SitesRequest) -> anyhow::Result<()> {
                 self.streams.lock().unwrap().push(req);
+                Ok(())
+            }
+            fn set_stream_sites(&self, req: SitesRequest) -> anyhow::Result<()> {
+                if let Some(e) = self.sites_error.lock().unwrap().clone() {
+                    anyhow::bail!(e);
+                }
+                self.stream_sites.lock().unwrap().push(req);
                 Ok(())
             }
             fn stop_stream(&self) {}
@@ -2301,22 +2327,58 @@ mod tests {
         assert_eq!(to_input(bad, 1920, 1080), None);
     }
 
-    #[tokio::test]
-    async fn stream_start_passes_request() {
-        let fake = Arc::new(Fake::default());
-        let body = r#"{"url":"rtmp://a.rtmp.youtube.com/live2","key":"k-1","remember":false}"#;
-        let r = app(fake.clone())
-            .oneshot(req(
-                "POST",
-                "/api/stream/start",
-                "127.0.0.1:8765",
-                Some(TOKEN),
-                Some(body),
-            ))
+    async fn post_json(fake: Arc<Fake>, path: &str, body: &str) -> (StatusCode, String) {
+        let r = app(fake)
+            .oneshot(req("POST", path, "127.0.0.1:8765", Some(TOKEN), Some(body)))
             .await
             .unwrap();
-        assert_eq!(r.status(), StatusCode::OK);
-        assert_eq!(fake.streams.lock().unwrap()[0].key, "k-1");
+        let code = r.status();
+        (code, body_string(r).await)
+    }
+
+    #[tokio::test]
+    async fn stream_start_accepts_legacy_and_sites_bodies() {
+        let fake = Arc::new(Fake::default());
+        let legacy = r#"{"url":"rtmp://a.rtmp.youtube.com/live2","key":"k-1","remember":false}"#;
+        let (code, _) = post_json(fake.clone(), "/api/stream/start", legacy).await;
+        assert_eq!(code, StatusCode::OK);
+        let sites = r#"{"sites":{"twitch":{"on":true,"key":"t-1","remember":true}}}"#;
+        let (code, _) = post_json(fake.clone(), "/api/stream/start", sites).await;
+        assert_eq!(code, StatusCode::OK);
+        let got = fake.streams.lock().unwrap().clone();
+        let yt = got[0].youtube.clone().unwrap();
+        assert_eq!(
+            (yt.on, yt.key.as_str(), yt.url.as_deref()),
+            (Some(true), "k-1", Some("rtmp://a.rtmp.youtube.com/live2"))
+        );
+        assert_eq!(got[0].twitch, None);
+        let tw = got[1].twitch.clone().unwrap();
+        assert_eq!(
+            (tw.on, tw.key.as_str(), tw.remember),
+            (Some(true), "t-1", true)
+        );
+        assert_eq!(got[1].youtube, None);
+        // Neither shape: refused before the app sees it.
+        let (code, _) = post_json(fake.clone(), "/api/stream/start", r#"{"key":"x"}"#).await;
+        assert!(code.is_client_error(), "{code}");
+        assert_eq!(fake.streams.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_sites_route_saves_ticks() {
+        let fake = Arc::new(Fake::default());
+        let body = r#"{"twitch":{"on":true}}"#;
+        let (code, _) = post_json(fake.clone(), "/api/stream/sites", body).await;
+        assert_eq!(code, StatusCode::OK);
+        let got = fake.stream_sites.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].twitch.as_ref().unwrap().on, Some(true));
+        assert_eq!(got[0].youtube, None);
+        *fake.sites_error.lock().unwrap() = Some("Twitch has no stream key".into());
+        let (code, body) = post_json(fake.clone(), "/api/stream/sites", body).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body, r#"{"error":"Twitch has no stream key"}"#);
+        assert_eq!(fake.stream_sites.lock().unwrap().len(), 1);
     }
 
     async fn input_post(fake: Arc<Fake>, body: &str) -> (StatusCode, String) {
