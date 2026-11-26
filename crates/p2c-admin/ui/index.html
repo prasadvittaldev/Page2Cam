@@ -1110,7 +1110,7 @@
   $("bgScreen").onchange = () => setBg({ full: "screen", full_screen: $("bgScreen").value });
   // Application windows (GET /api/windows). Titles are private, so the list is
   // fetched only when the Window choice is opened or refreshed, never on a poll.
-  let winEditing = false, winLoaded = false, winList = [];
+  let winEditing = false, winLoaded = false, winList = [], winSentId = "";
   const winLabel = (w) => w.title + " (" + w.exe + ")";
   async function loadWindows() {
     try {
@@ -1129,13 +1129,20 @@
     const sel = $("window-pick");
     if (!winLoaded) { $("window-warn").textContent = ""; return; }
     // The saved choice is a label; show it unless the user is picking.
+    // Selected by value (the id), never by index: the "not found" placeholder
+    // shifts the indexes. Of twins with the saved label, the one last picked.
     if (bg && bg.full === "window" && bg.full_window && document.activeElement !== sel) {
-      const i = winList.findIndex((w) => winLabel(w) === bg.full_window);
-      if (i >= 0) sel.selectedIndex = i;
-      else {
-        sel.selectedIndex = -1;
-        if (!sel.querySelector("option[data-missing]")) {
-          const o = new Option(bg.full_window + " — not found", "");
+      const same = winList.filter((w) => winLabel(w) === bg.full_window);
+      const w = same.find((x) => String(x.id) === winSentId) || same[0];
+      const missing = sel.querySelector("option[data-missing]");
+      if (w) {
+        if (missing) missing.remove();
+        sel.value = String(w.id);
+      } else {
+        const text = bg.full_window + " — not found";
+        if (missing) missing.text = text;
+        else {
+          const o = new Option(text, "");
           o.dataset.missing = "1"; o.disabled = true; sel.add(o, 0);
         }
         sel.selectedIndex = 0;
@@ -1160,6 +1167,7 @@
     syncWindow();
     if (!id) return;
     winEditing = false;
+    winSentId = id;
     await setBg({ full: "window", full_window: id });
   };
   $("window-refresh").onclick = async () => { await loadWindows(); syncBg(); };
