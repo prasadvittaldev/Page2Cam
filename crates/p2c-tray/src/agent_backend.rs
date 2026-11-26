@@ -962,13 +962,14 @@ pub(crate) mod tests {
 
     #[test]
     fn window_sharing_is_announced() {
-        let (port, log) = fake_engine(|m, p, body| {
-            match (m, p) {
-            ("GET", "/api/state") => (
-                200,
-                br#"{"status":{"background_note":"Style set to full-height cut-out: a full-frame background needs the person cut out","window_note":"Sound: everything playing in Google Chrome"}}"#
-                    .to_vec(),
-            ),
+        const STATE: &[u8] = concat!(
+            r#"{"status":{"background_note":"Style set to full-height cut-out: "#,
+            r#"a full-frame background needs the person cut out","#,
+            r#""window_note":"Sound: everything playing in Google Chrome"}}"#
+        )
+        .as_bytes();
+        let (port, log) = fake_engine(|m, p, body| match (m, p) {
+            ("GET", "/api/state") => (200, STATE.to_vec()),
             ("GET", "/api/windows") => (
                 200,
                 br#"[{"id":"123","title":"Twitch","exe":"chrome.exe"}]"#.to_vec(),
@@ -991,7 +992,6 @@ pub(crate) mod tests {
                 }
             }
             _ => (200, b"{}".to_vec()),
-        }
         });
         let tray = Arc::new(FakeTray::default());
         *tray.state.lock() = "running".into();
