@@ -512,13 +512,29 @@
     </section>
 
     <section class="panel" aria-labelledby="h-stream">
-      <h2 id="h-stream">YouTube Live</h2>
-      <div class="row"><input type="text" id="rtmpUrl" aria-label="Server URL" spellcheck="false"></div>
-      <div class="row"><input type="password" id="streamKey" aria-label="Stream key" placeholder="Stream key" autocomplete="off"></div>
+      <h2 id="h-stream">Stream to</h2>
       <div class="row">
-        <label for="remember">Remember key on this PC</label>
-        <input type="checkbox" id="remember">
+        <input type="checkbox" id="site-youtube-on" aria-label="Stream to YouTube"><label for="site-youtube-on">YouTube</label>
+        <input type="password" id="site-youtube-key" aria-label="YouTube stream key" placeholder="Stream key" autocomplete="off">
       </div>
+      <div class="row">
+        <input type="checkbox" id="site-youtube-remember"><label for="site-youtube-remember">Remember YouTube key on this PC</label>
+      </div>
+      <div class="state" id="site-youtube-state" role="status"></div>
+      <div class="row">
+        <input type="checkbox" id="site-twitch-on" aria-label="Stream to Twitch"><label for="site-twitch-on">Twitch</label>
+        <input type="password" id="site-twitch-key" aria-label="Twitch stream key" placeholder="Stream key" autocomplete="off">
+      </div>
+      <div class="row">
+        <input type="checkbox" id="site-twitch-remember"><label for="site-twitch-remember">Remember Twitch key on this PC</label>
+      </div>
+      <div class="state" id="site-twitch-state" role="status"></div>
+      <details id="stream-advanced">
+        <summary>Advanced</summary>
+        <div class="row"><input type="text" id="site-youtube-url" aria-label="YouTube server URL" spellcheck="false"></div>
+        <div class="row"><input type="text" id="site-twitch-url" aria-label="Twitch server URL" spellcheck="false"></div>
+      </details>
+      <div class="state" id="stream-note" role="status"></div>
       <div class="row"><button class="btn primary" id="goLive" style="flex:1">Go live</button></div>
       <div class="state" id="streamState"></div>
     </section>
@@ -1083,18 +1099,57 @@
   loadScreens();
 
   // ---------- stream ----------
-  $("rtmpUrl").value = store.get("rtmpUrl", "rtmp://a.rtmp.youtube.com/live2");
+  const SITES = ["youtube", "twitch"];
+  // What a site's controls ask for. A typed key is sent once, then the box is cleared.
+  function siteBody(site) {
+    const o = { on: $("site-" + site + "-on").checked };
+    const url = $("site-" + site + "-url").value.trim();
+    if (url) o.url = url;
+    const key = $("site-" + site + "-key").value;
+    if (key) { o.key = key; o.remember = $("site-" + site + "-remember").checked; }
+    return o;
+  }
+  function clearKey(site) {
+    $("site-" + site + "-key").value = "";
+    $("site-" + site + "-remember").checked = false;
+  }
+  async function streamError(r) {
+    let m = "";
+    try { m = (await r.json()).error || ""; } catch { /* not JSON */ }
+    setState("streamState", "error: " + (m || "could not change the stream"));
+  }
+  const isLive = () => !!state && /^(live|connecting)/.test(state.status.stream);
   $("goLive").onclick = async () => {
-    const live = state && /^(live|connecting)/.test(state.status.stream);
-    if (live) { await api("/api/stream/stop", {}); refresh(); return; }
-    store.set("rtmpUrl", $("rtmpUrl").value);
+    if (isLive()) { await api("/api/stream/stop", {}); refresh(); return; }
     $("goLive").disabled = true;
-    const r = await api("/api/stream/start", { url: $("rtmpUrl").value, key: $("streamKey").value, remember: $("remember").checked });
+    const sites = {};
+    SITES.forEach((s) => { sites[s] = siteBody(s); });
+    const r = await api("/api/stream/start", { sites });
     $("goLive").disabled = false;
-    if (!r.ok) { setState("streamState", "error: " + await r.text()); }
-    $("streamKey").value = "";
+    if (r.ok) SITES.forEach(clearKey); else await streamError(r);
     refresh();
   };
+  SITES.forEach((s) => {
+    $("site-" + s + "-on").onchange = async () => {
+      if (!isLive()) return; // before Go live the ticks are sent with it
+      const r = await api("/api/stream/sites", { sites: { [s]: siteBody(s) } });
+      if (r.ok) clearKey(s); else await streamError(r);
+      refresh();
+    };
+  });
+  function syncStreams(s, firstTime) {
+    const list = Array.isArray(s.streams) ? s.streams : [];
+    SITES.forEach((site) => {
+      const d = list.find((x) => x.site === site) || { state: "idle", ticked: false, has_saved_key: false, url: "" };
+      const on = $("site-" + site + "-on"), url = $("site-" + site + "-url");
+      if (firstTime || document.activeElement !== on) on.checked = !!d.ticked;
+      if (d.url && (firstTime || document.activeElement !== url)) url.value = d.url;
+      $("site-" + site + "-key").placeholder = d.has_saved_key ? "●●●●●● (saved)" : "Stream key";
+      const txt = d.state === "idle" ? "" : d.state === "live" ? "Live" : d.state === "connecting" ? "Connecting…" : d.state;
+      setState("site-" + site + "-state", d.ticked || txt ? txt : "");
+    });
+    setState("stream-note", s.stream_note || "");
+  }
 
   // ---------- audio ----------
   let audio = null;
@@ -1196,18 +1251,17 @@
       if (first || document.activeElement !== $("url")) $("url").value = s.url;
       syncCropFromState(s);
       if (!dragging) { pip = state.pip; syncControls(); layoutPip(); }
+      syncStreams(s, first);
       if (first) {
         audio = state.audio;
         $("pageOn").checked = audio.page_on; $("pageGain").value = Math.round(audio.page_gain * 100);
         $("micOn").checked = audio.mic_on; $("micGain").value = Math.round(audio.mic_gain * 100);
-        if (s.stream_url) $("rtmpUrl").value = s.stream_url;
         first = false;
       }
-      $("streamKey").placeholder = s.has_saved_key ? "Stream key (saved key will be used)" : "Stream key";
       const live = s.stream === "live", connecting = s.stream === "connecting";
       $("goLive").textContent = live ? "End stream" : connecting ? "Cancel" : "Go live";
       $("goLive").classList.toggle("live", live);
-      setState("streamState", live ? "Live on " + s.stream_url : connecting ? "Connecting…" : s.stream === "idle" ? "" : s.stream);
+      setState("streamState", live ? "Live" : connecting ? "Connecting…" : s.stream === "idle" ? "" : s.stream);
       setState("webcamState", s.webcam === "none" ? "No webcam found. Plug one in and restart Page2Cam." : /^error/.test(s.webcam) ? s.webcam : /^reconnecting/.test(s.webcam) ? "Webcam " + s.webcam : "");
       document.querySelectorAll("[data-engine]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.engine === s.cutout_engine)));
       setState("cutoutState", s.cutout);

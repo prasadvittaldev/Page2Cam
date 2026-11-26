@@ -1702,6 +1702,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ui_has_stream_site_controls() {
+        let r = app(Arc::default())
+            .oneshot(req("GET", "/?t=abc123", "127.0.0.1:8765", None, None))
+            .await
+            .unwrap();
+        let html = body_string(r).await;
+        for id in [
+            "site-youtube-on",
+            "site-youtube-key",
+            "site-youtube-state",
+            "site-twitch-on",
+            "site-twitch-key",
+            "site-twitch-state",
+            "stream-advanced",
+            "stream-note",
+        ] {
+            assert!(html.contains(&format!("id=\"{id}\"")), "missing id {id}");
+        }
+    }
+
+    #[tokio::test]
     async fn ui_has_background_section() {
         let r = app(Arc::default())
             .oneshot(req("GET", "/?t=abc123", "127.0.0.1:8765", None, None))
